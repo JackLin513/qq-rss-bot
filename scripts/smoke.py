@@ -397,6 +397,35 @@ check("帮助含可用路由示例", "/36kr/newsflashes" in HELP_TEXT)
 check("帮助说明了订阅是群共享的", "按群共享" in HELP_TEXT)
 check("帮助说明了受限指令", "仅群主和管理员可用" in HELP_TEXT)
 
+print("[4.76] 指令面板字数按显示宽度校验")
+import setup_panel  # noqa: E402
+
+check("ASCII 宽 = 字符数", setup_panel._width("/sub") == 4)
+check("中文按 2 算", setup_panel._width("中文") == 4)
+check("全角标点按 2 算", setup_panel._width("，") == 2)
+check("中英混排", setup_panel._width("订阅 RSS") == 8)  # 4 + 1 + 3
+
+_problems = setup_panel.validate(setup_panel.PANEL_ITEMS)
+check("当前 PANEL_ITEMS 通过官方限制", _problems == [], str(_problems))
+
+# 回归：这 16 个中文只有 16 个字符（旧的 len() 判定会放行），
+# 但显示宽度 32 已超 desc 上限 30，接口会回 30013。
+_wide = [{"name": "/x", "desc": "中" * 16, "type": "command"}]
+check("16 个中文（宽 32）被判超限", setup_panel.validate(_wide) != [])
+
+_long_name = [{"name": "/" + "a" * 14, "desc": "短", "type": "command"}]
+check("name 宽 15 被判超限", setup_panel.validate(_long_name) != [])
+
+check("type 非法被抓", setup_panel.validate([{"name": "/x", "desc": "d", "type": "text"}]) != [])
+check("link 非 https 被抓",
+      setup_panel.validate([{"name": "/x", "desc": "d", "type": "link", "link": "http://a"}]) != [])
+check("21 个元素被抓",
+      setup_panel.validate([{"name": f"/{i}", "desc": "d", "type": "command"} for i in range(21)]) != [])
+
+# 30013 的错误提示必须提到宽度，否则会把人带偏到「元素太多」
+_hint = setup_panel.ERROR_HINTS["30013"]
+check("30013 提示包含宽度信息", "宽度" in _hint, _hint)
+
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
 print(f"  rsshub = {cfg.rsshub_base}")

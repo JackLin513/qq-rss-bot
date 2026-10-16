@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,7 +45,10 @@ ALL_SCOPES = ("group", "c2c", "channel", "dm")
 TARGET_TYPE = "all"  # 该场景下所有群都生效（机器人在群里的 openid 要进群后才知道，
 # 所以不用 specific —— 那需要先把 group_openid 列进去）
 
-# 官方限制：name ≤14 字符、desc ≤30 字符、单面板 ≤20 个元素
+# 官方限制：name ≤14、desc ≤30、单面板 ≤20 个元素。
+# 这几个数是**显示宽度**不是字符数：非 ASCII（中文）按 2 算。
+# 按字符数校验会在中文描述上放行、到接口才报 30013，而 30013 文档写的是
+# 「超出数量限制」，极易误判成元素太多 —— 实际是字数太宽。见 _width()。
 NAME_LIMIT = 14
 DESC_LIMIT = 30
 
@@ -70,7 +74,9 @@ ERROR_HINTS = {
     "30009": "有并发的面板操作在进行，稍后重试",
     "30011": "生效场景不合法，scope 只能是 c2c / group / channel / dm",
     "30012": "target_type 非法，或 channel/dm 只支持 all",
-    "30013": "数量超限（单面板 ≤20 元素，单请求 openids ≤20）",
+    "30013": "超出数量限制：单面板 ≤20 元素，或 name/desc 显示宽度超限"
+             "（中文按 2 计，name ≤14、desc ≤30）",
+    "30006": "指令面板不存在：panel_id 不对或已被删除，先用 --list 拿正确的",
     "30015": "元素 type 非法，只能是 command / link",
     "30016": "缺少必填字段",
     "30018": "该场景不支持此操作",
@@ -111,17 +117,31 @@ def compare_items(remote: list[dict]) -> list[str]:
     return diffs
 
 
+def _width(text: str) -> int:
+    """按官方口径算显示宽度：全角/宽字符算 2，其余算 1。
+
+    官方校验的是宽度不是字符数。用 len() 数的话，
+    「订阅本群所有 RSS 更新」这种 11 个字的中文描述会被当成 11 放行，
+    实际宽度 20+，接口才打回来。
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
 def validate(items: list[dict]) -> list[str]:
-    """本地先校验一遍字数，免得被接口打回来还要猜原因。"""
+    """本地先校验一遍，免得被接口打回来还要猜原因。"""
     problems: list[str] = []
     if len(items) > 20:
         problems.append(f"元素数 {len(items)} 超过上限 20")
     for i, item in enumerate(items):
         name, desc = item.get("name", ""), item.get("desc", "")
-        if len(name) > NAME_LIMIT:
-            problems.append(f"第 {i + 1} 个元素 name 长 {len(name)}，上限 {NAME_LIMIT}：{name!r}")
-        if len(desc) > DESC_LIMIT:
-            problems.append(f"第 {i + 1} 个元素 desc 长 {len(desc)}，上限 {DESC_LIMIT}：{desc!r}")
+        if _width(name) > NAME_LIMIT:
+            problems.append(
+                f"第 {i + 1} 个元素 name 宽 {_width(name)}，上限 {NAME_LIMIT}：{name!r}"
+            )
+        if _width(desc) > DESC_LIMIT:
+            problems.append(
+                f"第 {i + 1} 个元素 desc 宽 {_width(desc)}，上限 {DESC_LIMIT}：{desc!r}"
+            )
         if item.get("type") not in ("command", "link"):
             problems.append(f"第 {i + 1} 个元素 type 非法：{item.get('type')!r}")
         if item.get("type") == "link" and not str(item.get("link", "")).startswith("https://"):
@@ -173,7 +193,10 @@ async def main() -> int:
         for p in problems:
             print(f"  ✗ {p}")
         return 1
-    print(f"本地校验通过：{len(PANEL_ITEMS)} 个元素，名称/描述均在官方字数限制内")
+    print(
+        f"本地校验通过：{len(PANEL_ITEMS)} 个元素，名称/描述显示宽度均在官方限制内"
+        f"（name ≤{NAME_LIMIT}、desc ≤{DESC_LIMIT}，中文按 2 计）"
+    )
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
