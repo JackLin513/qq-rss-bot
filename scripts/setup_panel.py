@@ -40,6 +40,7 @@ TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 API_BASE = "https://api.sgroup.qq.com"
 
 SCOPE = "group"
+ALL_SCOPES = ("group", "c2c", "channel", "dm")
 TARGET_TYPE = "all"  # 该场景下所有群都生效（机器人在群里的 openid 要进群后才知道，
 # 所以不用 specific —— 那需要先把 group_openid 列进去）
 
@@ -82,6 +83,32 @@ def _norm_code(code: object) -> str:
     """把 40030011 / 30011 都归一到 '30011'。"""
     s = str(code)
     return s[3:] if s.startswith("400") and len(s) == 8 else s
+
+
+def compare_items(remote: list[dict]) -> list[str]:
+    """把线上面板和代码里的 PANEL_ITEMS 对比，返回差异描述。
+
+    面板是用户看到的唯一入口，和代码不一致会让人按着面板点了却执行不了，
+    所以这个对比是「适配」的核心检查。
+    """
+    diffs: list[str] = []
+    local = {i["name"]: i for i in PANEL_ITEMS}
+    online = {i.get("name"): i for i in remote}
+
+    for name in sorted(local.keys() - online.keys()):
+        diffs.append(f"面板缺少元素 {name}")
+    for name in sorted(online.keys() - local.keys()):
+        diffs.append(f"面板多出元素 {name}（代码里没有）")
+    for name in sorted(local.keys() & online.keys()):
+        for field in ("desc", "type", "only_admin"):
+            if local[name].get(field) != online[name].get(field):
+                diffs.append(
+                    f"{name} 的 {field}：代码={local[name].get(field)!r} "
+                    f"面板={online[name].get(field)!r}"
+                )
+    if [i["name"] for i in PANEL_ITEMS] != [i.get("name") for i in remote]:
+        diffs.append("元素顺序不一致（代码里的顺序视为期望顺序）")
+    return diffs
 
 
 def validate(items: list[dict]) -> list[str]:
@@ -129,6 +156,13 @@ async def main() -> int:
     elif "--list" in argv:
         mode = "list"
 
+    scope_arg = None
+    if "--scope" in argv:
+        scope_arg = argv[argv.index("--scope") + 1]
+        if scope_arg not in ALL_SCOPES:
+            print(f"--scope 只能是 {' / '.join(ALL_SCOPES)}")
+            return 1
+
     from qq_rss_bot.config import load_config
 
     cfg = load_config()
@@ -155,25 +189,58 @@ async def main() -> int:
             "Content-Type": "application/json",
         }
 
-        # 先只读探测一次，确认 host 和路径是对的，再动任何东西。
-        # scope 是必填查询参数（文档写在 GET /v2/panels 的参数表里，漏了会返回
-        # 30011「生效场景不合法」）。
-        resp = await client.get(
-            f"{API_BASE}/v2/panels", params={"scope": SCOPE}, headers=headers
-        )
-        print(f"GET /v2/panels?scope={SCOPE} → {explain(resp)}")
-        if resp.status_code != 200:
-            print("\n只读查询就失败了，先别继续。可能是 host 与文档不符，或账号无此能力。")
-            return 1
-        existing = resp.json().get("records") or []
-        print(f"当前 scope={SCOPE} 下已有 {len(existing)} 个面板")
-        for p in existing:
-            print(
-                f"  {p.get('panel_id')}  target={p.get('target_type')}"
-                f"  items={len((p.get('panel') or {}).get('items') or [])}"
+        # 先只读探测：scope 是必填查询参数（漏了返回 30011「生效场景不合法」）。
+        # 列表面板时把四个场景都查一遍 —— 面板可能建在别的 scope 下
+        # （平台 UI 里不选群聊就会落到单聊），只查 group 会显示成一个都没有。
+        scopes = [scope_arg] if scope_arg else (list(ALL_SCOPES) if mode == "list" else [SCOPE])
+
+        total = 0
+        for sc in scopes:
+            resp = await client.get(
+                f"{API_BASE}/v2/panels", params={"scope": sc}, headers=headers
             )
+            if resp.status_code != 200:
+                print(f"GET /v2/panels?scope={sc} → {explain(resp)}")
+                print("\n只读查询失败，先别继续：可能是 host 与文档不符，或账号无此能力。")
+                return 1
+            records = resp.json().get("records") or []
+            total += len(records)
+            print(f"\n=== scope={sc}：{len(records)} 个面板 ===")
+            for p in records:
+                items = (p.get("panel") or {}).get("items") or []
+                print(
+                    f"\n  panel_id={p.get('panel_id')}  target={p.get('target_type')}"
+                    f"  version={p.get('version')}"
+                )
+                print(f"  updated_at={p.get('updated_at')}")
+                for it in items:
+                    marks = []
+                    if it.get("only_admin"):
+                        marks.append("仅管理员")
+                    if it.get("type") == "link":
+                        marks.append(f"→ {it.get('link')}")
+                    suffix = ("  " + " ".join(marks)) if marks else ""
+                    print(
+                        f"    {it.get('type', '?'):7} {str(it.get('name', '?')):<9}"
+                        f" {it.get('desc', '')}{suffix}"
+                    )
+
+                if sc != SCOPE:
+                    print(f"\n    ⚠️ 这个面板建在 scope={sc} 下，群聊里不会显示")
+                    print(f"    修法：--delete {p.get('panel_id')}，再用 --create 建到 group")
+                    continue
+
+                diffs = compare_items(items)
+                if diffs:
+                    print("\n    与代码不一致（用户照面板点会执行不了）：")
+                    for d in diffs:
+                        print(f"      ✗ {d}")
+                    print(f"    修法：uv run python scripts/setup_panel.py --update {p.get('panel_id')}")
+                else:
+                    print("\n    ✅ 与代码完全一致")
 
         if mode == "list":
+            print(f"\n合计 {total} 个面板")
             return 0
 
         if mode == "delete":

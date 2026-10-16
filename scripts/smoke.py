@@ -356,8 +356,42 @@ async def _check_permissions() -> None:
 
 asyncio.run(_check_permissions())
 
+async def _check_panel_text_forms() -> None:
+    """指令面板插入的文本必须都能被解析。
+
+    面板是用户在客户端里看到的唯一入口：点一下会把指令名填进输入框。
+    填进来的形式（带不带斜杠、用中文名还是英文名）都得认，
+    否则用户照着面板点了却得到「未知指令」。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        h = CommandHandler(cfg_stub(), db, None)
+        replies: list[str] = []
+
+        async def reply(text: str) -> None:
+            replies.append(text)
+
+        ctx = CommandContext("G", reply, "owner")
+        forms = [
+            "/sub", "/unsub", "/list", "/check", "/ping", "/help",
+            "sub", "unsub", "list", "check", "ping", "help",
+            "/订阅", "/取消", "/列表", "/帮助", "/?",
+        ]
+        unknown: list[str] = []
+        for text in forms:
+            replies.clear()
+            await h.handle(ctx, text)
+            if any("未知指令" in r for r in replies):
+                unknown.append(text)
+
+        check("面板可能插入的所有形式都被识别", not unknown, f"未识别：{unknown}")
+        db.close()
+
+
+print("[4.75] 指令面板插入的文本能否被解析")
+asyncio.run(_check_panel_text_forms())
+
 print("[4.8] 帮助文案里不该出现跑不通的示例")
-# /github/trending/* 默认 503（需 GITHUB_ACCESS_TOKEN），不能在帮助里当例子
 check("帮助不含 github/trending 示例", "github/trending" not in HELP_TEXT)
 check("帮助含可用路由示例", "/36kr/newsflashes" in HELP_TEXT)
 check("帮助说明了订阅是群共享的", "按群共享" in HELP_TEXT)
