@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_list(name: str) -> tuple[str, ...]:
+    """逗号或空白分隔的列表。空值 → 空元组（= 不启用该功能）。"""
+    raw = os.environ.get(name) or ""
+    return tuple(part for part in re.split(r"[,\s]+", raw.strip()) if part)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -42,6 +49,24 @@ class Config:
     log_level: str
     attach_images: bool
     restrict_admin_commands: bool
+    # 主动消息节流：群维度官方频控是 20 条/分钟、1000 条/天，
+    # 这里默认留余量给回执/提示这类消息。
+    send_per_minute: int = 20
+    daily_send_limit: int = 900
+    # 每群订阅数上限。没有上限的话，管理员加 20 个源能瞬间打满每日配额。
+    max_subs_per_group: int = 10
+    # 连续失败多少次自动暂停该订阅
+    max_fail_before_pause: int = 5
+    # 出错私聊的收件人白名单。**留空 = 自动登记群主和管理员**（默认行为）；
+    # 一旦填了就只发给名单上的人，数据库里登记的谁都不看 —— 收件人写死在
+    # .env 里，换群主、加管理员、撤管理员都不影响。
+    # 注意 openid 是「用户 × 机器人」维度的匿名 ID，不是 QQ 号，
+    # 换 AppID 就全变（连 group_openid 一起失效）。
+    notify_openids: tuple[str, ...] = ()
+    # 机器人进新群时自动订阅的源（RSSHub 路由或完整 URL）。**留空 = 关掉这个功能**。
+    # 启动时还会给「一个订阅都没有」的已有群补上（只补零订阅的，见
+    # autosub.AutoSubscriber.backfill —— 一律补会把故意退订的群重新订回来）。
+    auto_subscribe_feed: str = ""
 
 
 def load_config() -> Config:
@@ -76,4 +101,10 @@ def load_config() -> Config:
         # 关掉就退回「谁都能订阅/退订」。留这个开关是为了角色识别万一失灵时
         # 有条退路，不至于把机器人锁死。
         restrict_admin_commands=_env_bool("RESTRICT_ADMIN_COMMANDS", True),
+        send_per_minute=_env_int("SEND_PER_MINUTE", 20),
+        daily_send_limit=_env_int("DAILY_SEND_LIMIT", 900),
+        max_subs_per_group=_env_int("MAX_SUBS_PER_GROUP", 10),
+        max_fail_before_pause=_env_int("MAX_FAIL_BEFORE_PAUSE", 5),
+        notify_openids=_env_list("NOTIFY_OPENIDS"),
+        auto_subscribe_feed=(os.environ.get("AUTO_SUBSCRIBE_FEED") or "").strip(),
     )

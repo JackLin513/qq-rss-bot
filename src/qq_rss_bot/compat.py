@@ -38,7 +38,7 @@ class Mention:
     botpy 的 ``_User`` 只取 ``id / username / bot / avatar``，丢掉了
     **``is_you``** —— 而 ``is_you`` 是判断「这条 @ 是不是冲着机器人来的」
     最精确的依据，也是唯一能认出指令面板那种 @ 的东西：
-    面板插入的是 openid 占位符 ``<@C371C51B...>``，靠匹配显示名根本对不上。
+    面板插入的是 openid 占位符 ``<@机器人openid>``，靠匹配显示名根本对不上。
 
     和 ``member_role`` 是同一类问题：报文里有，botpy 不要，只能自己捡回来。
     """

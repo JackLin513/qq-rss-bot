@@ -43,7 +43,32 @@ CREATE TABLE IF NOT EXISTS seen_entries (
     seen_at         TEXT    NOT NULL,
     PRIMARY KEY (subscription_id, entry_key)
 );
+
+-- 每群每天的主动消息计数。落库而不是放内存：
+-- 进程重启不能把已用配额清零，否则一天的真实用量会被低估。
+CREATE TABLE IF NOT EXISTS send_counters (
+    group_openid TEXT    NOT NULL,
+    day          TEXT    NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (group_openid, day)
+);
+
+-- 出错时要私聊谁。openid 从群消息的 author.member_openid 里拿，
+-- 只有发过指令的人才会被记下来（从没说过话的成员拿不到 openid）。
+CREATE TABLE IF NOT EXISTS notify_targets (
+    group_openid  TEXT NOT NULL,
+    member_openid TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (group_openid, member_openid)
+);
 """
+
+# 老库缺的列。本项目没有成套迁移框架，但「加一列」这类向前兼容的改动
+# 用 PRAGMA 检查一下就够了 —— 不写的话，已有的 data/bot.db 会直接报
+# no such column。改类型 / 删列仍然要手工处理。
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("subscriptions", "fail_count", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 def utcnow() -> str:
@@ -60,6 +85,12 @@ class Subscription:
     initialized: bool
     last_polled_at: str | None
     last_error: str | None
+    # 连续抓取失败次数。到阈值就自动暂停，免得一个死掉的源
+    # 永远每 15 分钟失败一次、把日志和 RSSHub 都拖住。
+    fail_count: int = 0
+    # 暂停的订阅不参与轮询（due_subscriptions 里已经有 WHERE enabled = 1，
+    # 但在此之前项目里没有任何代码能把它设成 0）
+    enabled: bool = True
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> "Subscription":
@@ -72,6 +103,8 @@ class Subscription:
             initialized=bool(row["initialized"]),
             last_polled_at=row["last_polled_at"],
             last_error=row["last_error"],
+            fail_count=row["fail_count"] if "fail_count" in row.keys() else 0,
+            enabled=bool(row["enabled"]),
         )
 
 
@@ -83,7 +116,15 @@ class Database:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """把老库补齐到当前 SCHEMA（只做加列，见 _MIGRATIONS 的说明）。"""
+        for table, column, decl in _MIGRATIONS:
+            have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -106,6 +147,32 @@ class Database:
     def known_groups(self) -> list[str]:
         rows = self._conn.execute("SELECT group_openid FROM groups").fetchall()
         return [r["group_openid"] for r in rows]
+
+    def forget_group(self, group_openid: str) -> int:
+        """机器人退群时把该群彻底忘掉，返回删掉的订阅数。
+
+        **必须连 `groups` 那一行一起删。** `known_groups()` 是启动补订阅的依据：
+        只删订阅、留着 groups 的话，退群后那张表还记着这个群，
+        下次启动会把它当成「零订阅的新群」重新补上订阅，然后轮询器对着一个
+        机器人已经不在的群推送 —— 每个周期失败一次，永远不停
+        （而且 `fail_count` 只统计**抓取**失败，推送失败不会让它自动暂停）。
+
+        `send_counters` 不动：它按天清理，而且同一天被重新拉进群时
+        沿用已用配额反而更安全。
+        """
+        removed = self._conn.execute(
+            "SELECT COUNT(*) c FROM subscriptions WHERE group_openid = ?", (group_openid,)
+        ).fetchone()["c"]
+        self._conn.execute(
+            "DELETE FROM seen_entries WHERE subscription_id IN"
+            " (SELECT id FROM subscriptions WHERE group_openid = ?)",
+            (group_openid,),
+        )
+        self._conn.execute("DELETE FROM subscriptions WHERE group_openid = ?", (group_openid,))
+        self._conn.execute("DELETE FROM notify_targets WHERE group_openid = ?", (group_openid,))
+        self._conn.execute("DELETE FROM groups WHERE group_openid = ?", (group_openid,))
+        self._conn.commit()
+        return int(removed)
 
     # ---------- 订阅 ----------
 
@@ -165,17 +232,121 @@ class Database:
     def mark_polled(
         self, sub_id: int, *, title: str | None = None, error: str | None = None,
         mark_initialized: bool = False,
-    ) -> None:
+    ) -> int:
+        """记录一次抓取结果，返回**连续失败次数**（这次成功就归零）。
+
+        调用方靠这个返回值决定要不要自动暂停。
+        """
         self._conn.execute(
             """
             UPDATE subscriptions
                SET last_polled_at = ?,
                    last_error     = ?,
+                   fail_count     = CASE WHEN ? IS NULL THEN 0 ELSE fail_count + 1 END,
                    title          = COALESCE(?, title),
                    initialized    = CASE WHEN ? THEN 1 ELSE initialized END
              WHERE id = ?
             """,
-            (utcnow(), error, title, 1 if mark_initialized else 0, sub_id),
+            (utcnow(), error, error, title, 1 if mark_initialized else 0, sub_id),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT fail_count FROM subscriptions WHERE id = ?", (sub_id,)
+        ).fetchone()
+        return int(row["fail_count"]) if row else 0
+
+    def set_enabled(self, group_openid: str, sub_id: int, enabled: bool) -> bool:
+        """暂停 / 恢复一个订阅。表里本来就有 enabled 列，只是从前没有任何代码能改它。"""
+        cur = self._conn.execute(
+            "UPDATE subscriptions SET enabled = ? WHERE id = ? AND group_openid = ?",
+            (1 if enabled else 0, sub_id, group_openid),
+        )
+        if enabled:
+            # 恢复时把失败计数清零，否则一恢复就立刻又被自动暂停
+            self._conn.execute(
+                "UPDATE subscriptions SET fail_count = 0 WHERE id = ? AND group_openid = ?",
+                (sub_id, group_openid),
+            )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def set_interval(self, group_openid: str, sub_id: int, interval_sec: int) -> bool:
+        """改间隔，并把 last_polled_at 清空让新间隔**立刻生效**。
+
+        不清的话，从 60min 改成 5min 要等下一次到点（最多 60 分钟）才起作用，
+        用户会以为没改成。
+        """
+        cur = self._conn.execute(
+            """
+            UPDATE subscriptions
+               SET interval_sec = ?, last_polled_at = NULL
+             WHERE id = ? AND group_openid = ?
+            """,
+            (interval_sec, sub_id, group_openid),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def count_subscriptions(self, group_openid: str) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) c FROM subscriptions WHERE group_openid = ?", (group_openid,)
+        ).fetchone()
+        return int(row["c"])
+
+    # ---------- 主动消息配额 ----------
+
+    def send_count(self, group_openid: str, day: str) -> int:
+        row = self._conn.execute(
+            "SELECT count FROM send_counters WHERE group_openid = ? AND day = ?",
+            (group_openid, day),
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def bump_send_count(self, group_openid: str, day: str, n: int = 1) -> int:
+        self._conn.execute(
+            """
+            INSERT INTO send_counters (group_openid, day, count) VALUES (?, ?, ?)
+            ON CONFLICT (group_openid, day) DO UPDATE SET count = count + excluded.count
+            """,
+            (group_openid, day, n),
+        )
+        self._conn.commit()
+        return self.send_count(group_openid, day)
+
+    def prune_send_counters(self, keep_days: int = 7) -> None:
+        self._conn.execute(
+            "DELETE FROM send_counters WHERE day < date('now', ?)",
+            (f"-{int(keep_days)} day",),
+        )
+        self._conn.commit()
+
+    # ---------- 出错时私聊谁 ----------
+
+    def set_notify_target(self, group_openid: str, member_openid: str) -> None:
+        if not member_openid:
+            return
+        self._conn.execute(
+            """
+            INSERT INTO notify_targets (group_openid, member_openid, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (group_openid, member_openid) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (group_openid, member_openid, utcnow()),
+        )
+        self._conn.commit()
+
+    def notify_targets(self, group_openid: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT member_openid FROM notify_targets WHERE group_openid = ?"
+            " ORDER BY updated_at DESC",
+            (group_openid,),
+        ).fetchall()
+        return [r["member_openid"] for r in rows]
+
+    def remove_notify_target(self, group_openid: str, member_openid: str) -> None:
+        self._conn.execute(
+            "DELETE FROM notify_targets WHERE group_openid = ? AND member_openid = ?",
+            (group_openid, member_openid),
         )
         self._conn.commit()
 
@@ -255,5 +426,8 @@ class Database:
             ).fetchone()["c"],
             "seen_entries": self._conn.execute(
                 "SELECT COUNT(*) c FROM seen_entries"
+            ).fetchone()["c"],
+            "paused": self._conn.execute(
+                "SELECT COUNT(*) c FROM subscriptions WHERE enabled = 0"
             ).fetchone()["c"],
         }

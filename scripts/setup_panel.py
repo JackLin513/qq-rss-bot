@@ -29,13 +29,16 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import httpx  # noqa: E402
+
+# 显示宽度的口径和消息按钮共用一份实现（menu.display_width）。
+# 两处各写一遍的话，East-Asian-Width 的规则迟早会漂移。
+from qq_rss_bot.menu import display_width as _width  # noqa: E402
 
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 API_BASE = "https://api.sgroup.qq.com"
@@ -52,18 +55,21 @@ TARGET_TYPE = "all"  # 该场景下所有群都生效（机器人在群里的 op
 NAME_LIMIT = 14
 DESC_LIMIT = 30
 
-# only_admin 与代码里的 RESTRICTED_TOKENS 对齐：
-# /sub 和 /unsub 在代码里就是仅群主/管理员可用，面板上也标上，UI 语义才一致。
+# **只留三个入口。** 指令面板实测是**平的、不能嵌套**
+# （见 scripts/probe_panel.py），11 个元素挤在一起之后再加功能就没地方放了。
+# 所以面板只管把人领进门，订阅/退订/列表/搜索这些全收进 `/rss` 的按钮卡片里
+# —— 面板做不到的层级，消息里的 keyboard 做得到。
+#
+# 三个都是 only_admin=False：`/rss` 只是打开菜单，具体指令各自的权限在
+# commands._is_admin 里判。面板上标成管理员会让普通成员连菜单都打不开。
+#
 # 名称用**裸名**（不带斜杠）：实测服务端会把开头的 `/` 剥掉存成 `sub`，
-# 客户端点击时自己补 `/`。写成 `/sub` 不会被拒，但回读时对不上，制造假差异。
+# 客户端点击时自己补 `/`。写成 `/rss` 不会被拒，但回读时对不上，制造假差异。
 PANEL_ITEMS = [
-    {"name": "sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
-    {"name": "unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
-    {"name": "list", "desc": "查看本群所有订阅", "type": "command", "only_admin": False},
-    {"name": "find", "desc": "搜索 RSSHub 路由，不用记路径", "type": "command",
+    {"name": "rss", "desc": "RSS 订阅设置，点开是按钮菜单", "type": "command",
      "only_admin": False},
-    {"name": "check", "desc": "立刻抓一次验证源是否可用", "type": "command", "only_admin": False},
-    {"name": "ping", "desc": "检查机器人在线状态", "type": "command", "only_admin": False},
+    {"name": "new", "desc": "读最新几条新闻，可指定数量", "type": "command",
+     "only_admin": False},
     {"name": "help", "desc": "查看完整用法说明", "type": "command", "only_admin": False},
 ]
 
@@ -130,16 +136,6 @@ def compare_items(remote: list[dict]) -> list[str]:
     if [_name_key(i["name"]) for i in PANEL_ITEMS] != [_name_key(i.get("name")) for i in remote]:
         diffs.append("元素顺序不一致（代码里的顺序视为期望顺序）")
     return diffs
-
-
-def _width(text: str) -> int:
-    """按官方口径算显示宽度：全角/宽字符算 2，其余算 1。
-
-    官方校验的是宽度不是字符数。用 len() 数的话，
-    「订阅本群所有 RSS 更新」这种 11 个字的中文描述会被当成 11 放行，
-    实际宽度 20+，接口才打回来。
-    """
-    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
 
 
 def validate(items: list[dict]) -> list[str]:

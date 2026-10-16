@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -14,8 +16,19 @@ import httpx
 
 from .config import Config
 from .db import Database, Subscription
-from .rss import fetch_feed, resolve_url
+from .menu import (
+    MAX_INLINE_UNSUB,
+    build_rss_keyboard,
+    build_rss_markdown,
+    build_rss_text,
+    build_unsub_keyboard,
+    build_unsub_markdown,
+    format_subscription_list,
+)
+from .rss import Entry, FeedResult, fetch_feed, resolve_url
 from .routes import format_hits, load_index
+from .quota import QuotaExceeded
+from .scheduler import Pusher, format_entry
 
 _log = logging.getLogger("qq_rss_bot.commands")
 
@@ -58,7 +71,7 @@ def is_bot_mentioned(
 
     1. **``is_you``** —— 平台直接标了「这个 @ 就是你」。这是唯一精确的依据，
        也是唯一能认出指令面板那种 @ 的东西：面板插入的是 openid 占位符
-       ``<@C371C51B...>`` 而不是显示名，字符串匹配对不上。
+       ``<@机器人openid>`` 而不是显示名，字符串匹配对不上。
        （botpy 的 ``_User`` 会丢掉 ``is_you``，由 ``compat.Mention`` 捡回来。）
     2. ``mentions`` **非空但没一个 ``is_you``** → 明确是在 @ 别人，直接否定。
        有了这条，「@队友 + 恰好一个指令名」不再误触发。
@@ -94,18 +107,25 @@ def is_bot_mentioned(
     return False
 
 HELP_TEXT = """RSS 订阅机器人
+/rss                               按钮菜单：订阅 / 退订 / 列表 / 搜索
 /sub <RSSHub路由或URL> [间隔分钟]  订阅，默认 15 分钟
 /unsub <编号>                      取消订阅
 /list                              查看本群订阅
 /find <关键词>                     搜 RSSHub 路由，不用记路径
-/check <编号>                      立刻抓一次并预览
+/new [编号|all] [条数]             读最新几条，默认每源 3 条
+/check <编号>                      抓一次看源还活着没（只看，不影响推送）
+/pause <编号>                      暂停某个订阅
+/resume <编号>                     恢复暂停的订阅
+/interval <编号> <分钟>            改抓取间隔，不用退订重订
 /ping                              存活检测
 /help                              本说明
 
 订阅是按群共享的：群里任何人订阅，全群都会收到推送。
-/sub 与 /unsub 仅群主和管理员可用。
+/sub /unsub /pause /resume /interval 仅群主和管理员可用。
 
-例：/sub /36kr/newsflashes 30"""
+例：/sub /36kr/newsflashes 30
+
+新群会被自动订上默认源（AUTO_SUBSCRIBE_FEED），不用手动配。"""
 
 # 指令别名 → 规范名。键是群里实际能敲的 token（不带斜杠）。
 # 这张表是「什么算指令」的唯一依据 —— 别名、权限、@ 识别都从它派生，
@@ -126,7 +146,18 @@ COMMAND_ALIASES = {
     "搜索": "find",
     "路由": "find",
     "check": "check",
+    "new": "new",
+    "最新": "new",
+    "pause": "pause",
+    "暂停": "pause",
+    "resume": "resume",
+    "恢复": "resume",
+    "interval": "interval",
+    "间隔": "interval",
     "ping": "ping",
+    "rss": "rss",
+    "菜单": "rss",
+    "menu": "rss",
 }
 
 COMMAND_TOKENS = frozenset(COMMAND_ALIASES)
@@ -139,13 +170,21 @@ COMMAND_METHODS = {
     "list": "_list",
     "find": "_find",
     "check": "_check",
+    "new": "_new",
+    "pause": "_pause",
+    "resume": "_resume",
+    "interval": "_interval",
     "ping": "_ping",
+    "rss": "_rss",
 }
 
 # 只有群主/管理员能用的指令。**从别名表派生**，加别名不会漏 ——
 # 曾经是手工列 {"sub","subscribe","订阅",...}，漏一个中文别名就等于没限制。
+RESTRICTED_CANONICAL = frozenset({"sub", "unsub", "pause", "resume", "interval"})
 RESTRICTED_TOKENS = frozenset(
-    token for token, canonical in COMMAND_ALIASES.items() if canonical in ("sub", "unsub")
+    token
+    for token, canonical in COMMAND_ALIASES.items()
+    if canonical in RESTRICTED_CANONICAL
 )
 
 
@@ -166,13 +205,33 @@ def looks_like_command(text: str | None) -> bool:
 # /find 每次最多显示几条 —— 群消息有长度限制，而且人也不会往下翻
 _FIND_LIMIT = 5
 
+# /new 是**逐条带图**发的，一次刷太多会撞上群维度 20 qpm 的频控，
+# 所以三个数都得有：默认值、单源上限、单次总量上限。
+_NEW_DEFAULT = 3
+_NEW_MAX_PER_SUB = 10
+_NEW_MAX_TOTAL = 15
+# 逐条之间的间隔，和 scheduler 的推送节奏一致（稳定到达顺序 + 避频控）
+_NEW_GAP_SEC = 0.4
+# /new 的每群冷却。它一次最多发 15 条，占的是**全群共享**的每日配额，
+# 不限的话一个人连点几下就能把一天的配额烧掉。
+_NEW_COOLDOWN_SEC = 60.0
+
 # 实测群主是 "owner"；"admin" 是按常见约定加的，若真实值不同，
 # 拒绝时会把实际角色打进日志，照着改这里即可。
 ADMIN_ROLES = frozenset({"owner", "admin"})
 
+# /rss 的子参数：`/rss unsub` 是「退订…」按钮点出来的二级卡片（手打也认）。
+_RSS_UNSUB_ARGS = frozenset({"unsub", "退订", "cancel"})
+
 
 class Replier(Protocol):
     async def __call__(self, text: str) -> None: ...
+
+
+class CardReplier(Protocol):
+    """带按钮的回复（markdown + keyboard）。"""
+
+    async def __call__(self, markdown: str, keyboard: dict) -> None: ...
 
 
 @dataclass
@@ -182,14 +241,29 @@ class CommandContext:
     # 发起人在群里的角色（owner / admin / …）。由 compat.py 的补丁补上，
     # 老协议路径或 botpy 行为变化时可能为 None —— 见 CommandHandler._is_admin。
     member_role: str | None = None
+    # 带按钮的回复。**必须有默认值**：smoke.py 里十几处是位置传参
+    # （CommandContext("G", reply, "owner")），加个没默认值的字段会全炸。
+    # 拿不到时 /rss 退化成纯文本，不影响功能。
+    reply_card: CardReplier | None = None
 
 
 class CommandHandler:
-    def __init__(self, cfg: Config, db: Database, http: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        db: Database,
+        http: httpx.AsyncClient,
+        pusher: Pusher | None = None,
+    ) -> None:
         self.cfg = cfg
         self.db = db
         self.http = http
+        # /new 要主动发消息（带图那条路只有 Pusher 有），
+        # 所以把推送出口也接进来，而不是在指令层另写一套发消息的代码。
+        # 测试里传 None 也能跑，_new 会回一句「不支持」。
+        self.pusher = pusher
         self._routes = None  # 路由表懒加载，进程内常驻
+        self._last_new: dict[str, float] = {}  # /new 的每群冷却
 
     async def handle(self, ctx: CommandContext, raw: str) -> None:
         text = _PLACEHOLDER_RE.sub("", raw or "").strip()
@@ -200,8 +274,13 @@ class CommandHandler:
         parts = text.split()
         command, args = parts[0].lstrip("/").lower(), parts[1:]
 
+        # 用 .get + getattr(..., None) 而不是 COMMAND_METHODS[canonical]：
+        # 这一行在 try **外面**，只加别名忘了往 COMMAND_METHODS 挂方法就是
+        # 未捕获的 KeyError（整个事件处理器炸掉，而不是回一句「未知指令」）。
+        # smoke 里另有一条断言：COMMAND_METHODS 的每个值都真的存在于 CommandHandler。
         canonical = COMMAND_ALIASES.get(command)
-        handler = getattr(self, COMMAND_METHODS[canonical]) if canonical else None
+        method = COMMAND_METHODS.get(canonical) if canonical else None
+        handler = getattr(self, method, None) if method else None
 
         if handler is None:
             # 群里随便聊天时不要刷屏，只有看起来像指令才回
@@ -252,6 +331,35 @@ class CommandHandler:
             f"pong\n群 {stats['groups']} / 订阅 {stats['subscriptions']} / 已记录条目 {stats['seen_entries']}"
         )
 
+    async def _rss(self, ctx: CommandContext, args: list[str]) -> None:
+        """按钮菜单。
+
+        指令面板是**平的、不能嵌套**（实测，`scripts/probe_panel.py` 可复跑），
+        所以面板只留入口，真正的分层靠这条消息里的按钮。
+
+        退订按钮按本群的实际订阅**现算**，点下去插的是完整指令 `/unsub 1` ——
+        省得用户回去数编号。超过 MAX_INLINE_UNSUB 个就折叠成「退订…」，
+        点开去二级卡片展开（单条消息的按钮行数上限官方没写，主动压住）。
+        """
+        subs = self.db.list_subscriptions(ctx.group_openid)
+        # /rss unsub 走二级卡片；订阅不多时它和主卡片本来就一样，直接用主卡片
+        sub = args[0].lower() if args else ""
+        use_second = sub in _RSS_UNSUB_ARGS and len(subs) > MAX_INLINE_UNSUB
+        if use_second:
+            text, kb = build_unsub_markdown(subs), build_unsub_keyboard(subs)
+        else:
+            text, kb = build_rss_markdown(subs), build_rss_keyboard(subs)
+
+        if ctx.reply_card is not None:
+            try:
+                await ctx.reply_card(text, kb)
+                return
+            except Exception:  # noqa: BLE001 —— 网络层什么都可能抛
+                # 卡片发不出去（比如账号没有 markdown 权限）不该让 /rss 整个失效
+                _log.warning("发送 /rss 按钮卡片失败，退回纯文本", exc_info=True)
+        # 拿不到卡片通道（老协议路径 / 测试里的假实现）也走这里
+        await ctx.reply(build_rss_text(subs))
+
     async def _sub(self, ctx: CommandContext, args: list[str]) -> None:
         if not args:
             await ctx.reply("用法：/sub <RSSHub路由或URL> [间隔分钟]")
@@ -271,6 +379,28 @@ class CommandHandler:
         else:
             interval = self.cfg.default_interval_sec
 
+        # 已经订过就别再抓一遍了 —— 顺便告诉用户怎么改间隔（以前只会回一句
+        # 「已经订阅过了」，用户想改间隔只能退订重订，而重订会重建 baseline 丢增量）
+        existing = self._find_sub(ctx.group_openid, url)
+        if existing is not None:
+            pos, sub = existing
+            await ctx.reply(
+                f"本群已经订阅过了（编号 {pos}）：{sub.title or url}\n"
+                f"当前每 {sub.interval_sec // 60} 分钟检查一次，"
+                f"想改间隔用 /interval {pos} <分钟>。"
+            )
+            return
+
+        # 上限要在**抓取之前**判：不然白抓一次才说不让订
+        cap = self.cfg.max_subs_per_group
+        if cap and self.db.count_subscriptions(ctx.group_openid) >= cap:
+            await ctx.reply(
+                f"本群订阅数已达上限 {cap} 个。\n"
+                f"用 /list 看看现有的、/unsub 退掉不用的再订阅。\n"
+                f"（设上限是因为推送要占主动消息配额，源太多会互相挤。）"
+            )
+            return
+
         # 先抓一次：既能验证路由，又能建立 baseline，避免订阅瞬间倒灌旧文章
         result = await fetch_feed(self.http, url, self.cfg.fetch_timeout_sec)
         if not result.ok:
@@ -280,16 +410,20 @@ class CommandHandler:
         sub_id, created = self.db.add_subscription(
             ctx.group_openid, url, result.title, interval
         )
-        if not created:
-            await ctx.reply(f"本群已经订阅过了（编号 {sub_id}）：{result.title or url}")
+        if not created:  # 竞态：上面查过之后、这里插入之前又被订了一次
+            await ctx.reply(f"本群已经订阅过了：{result.title or url}")
             return
 
         # 把当前已有条目全部登记为已见，之后只推增量
         self.db.filter_new_entries(sub_id, [e.key for e in result.entries])
         self.db.mark_polled(sub_id, title=result.title, mark_initialized=True)
 
+        # 编号是**本群内的位置**，不是数据库主键 —— 新增的排在最后，
+        # 所以位置就是当前条数。直接用 sub_id 会泄漏全局自增主键：
+        # 一个从没订阅过的新群，第一条会显示成「5.」。
+        pos = self.db.count_subscriptions(ctx.group_openid)
         await ctx.reply(
-            f"订阅成功，编号 {sub_id}\n"
+            f"订阅成功，编号 {pos}\n"
             f"{result.title or url}\n"
             f"当前 {len(result.entries)} 条，每 {interval // 60} 分钟检查一次，只推新内容。"
         )
@@ -308,6 +442,20 @@ class CommandHandler:
         # 只有名字能让人一眼看出删错没有。
         await ctx.reply(f"已取消订阅 {pos}. {sub.title or sub.url}")
 
+    def _position_of(self, group_openid: str, sub_id: int) -> int | None:
+        """数据库主键 → 用户看到的**群内位置**。"""
+        for pos, sub in enumerate(self.db.list_subscriptions(group_openid), 1):
+            if sub.id == sub_id:
+                return pos
+        return None
+
+    def _find_sub(self, group_openid: str, url: str) -> tuple[int, Subscription] | None:
+        """按 URL 找本群的订阅，返回 (位置, 订阅)。"""
+        for pos, sub in enumerate(self.db.list_subscriptions(group_openid), 1):
+            if sub.url == url:
+                return pos, sub
+        return None
+
     def _pick(self, group_openid: str, raw: str) -> tuple[int, Subscription] | None:
         """把 /list 里的编号解析成 (位置, 订阅)。
 
@@ -325,21 +473,11 @@ class CommandHandler:
         return pos, subs[pos - 1]
 
     async def _list(self, ctx: CommandContext, args: list[str]) -> None:
-        subs = self.db.list_subscriptions(ctx.group_openid)
-        if not subs:
-            await ctx.reply("本群还没有订阅，用 /sub 添加。")
-            return
-        lines = ["本群订阅："]
         # 编号用**本群内的位置**，不用数据库主键：主键全局自增、跨群共享，
         # 会让新群的第一条订阅显示成 "5."，删一条还留空号。
-        for pos, sub in enumerate(subs, 1):
-            name = sub.title or sub.url
-            if len(name) > 40:
-                name = name[:39] + "…"
-            flag = "" if sub.initialized else "（待首抓）"
-            err = f" ⚠{sub.last_error}" if sub.last_error else ""
-            lines.append(f"{pos}. {name} / {sub.interval_sec // 60}min{flag}{err}")
-        await ctx.reply("\n".join(lines))
+        # 格式化的那份在 menu.py —— /rss 的按钮发不出去时也用同一份兜底，
+        # 两边必须长得一样。
+        await ctx.reply(format_subscription_list(self.db.list_subscriptions(ctx.group_openid)))
 
     async def _route_index(self):
         """懒加载 RSSHub 路由表。
@@ -380,7 +518,14 @@ class CommandHandler:
         await ctx.reply(format_hits(query, total, hits, _FIND_LIMIT))
 
     async def _check(self, ctx: CommandContext, args: list[str]) -> None:
-        """手动触发一次抓取，用来验证路由是否还活着。"""
+        """抓一次看看源还活着没。**只看，不动去重状态。**
+
+        踩过的坑：这里原本调的是 `filter_new_entries`，它是「查的同时就写入已见」
+        的版本。于是用户只是想预览一下，那几条新内容就被**静默消费**掉了，
+        定时推送永远不会再发 —— 而回复里还写着「本次新 3 条」，
+        读起来像是在报告状态，实际是把它吃掉了。
+        推送路径本来就用只读的 `seen_keys`，这里必须一致。
+        """
         if not args:
             await ctx.reply("用法：/check <编号>")
             return
@@ -393,13 +538,275 @@ class CommandHandler:
 
         result = await fetch_feed(self.http, sub.url, self.cfg.fetch_timeout_sec)
         if not result.ok:
-            self.db.mark_polled(sub_id, error=result.error)
-            await ctx.reply(f"抓取失败：{result.error}")
+            # 手动检查也算一次失败：让它参与连续失败计数，
+            # 该自动暂停的照样暂停。但**不** update last_polled_at，
+            # 免得手动看一眼就把定时抓取往后推一轮。
+            fails = self.db.mark_polled(sub_id, error=result.error)
+            await ctx.reply(f"抓取失败（连续 {fails} 次）：{result.error}")
             return
 
-        fresh = self.db.filter_new_entries(sub_id, [e.key for e in result.entries])
+        # 只读：不写 seen_entries
+        already = self.db.seen_keys(sub_id, [e.key for e in result.entries])
+        pending = len(result.entries) - len(already)
         self.db.mark_polled(sub_id, title=result.title, mark_initialized=True)
         preview = result.entries[0].title if result.entries else ""
         await ctx.reply(
-            f"{result.title or sub.url}\n共 {len(result.entries)} 条，本次新 {len(fresh)} 条\n最新：{preview}"
+            f"{result.title or sub.url}\n"
+            f"共 {len(result.entries)} 条，其中 {pending} 条还没推送过\n"
+            f"最新：{preview}\n"
+            f"（只是看看，不影响推送状态；想现在就读用 /new {args[0]}）"
         )
+
+    async def _pause(self, ctx: CommandContext, args: list[str]) -> None:
+        """暂停订阅。表里本来就有 enabled 列，只是从前没有任何代码能改它。"""
+        await self._set_enabled(ctx, args, False)
+
+    async def _resume(self, ctx: CommandContext, args: list[str]) -> None:
+        await self._set_enabled(ctx, args, True)
+
+    async def _set_enabled(self, ctx: CommandContext, args: list[str], enabled: bool) -> None:
+        word = "恢复" if enabled else "暂停"
+        cmd = "resume" if enabled else "pause"
+        if not args:
+            await ctx.reply(f"用法：/{cmd} <编号>（编号用 /list 查）")
+            return
+        picked = self._pick(ctx.group_openid, args[0])
+        if picked is None:
+            await ctx.reply("编号不对，先用 /list 看本群订阅的编号。")
+            return
+        pos, sub = picked
+        if not self.db.set_enabled(ctx.group_openid, sub.id, enabled):
+            await ctx.reply(f"{word}失败，先用 /list 确认编号。")
+            return
+        name = sub.title or sub.url
+        if enabled:
+            await ctx.reply(f"已{word} {pos}. {name}\n下次抓取会重新对齐时间，失败计数已清零。")
+        else:
+            await ctx.reply(
+                f"已{word} {pos}. {name}\n"
+                f"暂停期间不再抓取和推送，已读过的不受影响；/resume {pos} 可以恢复。"
+            )
+
+    async def _interval(self, ctx: CommandContext, args: list[str]) -> None:
+        """改抓取间隔。
+
+        必须是独立指令：/sub 同一个 URL 只会说「已经订阅过了」，
+        用户想从 15 分钟改成 60 分钟就只能退订重订 —— 而重订会**重建 baseline**，
+        把两次之间的增量全部丢掉。改间隔不该付出这个代价。
+        """
+        if len(args) < 2:
+            await ctx.reply(
+                "用法：/interval <编号> <分钟>\n"
+                "例：/interval 1 60    （编号用 /list 查）"
+            )
+            return
+        picked = self._pick(ctx.group_openid, args[0])
+        if picked is None:
+            await ctx.reply("编号不对，先用 /list 看本群订阅的编号。")
+            return
+        try:
+            minutes = int(args[1])
+        except ValueError:
+            await ctx.reply("间隔得是整数分钟，例如 /interval 1 60")
+            return
+        if not 1 <= minutes <= 1440:
+            await ctx.reply("间隔请填 1~1440 分钟。")
+            return
+        pos, sub = picked
+        if not self.db.set_interval(ctx.group_openid, sub.id, minutes * 60):
+            await ctx.reply("修改失败，先用 /list 确认编号。")
+            return
+        await ctx.reply(
+            f"{pos}. {sub.title or sub.url} 的间隔已改为 {minutes} 分钟，立刻生效。"
+        )
+
+    def _parse_new_args(
+        self, subs: list[Subscription], args: list[str]
+    ) -> tuple[list[Subscription], int] | str:
+        """解析 /new 的参数，返回 (要读的订阅, 每个源几条)，参数不对就返回一句提示。
+
+        形态：
+            /new             全部订阅，每个 3 条
+            /new 2           第 2 个订阅，3 条
+            /new 2 5         第 2 个订阅，5 条
+            /new all 5       全部订阅，每个 5 条
+
+        编号沿用 /list 的**本群位置**语义（和 _pick 一致），不是数据库主键。
+        """
+        if len(args) > 2:
+            return "用法：/new [编号|all] [条数]"
+
+        per = _NEW_DEFAULT
+        if len(args) == 2:
+            if not args[1].isdigit():
+                return "条数得是整数，例如 /new 2 5"
+            # 超出单源上限就静默截到上限：这里没必要报错，
+            # 用户要的是「多给几条」，不是「必须恰好 N 条」。
+            per = max(1, min(int(args[1]), _NEW_MAX_PER_SUB))
+
+        target = (args[0] if args else "all").lower()
+        if target in ("all", "全部", "所有"):
+            return list(subs), per
+        if not target.isdigit():
+            return "用法：/new [编号|all] [条数]"
+        pos = int(target)
+        if pos < 1 or pos > len(subs):
+            return "编号不对，先用 /list 看本群订阅的编号。"
+        return [subs[pos - 1]], per
+
+    async def _new(self, ctx: CommandContext, args: list[str]) -> None:
+        """按需读取最新内容。
+
+        和定时推送只差触发方式：推送是「有新条目就发」，/new 是「我现在就要看」。
+        两者共用同一个推送出口和同一套文案，所以群里的观感是一致的。
+
+        **读过的条目会被标记为已见**，定时推送不会再原样发一遍 ——
+        否则用户主动看一眼，过几分钟机器人又把同样的东西刷一次。
+
+        默认每源 3 条。整批一次性发完会撞频控，所以有单源和单次总量两个上限。
+        """
+        if self.pusher is None:
+            await ctx.reply("当前通道不支持读取新闻。")
+            return
+
+        # 冷却：一次最多发 15 条，占的是**全群共享**的每日配额。
+        # 不限的话一个人连点几下就能把一天的配额烧掉，别人就没得看了。
+        now = time.monotonic()
+        elapsed = now - self._last_new.get(ctx.group_openid, 0.0)
+        if elapsed < _NEW_COOLDOWN_SEC:
+            await ctx.reply(
+                f"/new 每分钟只能用一次，还要等 "
+                f"{int(_NEW_COOLDOWN_SEC - elapsed) + 1} 秒。"
+            )
+            return
+        self._last_new[ctx.group_openid] = now
+
+        subs = self.db.list_subscriptions(ctx.group_openid)
+        if not subs:
+            await ctx.reply("本群还没有订阅，用 /sub 添加。")
+            return
+
+        parsed = self._parse_new_args(subs, args)
+        if isinstance(parsed, str):
+            await ctx.reply(parsed)
+            return
+        targets, per = parsed
+
+        # 并发抓，源之间互不拖累
+        results = await asyncio.gather(
+            *(fetch_feed(self.http, sub.url, self.cfg.fetch_timeout_sec) for sub in targets),
+            return_exceptions=True,
+        )
+
+        plan: list[tuple[Subscription, FeedResult, list[Entry]]] = []
+        failed = 0
+        for sub, result in zip(targets, results):
+            if isinstance(result, BaseException) or not result.ok:
+                failed += 1
+                _log.warning(
+                    "读取最新失败 %s: %s",
+                    sub.url,
+                    result if isinstance(result, BaseException) else result.error,
+                )
+                continue
+            plan.append((sub, result, list(result.entries[:per])))
+
+        # 总量上限：按订阅顺序取，取满为止。被截掉的**不标记已见**，
+        # 留给定时推送补发。
+        budget = _NEW_MAX_TOTAL
+        shown: list[tuple[Subscription, FeedResult, list[Entry]]] = []
+        for sub, result, entries in plan:
+            take = entries[:budget]
+            if not take:
+                break
+            budget -= len(take)
+            shown.append((sub, result, take))
+
+        total = sum(len(entries) for _, _, entries in shown)
+        if not total:
+            note = f"（{failed} 个源抓取失败）" if failed else ""
+            await ctx.reply(f"没取到内容。{note}")
+            return
+
+        # 回执先发：逐条发中间会静默好几秒，没有回执用户不知道点没点上。
+        # 走被动回复，不占主动消息额度。
+        dropped = sum(len(entries) for _, _, entries in plan) - total
+        lines = [
+            "最新 %d 条：%s"
+            % (
+                total,
+                " · ".join(
+                    f"{(sub.title or sub.url)[:20]} {len(entries)}" for sub, _, entries in shown
+                ),
+            )
+        ]
+        if dropped:
+            lines.append(f"（单次上限 {_NEW_MAX_TOTAL} 条，省略 {dropped} 条）")
+        if failed:
+            lines.append(f"（{failed} 个源抓取失败）")
+        await ctx.reply("\n".join(lines))
+
+        seen: dict[int, list[str]] = {}
+        sent = 0
+        quota_hit = False
+        for sub, result, entries in shown:
+            for entry in entries:
+                if sent:
+                    await asyncio.sleep(_NEW_GAP_SEC)
+                sent += 1
+                text = format_entry(result.title, sub.url, entry)
+                ok = False
+                if self.cfg.attach_images and entry.image:
+                    try:
+                        await self.pusher.send_rich(ctx.group_openid, text, entry.image)
+                        ok = True
+                    except QuotaExceeded as exc:
+                        # 配额是整批级别的状态，不能当成「这张图坏了」退回纯文字 ——
+                        # 那样会白试一遍，每条还多刷一行日志
+                        _log.warning("群 %s 配额用尽，/new 提前结束: %s", ctx.group_openid, exc)
+                        try:
+                            await ctx.reply(
+                                f"今日主动消息配额已用尽（{exc.used}/{exc.limit} 条），"
+                                f"剩下的 {total - sent} 条不发了，明天零点恢复。"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        quota_hit = True
+                        break
+                    except Exception as exc:  # noqa: BLE001 —— QQ 拉不到图/图太大都可能
+                        _log.warning("配图失败，退回纯文字 (%s): %s", entry.image, exc)
+                if quota_hit:
+                    break
+                if not ok:
+                    try:
+                        await self.pusher.send_text(ctx.group_openid, text)
+                        ok = True
+                    except QuotaExceeded as exc:
+                        # 配额没了：剩下的发也白发，直接收尾。
+                        # 已经发出去的那些照常标记已见（它们是成功的），
+                        # 没发的**不标记**，留给定时推送。
+                        _log.warning("群 %s 配额用尽，/new 提前结束: %s", ctx.group_openid, exc)
+                        try:
+                            await ctx.reply(
+                                f"今日主动消息配额已用尽（{exc.used}/{exc.limit} 条），"
+                                f"剩下的 {total - sent} 条不发了，明天零点恢复。"
+                            )
+                        except Exception:  # noqa: BLE001 —— 回执发不出去也不能影响收尾
+                            pass
+                        quota_hit = True
+                        break
+                    except Exception as exc:
+                        _log.error("发送失败，留给定时推送: %s | %s", entry.title[:40], exc)
+
+                # 只把**真发出去**的记成已见，和 scheduler 的 at-least-once 一致。
+                # 配额用尽时 ok 必为 False，自然不会标记。
+                if ok:
+                    seen.setdefault(sub.id, []).append(entry.key)
+                if quota_hit:
+                    break
+            if quota_hit:
+                break
+
+        for sub_id, keys in seen.items():
+            self.db.mark_seen(sub_id, keys)
+            self.db.prune_seen(sub_id)
