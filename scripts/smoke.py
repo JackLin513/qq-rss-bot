@@ -107,6 +107,73 @@ async def _check_push_routing() -> None:
         db.close()
 
 
+async def _check_retry_on_push_failure() -> None:
+    """推送失败必须留下重试机会。
+
+    回归测试：曾经 filter_new_entries 在推送**之前**就标记已见，
+    网络一断这些条目就永远不再推 —— 静默丢消息。
+    """
+    import qq_rss_bot.scheduler as sched
+    from qq_rss_bot.rss import Entry as E
+    from qq_rss_bot.rss import FeedResult
+    from qq_rss_bot.scheduler import FeedPoller
+
+    original = sched.fetch_feed
+
+    async def fake_fetch(client, url, timeout):  # noqa: ARG001
+        return FeedResult(
+            url=url,
+            title="源名",
+            entries=[
+                E("k1", "标题1", "https://a.com/1", None, "", None),
+                E("k2", "标题2", "https://a.com/2", None, "", None),
+            ],
+        )
+
+    sched.fetch_feed = fake_fetch
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "t.db")
+            sid, _ = db.add_subscription("G", "https://a.com/f", "源名", 60)
+            db.mark_polled(sid, title="源名", mark_initialized=True)
+            sub = db.list_subscriptions("G")[0]
+
+            class Flaky:
+                def __init__(self) -> None:
+                    self.fail = True
+                    self.text: list[str] = []
+
+                async def send_text(self, group_openid: str, content: str) -> None:
+                    if self.fail:
+                        raise RuntimeError("模拟网络中断")
+                    self.text.append(content)
+
+                async def send_rich(self, group_openid, content, url) -> None:
+                    await self.send_text(group_openid, content)
+
+            f = Flaky()
+            poller = FeedPoller(cfg_stub(), db, None, f)
+
+            await poller._poll_one(sub)
+            check("推送失败 → 不标记已见（留待重试）",
+                  db.seen_keys(sid, ["k1", "k2"]) == set(), str(db.seen_keys(sid, ["k1", "k2"])))
+
+            f.fail = False
+            await poller._poll_one(sub)
+            check("网络恢复后重推成功", len(f.text) == 2, f"实际 {len(f.text)}")
+            check("推成功后标记已见",
+                  db.seen_keys(sid, ["k1", "k2"]) == {"k1", "k2"})
+
+            f.text.clear()
+            await poller._poll_one(sub)
+            check("已见的不再重推", f.text == [], f"实际 {len(f.text)}")
+
+            check("seen_keys 只查不写", db.seen_keys(sid, ["从没见过的key"]) == set())
+            db.close()
+    finally:
+        sched.fetch_feed = original
+
+
 print("[1] resolve_url")
 check("路由补全", resolve_url("/github/trending/daily/python", "https://rsshub.app")
       == "https://rsshub.app/github/trending/daily/python")
@@ -201,6 +268,9 @@ check("已知局限：@名字前缀会被误判", is_bot_mentioned("@bot2 hi", [
 
 print("[4.55] 逐条推送的配图路由")
 asyncio.run(_check_push_routing())
+
+print("[4.56] 推送失败必须可重试（不丢消息）")
+asyncio.run(_check_retry_on_push_failure())
 
 print("[4.6] botpy 新协议适配器注册")
 import inspect  # noqa: E402

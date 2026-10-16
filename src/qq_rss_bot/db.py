@@ -181,10 +181,42 @@ class Database:
 
     # ---------- 条目去重 ----------
 
+    def seen_keys(self, sub_id: int, entry_keys: Sequence[str]) -> set[str]:
+        """只查哪些 key 已经见过，**不写入**。
+
+        与 filter_new_entries 的区别很重要：推送要在「标记已见」之前发生，
+        否则推送失败时条目已被记为见过，就永远不会再推了（丢消息）。
+        """
+        if not entry_keys:
+            return set()
+        marks = ",".join("?" * len(entry_keys))
+        rows = self._conn.execute(
+            f"SELECT entry_key FROM seen_entries"
+            f" WHERE subscription_id = ? AND entry_key IN ({marks})",
+            (sub_id, *entry_keys),
+        ).fetchall()
+        return {r["entry_key"] for r in rows}
+
+    def mark_seen(self, sub_id: int, entry_keys: Sequence[str]) -> None:
+        """登记为已见。推送成功之后才该调用。"""
+        if not entry_keys:
+            return
+        now = utcnow()
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO seen_entries (subscription_id, entry_key, seen_at)"
+            " VALUES (?, ?, ?)",
+            [(sub_id, key, now) for key in entry_keys],
+        )
+        self._conn.commit()
+
     def filter_new_entries(
         self, sub_id: int, entry_keys: Sequence[str]
     ) -> list[str]:
-        """返回其中从未见过的 key，并把它们登记为已见。"""
+        """返回其中从未见过的 key，并**立即**把它们登记为已见。
+
+        适用于「不打算推送、只想标记」的场景（首抓建 baseline、/check 手动抓取）。
+        推送路径请改用 seen_keys + mark_seen，见上面 seen_keys 的说明。
+        """
         fresh: list[str] = []
         now = utcnow()
         for key in entry_keys:

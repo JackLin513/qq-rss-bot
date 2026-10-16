@@ -82,12 +82,19 @@ uv run python scripts/test_push.py             # 测主动消息（不占 WS 会
 ## 约定
 
 - 注释和用户可见文案用中文，代码标识符用英文。
+- **推送顺序不能反：先推送，成功了才 `mark_seen`**。语义是 at-least-once。
+  曾经用 `filter_new_entries`（查的同时就写入已见）在推送**之前**标记，
+  结果网络一断，那批条目已算见过、永远不再推 —— 静默丢消息且无任何日志。
+  所以 `db.seen_keys()` 只查不写，`db.mark_seen()` 才写；
+  `filter_new_entries` 只留给「不推送、只标记」的场景（首抓 baseline、/check）。
+- **`poll_once` 里 `asyncio.gather(..., return_exceptions=True)` 的返回值必须检查**。
+  不检查的话异常被静默吞掉，推送失败连一行日志都没有。
 - **推送是逐条发的，不是合并摘要**。原因：一条图文消息只能带一张图
   （官方 `media` 只收单个对象，传数组 400，实测过），合并就带不了图。
   文案改动看 `scheduler.format_entry`，长度上限 `_MAX_CONTENT = 1500`；
   逐条之间的间隔是 `_PUSH_GAP_SEC`（避免撞群维度 20 qpm 频控 + 稳定到达顺序）。
 - `FeedPoller` 的推送出口是 `Pusher` 协议（`send_text` / `send_rich`），
-  `RssBot` 自己实现它。测试里换成假实现就不碰 QQ，见 `scripts/smoke.py::_check_push_routing`。
+  `RssBot` 自己实现它。测试里换成假实现就不碰 QQ，见 `scripts/smoke.py`。
 - 配图抽取在 `rss.first_image()`，必须在 `_clean_text` 剥标签**之前**做，否则 URL 就没了。
 - 数据库 schema 改动写在 `db.SCHEMA` 里；目前没有迁移机制，
   表结构变更需要手动处理已有 `data/bot.db`。

@@ -81,7 +81,16 @@ class FeedPoller:
         if not due:
             return
         _log.debug("本轮待抓取 %d 个订阅", len(due))
-        await asyncio.gather(*(self._poll_one(sub) for sub in due), return_exceptions=True)
+        results = await asyncio.gather(
+            *(self._poll_one(sub) for sub in due), return_exceptions=True
+        )
+        # 必须检查返回值：return_exceptions=True 会把异常收进结果里静默丢弃，
+        # 不检查的话推送失败连一行日志都没有。
+        for sub, result in zip(due, results):
+            if isinstance(result, BaseException):
+                _log.error(
+                    "订阅 #%s (%s) 本轮处理失败", sub.id, sub.url, exc_info=result
+                )
 
     async def _poll_one(self, sub: Subscription) -> None:
         async with self._sem:
@@ -102,33 +111,55 @@ class FeedPoller:
                 _log.info("订阅 #%s 建立 baseline，%d 条", sub.id, len(keys))
                 return
 
-            fresh_keys = set(self.db.filter_new_entries(sub.id, keys))
+            # 先只查、不写。推送成功之后才标记已见 ——
+            # 顺序反了的话，推送失败时条目已被记为见过，就永远不会再推（静默丢消息）
+            already = self.db.seen_keys(sub.id, keys)
+            fresh = [e for e in result.entries if e.key not in already]
             self.db.mark_polled(sub.id, title=result.title)
             self.db.prune_seen(sub.id)
 
-            if not fresh_keys:
+            if not fresh:
                 return
 
-            fresh = [e for e in result.entries if e.key in fresh_keys]
             shown = fresh[: self.cfg.max_items_per_push]
-            await self._push_entries(sub, result.title, shown)
+            pushed = await self._push_entries(sub, result.title, shown)
+
+            # 超出上限的那些是「有意丢弃」，直接标记已见，免得下轮反复捞
+            dropped = [e.key for e in fresh[self.cfg.max_items_per_push :]]
+            if dropped:
+                self.db.mark_seen(sub.id, dropped)
+            # 只有真正推成功的才标记已见；失败的留到下轮重试
+            self.db.mark_seen(sub.id, [e.key for e in pushed])
 
             overdue = len(fresh) - len(shown)
             if overdue > 0:
-                await self.pusher.send_text(
-                    sub.group_openid, f"（另有 {overdue} 条更新未展示）"
-                )
+                try:
+                    await self.pusher.send_text(
+                        sub.group_openid, f"（另有 {overdue} 条更新未展示）"
+                    )
+                except Exception as exc:
+                    # 只是提示，失败不影响正文，不该让它冒泡打断本轮
+                    _log.warning("「另有 N 条」提示发送失败: %s", exc)
+
+            failed = len(shown) - len(pushed)
             _log.info(
-                "推送 #%s → %s，%d 条（配图 %d）",
+                "推送 #%s → %s，%d 条（配图 %d）%s",
                 sub.id,
                 sub.group_openid,
-                len(shown),
-                sum(1 for e in shown if e.image),
+                len(pushed),
+                sum(1 for e in pushed if e.image),
+                f"，{failed} 条失败待下轮重试" if failed else "",
             )
 
     async def _push_entries(
         self, sub: Subscription, feed_title: str | None, entries: list[Entry]
-    ) -> None:
+    ) -> list[Entry]:
+        """逐条推送，返回**成功**的那些。
+
+        单条失败不能中断整批（否则它后面的条目白丢），也不标记已见，
+        留给下一轮重试。
+        """
+        pushed: list[Entry] = []
         for index, entry in enumerate(entries):
             if index:
                 await asyncio.sleep(_PUSH_GAP_SEC)
@@ -137,9 +168,17 @@ class FeedPoller:
             if self.cfg.attach_images and entry.image:
                 try:
                     await self.pusher.send_rich(sub.group_openid, text, entry.image)
+                    pushed.append(entry)
                     continue
                 except Exception as exc:
                     # 配图失败（QQ 拉不到图 / 图太大 / 格式不支持）不该让整条新闻丢失，
                     # 退回纯文字再发一次
                     _log.warning("配图推送失败，退回纯文字 (%s): %s", entry.image, exc)
-            await self.pusher.send_text(sub.group_openid, text)
+
+            try:
+                await self.pusher.send_text(sub.group_openid, text)
+                pushed.append(entry)
+            except Exception as exc:
+                _log.error("推送条目失败，下轮重试: %s | %s", entry.title[:40], exc)
+
+        return pushed
