@@ -13,7 +13,7 @@ from typing import Protocol
 import httpx
 
 from .config import Config
-from .db import Database
+from .db import Database, Subscription
 from .rss import fetch_feed, resolve_url
 
 _log = logging.getLogger("qq_rss_bot.commands")
@@ -263,14 +263,34 @@ class CommandHandler:
         )
 
     async def _unsub(self, ctx: CommandContext, args: list[str]) -> None:
-        if not args or not args[0].isdigit():
+        if not args:
             await ctx.reply("用法：/unsub <编号>（编号用 /list 查）")
             return
-        sub_id = int(args[0])
-        if self.db.remove_subscription(ctx.group_openid, sub_id):
-            await ctx.reply(f"已取消订阅 {sub_id}。")
-        else:
-            await ctx.reply(f"没找到本群的订阅 {sub_id}。")
+        picked = self._pick(ctx.group_openid, args[0])
+        if picked is None:
+            await ctx.reply("编号不对，先用 /list 看本群订阅的编号。")
+            return
+        pos, sub = picked
+        self.db.remove_subscription(ctx.group_openid, sub.id)
+        # 回复里带上是哪一个：编号是**位置**，列表一变含义就跟着变，
+        # 只有名字能让人一眼看出删错没有。
+        await ctx.reply(f"已取消订阅 {pos}. {sub.title or sub.url}")
+
+    def _pick(self, group_openid: str, raw: str) -> tuple[int, Subscription] | None:
+        """把 /list 里的编号解析成 (位置, 订阅)。
+
+        编号是**本群内的位置**（1、2、3…），不是数据库主键。
+        主键是全局自增、跨群共享的 —— 一个从没订阅过的新群，第一条订阅会
+        显示成 "5."；删掉一条还会留下空号。用户看到的编号必须和 /list 的顺序
+        一致，否则他会照着一个记不住的数字去猜。
+        """
+        if not raw.isdigit():
+            return None
+        subs = self.db.list_subscriptions(group_openid)
+        pos = int(raw)
+        if pos < 1 or pos > len(subs):
+            return None
+        return pos, subs[pos - 1]
 
     async def _list(self, ctx: CommandContext, args: list[str]) -> None:
         subs = self.db.list_subscriptions(ctx.group_openid)
@@ -278,27 +298,28 @@ class CommandHandler:
             await ctx.reply("本群还没有订阅，用 /sub 添加。")
             return
         lines = ["本群订阅："]
-        for sub in subs:
+        # 编号用**本群内的位置**，不用数据库主键：主键全局自增、跨群共享，
+        # 会让新群的第一条订阅显示成 "5."，删一条还留空号。
+        for pos, sub in enumerate(subs, 1):
             name = sub.title or sub.url
             if len(name) > 40:
                 name = name[:39] + "…"
             flag = "" if sub.initialized else "（待首抓）"
             err = f" ⚠{sub.last_error}" if sub.last_error else ""
-            lines.append(f"{sub.id}. {name} / {sub.interval_sec // 60}min{flag}{err}")
+            lines.append(f"{pos}. {name} / {sub.interval_sec // 60}min{flag}{err}")
         await ctx.reply("\n".join(lines))
 
     async def _check(self, ctx: CommandContext, args: list[str]) -> None:
         """手动触发一次抓取，用来验证路由是否还活着。"""
-        if not args or not args[0].isdigit():
+        if not args:
             await ctx.reply("用法：/check <编号>")
             return
-        sub_id = int(args[0])
-        sub = next(
-            (s for s in self.db.list_subscriptions(ctx.group_openid) if s.id == sub_id), None
-        )
-        if sub is None:
-            await ctx.reply(f"没找到本群的订阅 {sub_id}。")
+        picked = self._pick(ctx.group_openid, args[0])
+        if picked is None:
+            await ctx.reply("编号不对，先用 /list 看本群订阅的编号。")
             return
+        _, sub = picked
+        sub_id = sub.id
 
         result = await fetch_feed(self.http, sub.url, self.cfg.fetch_timeout_sec)
         if not result.ok:

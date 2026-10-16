@@ -84,6 +84,12 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   补法是子类 `GroupMessageWithRole` 加一个 `__slots__` 槽位——
   `GroupMessage` 用了 `__slots__`，不能事后挂属性。
   两个解析器都替换，幂等靠函数上的 `_qq_rss_bot_patched` 标记。
+- **`/list` 的编号是「本群内的位置」，绝不是数据库主键**。主键是全局自增、
+  跨群共享的：直接打 `sub.id` 会让从没订阅过的新群第一条订阅显示成「5.」，
+  删一条还留下空号。`_pick()` 负责把用户输入的位置编号解析成订阅，
+  `_list` 用 `enumerate(subs, 1)`。删完自动重排。
+  编号会随增删变化，所以 `/unsub` 的回复必须带上**被删源的名字** ——
+  否则用户在 `/list` 之后列表变了，删错了也不知道。
 - **指令别名表 `COMMAND_ALIASES` 是唯一事实来源**：`COMMAND_TOKENS`（什么算指令）、
   `RESTRICTED_TOKENS`（哪些要管理员）、`COMMAND_METHODS`（派发到哪个方法）
   全从它派生。曾经是手工维护三份，`RESTRICTED_TOKENS` 漏一个中文别名就等于没限制。

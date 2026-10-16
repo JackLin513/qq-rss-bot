@@ -393,8 +393,8 @@ async def _check_permissions() -> None:
 
         replies.clear()
         await h.handle(CommandContext("G", reply, "owner"), "/unsub 1")
-        check("群主发 /unsub 能执行（走到底：没这个订阅）",
-              any("没找到" in r for r in replies), str(replies))
+        check("群主发 /unsub 走到编号校验（本群没订阅）",
+              any("编号不对" in r for r in replies), str(replies))
 
         replies.clear()
         await h.handle(CommandContext("G", reply, "member"), "/list")
@@ -509,6 +509,62 @@ check("顺序变了仍被抓", any("顺序" in d for d in setup_panel.compare_it
 check("重名被抓", setup_panel.validate(
     [{"name": "sub", "desc": "a", "type": "command"},
      {"name": "/sub", "desc": "b", "type": "command"}]) != [])
+
+async def _check_subscription_numbering() -> None:
+    """ /list 的编号必须是**本群内的位置**，不是数据库主键。
+
+    回归：曾经直接打 sub.id。主键是全局自增、跨群共享的，
+    于是从没订阅过的新群第一条订阅会显示成 "5."，删一条还留下空号 ——
+    用户看到的编号毫无规律可循。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        h = CommandHandler(cfg_stub(), db, None)
+        out: list[str] = []
+
+        async def reply(text: str) -> None:
+            out.append(text)
+
+        async def run(group: str, cmd: str) -> str:
+            out.clear()
+            await h.handle(CommandContext(group, reply, "owner"), cmd)
+            return out[0] if out else ""
+
+        # 先往别的群塞订阅，把自增主键顶高，制造「主键 != 位置」的局面
+        for i in range(4):
+            db.add_subscription("OTHER", f"https://o.com/{i}", f"占位{i}", 900)
+        for i in range(3):
+            db.add_subscription("G", f"https://a.com/{i}", f"源{i + 1}", 900)
+
+        listing = await run("G", "/list")
+        check("编号从 1 开始（不受全局主键影响）", "1. 源1" in listing, listing)
+        check("编号连续到 3", "3. 源3" in listing, listing)
+        check("不泄漏被顶高的主键号", "5." not in listing and "7." not in listing, listing)
+
+        text = await run("G", "/unsub 1")
+        check("取消后回复带编号和名字", text == "已取消订阅 1. 源1", text)
+
+        listing = await run("G", "/list")
+        check("删完重排成 1./2.", "1. 源2" in listing and "2. 源3" in listing, listing)
+        check("重排后不留空号", "3." not in listing, listing)
+
+        db.add_subscription("G", "https://a.com/9", "源4", 900)
+        check("新增的排在最后", "3. 源4" in await run("G", "/list"))
+
+        db.add_subscription("NEW", "https://n.com/1", "新群的源", 900)
+        check("从没订阅过的新群第一条就是 1.",
+              "1. 新群的源" in await run("NEW", "/list"))
+
+        check("越界编号被拒", "编号不对" in await run("G", "/unsub 99"))
+        check("非数字被拒", "编号不对" in await run("G", "/unsub abc"))
+        check("0 被拒", "编号不对" in await run("G", "/unsub 0"))
+        check("负数被拒", "编号不对" in await run("G", "/unsub -1"))
+        check("/check 越界也被拒", "编号不对" in await run("G", "/check 99"))
+        db.close()
+
+
+print("[4.79] /list 编号按群内位置排（不是数据库主键）")
+asyncio.run(_check_subscription_numbering())
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
