@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+data/
+*.db
+*.sqlite3
+.idea/
+.vscode/
+.DS_Store
+botpy.log
+
+# 个人在本机的 Claude Code 权限设置，不进公开仓库
+.claude/settings.local.json
