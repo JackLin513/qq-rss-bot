@@ -7,12 +7,28 @@ QQ 群 RSS 订阅机器人。单个 Python 进程：botpy 维持 QQ 长连接，
 ```bash
 uv sync
 uv run qq-rss-bot                              # 启动（需要 .env）
-uv run python scripts/smoke.py                 # 26 项离线+抓取测试
-uv run python scripts/integration.py           # 11 项端到端（假推送，不碰 QQ）
+uv run python scripts/smoke.py                 # 62 项离线+抓取测试
+uv run python scripts/integration.py           # 15 项端到端（假推送，不碰 QQ）
 uv run python scripts/probe_events.py 20       # 事件探针（先停掉正式实例）
 uv run python scripts/check_sources.py         # 复测 RSSHub 各路由可用性
 uv run python scripts/test_push.py             # 测主动消息（不占 WS 会话，可并行）
 ```
+
+## 运行平台
+
+开发在 macOS（宿主原生跑 + Docker Desktop 跑 RSSHub），长期运行在**群晖 DS220+**
+（两者都容器化，x86_64）。
+
+跨平台只改部署形态，代码不动。两个必须记住的差异：
+
+- **容器里 `RSSHUB_BASE` 要用服务名 `http://rsshub:1200`**，不是 `127.0.0.1`
+  （容器里的 loopback 是容器自己）。
+- **代理只给 RSSHub，绝不能给 bot**：bot 要访问 `http://rsshub:1200` 这个内部服务名，
+  走代理必然失败；且 `api.sgroup.qq.com` 是国内站直连更好。
+  v2ex / github 这类上游被 DNS 污染，只有 RSSHub 需要代理。
+
+目标机实机实测（规格、内存账、容器网络可达性、迁移坑）见
+`docs/synology-migration.md`——那份是实机数据，别按规格重新推算。
 
 ## 已验证的 botpy 1.2.1 事实（不要再凭印象改）
 

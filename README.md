@@ -65,9 +65,50 @@ docker run -d --name rsshub --restart unless-stopped -p 1200:1200 \
 ### 3. 验证
 
 ```bash
-uv run python scripts/smoke.py        # 26 项：解析/去重/调度/真实抓取
-uv run python scripts/integration.py  # 11 项：端到端（真抓 HN，假推送）
+uv run python scripts/smoke.py        # 62 项：解析/去重/调度/配图/真实抓取
+uv run python scripts/integration.py  # 15 项：端到端（真抓源，假推送，不碰 QQ）
 ```
+
+## 运行平台
+
+同一套代码支持两种跑法，**差异只在部署形态，代码不用改**（`RSSHUB_BASE` 已是环境变量）。
+
+| | macOS（开发调试） | 群晖 Synology x86_64（长期运行） |
+|---|---|---|
+| 机器人 | 宿主原生 `uv run qq-rss-bot` | 容器（compose） |
+| RSSHub | Docker Desktop | 容器（compose） |
+| `RSSHUB_BASE` | `http://127.0.0.1:1200` | `http://rsshub:1200` ← 服务名 |
+| 出网代理 | 跟随系统代理 | 需显式配置，见下 |
+
+架构要求 **x86_64**（`diygod/rsshub` 的 amd64 镜像原生运行，无需模拟）。
+任何 x86_64 Linux 主机同理，不只群晖。
+
+**为什么地址要改**：容器里的 `127.0.0.1` 是容器自己，不是宿主机。两个服务都进容器后，
+bot 必须用 Docker 服务名访问 RSSHub。忘了改的症状是抓取全部超时。
+
+**代理只给 RSSHub，绝不能给 bot**：部分上游（实测 `www.v2ex.com`、`github.com`）
+国内直连不通——v2ex 的 DNS 被污染，解析到 Facebook 的 IP 段——需要走代理。
+但只有 RSSHub 需要；国内站走代理实测没有延迟代价，所以可以全局走。
+
+```yaml
+  rsshub:
+    environment:
+      - HTTP_PROXY=http://<你的代理地址>:6152
+      - HTTPS_PROXY=http://<你的代理地址>:6152
+      - NO_PROXY=localhost,127.0.0.1
+  bot:
+    environment:
+      - RSSHUB_BASE=http://rsshub:1200
+      - HTTP_PROXY=          # 显式清空，防止容器级代理被继承进来
+      - HTTPS_PROXY=
+      - NO_PROXY=localhost,127.0.0.1,rsshub,api.sgroup.qq.com,bots.qq.com
+```
+
+**bot 一旦走代理，`http://rsshub:1200` 就会失败**——那是容器内部的服务名，代理解析不了。
+而且 bot 的命脉 `api.sgroup.qq.com` 是国内站，直连更快更稳，没必要多一层依赖。
+
+详细评估（目标机实机规格、内存账、容器网络实测、四个迁移坑）见
+[`docs/synology-migration.md`](docs/synology-migration.md)。
 
 ## 指令
 
