@@ -161,6 +161,19 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   （scope=group、target_type=all、6 个元素），回读与代码完全一致。
   改内容：`scripts/setup_panel.py --update p_Y8uv4aayeceLDxBMGeKjGB`
 
+- **`/find` 的路由表来自 RSSHub 自带的 `GET /api/namespace`**（不是文档站）。
+  本地实测 4MB / 2064 站点 / 4004 条 / 24 分类，一次 0.12s。
+  精简后缓存 670KB，按天刷新，命中缓存 0.01s。
+  **RSSHub 挂掉时用过期缓存兜底** —— 抓不到路由表不该让整个功能不可用。
+- **路由的 `features` 能预判能不能跑**，这是 `/find` 比翻文档强的核心：
+  `requirePuppeteer` → 需要 chromium 镜像；`requireConfig`（**注意 `optional: true`
+  的不算阻塞**，微博的 `WEIBO_COOKIES` 就是）→ 缺环境变量会 503；
+  `antiCrawler` → 可能要 cookie/代理。实测：可用 3410 / 需配置 130 /
+  反爬 283 / 需浏览器 181。
+- **没把 `description` 纳入检索**：实测「新闻」命中 196 → 371 条，
+  但**前 5 条完全没变**，纯粹是体积负担。索引只放名称/路径/站点/分类。
+  要重新评估就按这个口径测：看**前 5 条有没有变**，不是看命中数。
+
 ## 约定
 
 - 注释和用户可见文案用中文，代码标识符用英文。

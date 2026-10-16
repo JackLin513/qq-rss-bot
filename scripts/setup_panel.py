@@ -60,6 +60,8 @@ PANEL_ITEMS = [
     {"name": "sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
     {"name": "unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
     {"name": "list", "desc": "查看本群所有订阅", "type": "command", "only_admin": False},
+    {"name": "find", "desc": "搜索 RSSHub 路由，不用记路径", "type": "command",
+     "only_admin": False},
     {"name": "check", "desc": "立刻抓一次验证源是否可用", "type": "command", "only_admin": False},
     {"name": "ping", "desc": "检查机器人在线状态", "type": "command", "only_admin": False},
     {"name": "help", "desc": "查看完整用法说明", "type": "command", "only_admin": False},

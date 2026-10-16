@@ -510,13 +510,11 @@ check("PANEL_ITEMS 用裸名（服务端会剥掉斜杠）",
       all(not i["name"].startswith("/") for i in setup_panel.PANEL_ITEMS))
 
 # 服务端真实回读形态：裸名、only_admin=false 时字段被省略
+# 从 PANEL_ITEMS 造出「服务端回读形态」：裸名 + only_admin=false 时字段消失。
+# 不硬编码列表 —— 否则每加一条指令，这里都要跟着改（曾经就因此误报过）。
 _remote = [
-    {"name": "sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
-    {"name": "unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
-    {"name": "list", "desc": "查看本群所有订阅", "type": "command"},
-    {"name": "check", "desc": "立刻抓一次验证源是否可用", "type": "command"},
-    {"name": "ping", "desc": "检查机器人在线状态", "type": "command"},
-    {"name": "help", "desc": "查看完整用法说明", "type": "command"},
+    {k: v for k, v in item.items() if not (k == "only_admin" and v is False)}
+    for item in setup_panel.PANEL_ITEMS
 ]
 check("真实回读形态 == 完全一致", setup_panel.compare_items(_remote) == [],
       str(setup_panel.compare_items(_remote)))
@@ -592,6 +590,117 @@ async def _check_subscription_numbering() -> None:
 
 print("[4.79] /list 编号按群内位置排（不是数据库主键）")
 asyncio.run(_check_subscription_numbering())
+
+print("[4.81] RSSHub 路由检索（/find）")
+from qq_rss_bot.routes import (  # noqa: E402
+    LEVEL_BAD,
+    LEVEL_OK,
+    LEVEL_WARN,
+    RouteIndex,
+    format_hits,
+    _availability,
+)
+
+# 可用性判定：这三类是最容易让人「照文档订阅然后吃 503」的原因
+check("requirePuppeteer → 跑不了",
+      _availability({"requirePuppeteer": True})[0] == LEVEL_BAD)
+check("requireConfig（非 optional）→ 有坑",
+      _availability({"requireConfig": [{"name": "GITHUB_ACCESS_TOKEN"}]})[0] == LEVEL_WARN)
+check("requireConfig 里 optional 的不算阻塞",
+      _availability({"requireConfig": [{"name": "WEIBO_COOKIES", "optional": True}]})[0]
+      == LEVEL_OK)
+check("antiCrawler → 有坑", _availability({"antiCrawler": True})[0] == LEVEL_WARN)
+check("features 全 false → 可用",
+      _availability({"requirePuppeteer": False, "requireConfig": False,
+                     "antiCrawler": False})[0] == LEVEL_OK)
+check("没有 features 字段 → 可用", _availability(None)[0] == LEVEL_OK)
+check("features 是怪类型不炸", _availability("nonsense")[0] == LEVEL_OK)
+check("puppeteer 优先于 config 报告",
+      _availability({"requirePuppeteer": True,
+                     "requireConfig": [{"name": "X"}]})[0] == LEVEL_BAD)
+
+_FIXTURE = {
+    "idolmaster": {
+        "name": "アイドルマスター THE IDOLM@STER",
+        "url": "idolmaster-official.jp",
+        "categories": ["anime", "game"],
+        "routes": {
+            "/news": {"path": "/news", "name": "ニュース News",
+                      "example": "/idolmaster/news"},
+        },
+    },
+    "weibo": {
+        "name": "微博",
+        "url": "weibo.com",
+        "categories": ["social-media"],
+        "routes": {
+            "/hot": {"path": "/hot", "name": "热搜", "example": "/weibo/hot",
+                     "features": {"requirePuppeteer": True}},
+        },
+    },
+    "example": {
+        "name": "示例站",
+        "url": "example.com",
+        "categories": ["other"],
+        "routes": {
+            "/hot": {"path": "/hot", "name": "热搜", "example": "/example/hot"},
+            "/trending": {"path": "/trending/:lang?", "name": "Trending",
+                          "example": "/example/trending/daily",
+                          "features": {"requireConfig": [
+                              {"name": "EXAMPLE_TOKEN", "optional": False}]}},
+            "/bare": {"path": "/bare/:id", "name": "没有 example 的路由"},
+        },
+    },
+}
+
+_idx = RouteIndex.parse(_FIXTURE)
+check("解析出全部路由", len(_idx) == 5, str(len(_idx)))
+
+check("按站点名搜（中文）", _idx.search("微博", 5)[0] == 1)
+check("按路径搜", _idx.search("idolmaster", 5)[0] == 1)
+check("按分类中文别名搜", _idx.search("动漫", 5)[0] >= 1)
+check("按分类英文 slug 搜", _idx.search("anime", 5)[0] >= 1)
+check("搜不到返回 0 条", _idx.search("这个肯定搜不到xyz", 5) == (0, []))
+
+# 同分时**可用的排前面** —— 搜出来跑不起来是最没用的结果
+_hot = _idx.search("热搜", 5)[1]
+check("同分时可用路由优先", _hot[0].level == LEVEL_OK, str([(h.site, h.level) for h in _hot]))
+
+check("可用性标进了结果",
+      any(h.level == LEVEL_WARN for h in _idx.search("trending", 5)[1]))
+check("没有 example 时退回 path",
+      any(h.path.startswith("/bare") for h in _idx.search("bare", 5)[1]))
+
+_text = format_hits("微博", 1, _idx.search("微博", 5)[1], 5)
+check("结果含路径", "/weibo/hot" in _text, _text)
+check("结果含站点名", "微博" in _text)
+check("结果标出坑", "需要浏览器" in _text, _text)
+check("结果给出下一步", "/sub" in _text)
+
+_empty = format_hits("xyz", 0, [], 5)
+check("没结果时给分类提示", "动漫" in _empty and "没找到" in _empty, _empty)
+
+# 命中数超过展示上限时要说明还有多少
+_many = RouteIndex.parse({
+    "n": {"name": "站", "url": "n.com", "categories": ["other"],
+          "routes": {f"/r{i}": {"path": f"/r{i}", "name": f"条目{i}",
+                                "example": f"/n/r{i}"} for i in range(9)}},
+})
+_tot, _top = _many.search("条目", 5)
+check("只返回 limit 条", len(_top) == 5 and _tot == 9)
+check("提示还有多少条", "还有 4 条" in format_hits("条目", _tot, _top, 5))
+
+# 缓存往返：磁盘上存的就是这个结构
+_rt = RouteIndex.from_dict(_idx.to_dict())
+check("缓存往返条数一致", len(_rt) == len(_idx))
+check("缓存往返后仍能搜", _rt.search("微博", 5)[0] == 1)
+check("缓存往返保住可用性",
+      _rt.search("trending", 5)[1][0].level == LEVEL_WARN)
+try:
+    RouteIndex.from_dict({"nonsense": 1})
+    check("坏缓存要抛错（好触发重拉）", False)
+except ValueError:
+    check("坏缓存要抛错（好触发重拉）", True)
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

@@ -15,6 +15,7 @@ import httpx
 from .config import Config
 from .db import Database, Subscription
 from .rss import fetch_feed, resolve_url
+from .routes import format_hits, load_index
 
 _log = logging.getLogger("qq_rss_bot.commands")
 
@@ -96,6 +97,7 @@ HELP_TEXT = """RSS 订阅机器人
 /sub <RSSHub路由或URL> [间隔分钟]  订阅，默认 15 分钟
 /unsub <编号>                      取消订阅
 /list                              查看本群订阅
+/find <关键词>                     搜 RSSHub 路由，不用记路径
 /check <编号>                      立刻抓一次并预览
 /ping                              存活检测
 /help                              本说明
@@ -119,6 +121,10 @@ COMMAND_ALIASES = {
     "取消": "unsub",
     "list": "list",
     "列表": "list",
+    "find": "find",
+    "search": "find",
+    "搜索": "find",
+    "路由": "find",
     "check": "check",
     "ping": "ping",
 }
@@ -131,6 +137,7 @@ COMMAND_METHODS = {
     "sub": "_sub",
     "unsub": "_unsub",
     "list": "_list",
+    "find": "_find",
     "check": "_check",
     "ping": "_ping",
 }
@@ -156,6 +163,9 @@ def looks_like_command(text: str | None) -> bool:
         return False
     return parts[0].lstrip("/").lower() in COMMAND_TOKENS
 
+# /find 每次最多显示几条 —— 群消息有长度限制，而且人也不会往下翻
+_FIND_LIMIT = 5
+
 # 实测群主是 "owner"；"admin" 是按常见约定加的，若真实值不同，
 # 拒绝时会把实际角色打进日志，照着改这里即可。
 ADMIN_ROLES = frozenset({"owner", "admin"})
@@ -179,6 +189,7 @@ class CommandHandler:
         self.cfg = cfg
         self.db = db
         self.http = http
+        self._routes = None  # 路由表懒加载，进程内常驻
 
     async def handle(self, ctx: CommandContext, raw: str) -> None:
         text = _PLACEHOLDER_RE.sub("", raw or "").strip()
@@ -329,6 +340,44 @@ class CommandHandler:
             err = f" ⚠{sub.last_error}" if sub.last_error else ""
             lines.append(f"{pos}. {name} / {sub.interval_sec // 60}min{flag}{err}")
         await ctx.reply("\n".join(lines))
+
+    async def _route_index(self):
+        """懒加载 RSSHub 路由表。
+
+        4MB / 4004 条，进程内只留一份；磁盘缓存按天刷新，
+        所以群里第一条 /find 之后，后面的都是纯内存检索。
+        """
+        if self._routes is None:
+            self._routes = await load_index(
+                cache_path=self.cfg.db_path.parent / "rsshub-routes.json",
+                http=self.http,
+                base_url=self.cfg.rsshub_base,
+            )
+        return self._routes
+
+    async def _find(self, ctx: CommandContext, args: list[str]) -> None:
+        """搜 RSSHub 路由。
+
+        存在的理由：RSSHub 有 4000 多条路由，指望用户记住 `/36kr/newsflashes`
+        这种路径不现实。搜出来直接给可订阅的路径，顺带标出哪些在本实例上
+        跑不起来 —— 免得照着一份跑不通的路径去 /sub，再对着 503 发懵。
+        """
+        if not args:
+            await ctx.reply(
+                "用法：/find <关键词>\n"
+                "按站点名、路由名或分类搜 RSSHub 路由。\n"
+                "例：/find 偶像   /find github   /find 动漫"
+            )
+            return
+        query = " ".join(args)
+        try:
+            index = await self._route_index()
+        except Exception as exc:  # noqa: BLE001 —— 网络层什么都可能抛
+            _log.warning("路由表取不到：%r", exc)
+            await ctx.reply("路由表暂时取不到（RSSHub 可能没起来），稍后再试。")
+            return
+        total, hits = index.search(query, limit=_FIND_LIMIT)
+        await ctx.reply(format_hits(query, total, hits, _FIND_LIMIT))
 
     async def _check(self, ctx: CommandContext, args: list[str]) -> None:
         """手动触发一次抓取，用来验证路由是否还活着。"""
