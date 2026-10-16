@@ -174,10 +174,60 @@ Docker 自身数据在 `/volume1/@docker`，由 Container Manager 管理，无�
   实测一小时 DNS 失败 8 次、WebSocket 异常断开 4 次）。NAS 实测 `api.sgroup.qq.com`
   可达、QQ API 握手 0.26s。
 
-## 尚未完成
+## 部署进度（2026-10-17 更新）
 
-- `Dockerfile` 和 `docker-compose.yml` 还没写（等功能开发完成后统一打包）
-- 打包后应先在本地用 `docker compose` 完整验证一遍，能验证到
-  「两个容器互通 + 机器人能推消息」；只有群晖专有的路径差异需要到机器上再调
-- bot 内的容器级网络验证已通过（`api.sgroup.qq.com` 可达），
-  但**双容器互通**（bot → `rsshub:1200`）尚未实测，需要在本地 compose 阶段覆盖
+### 已完成
+
+- **`Dockerfile` / `docker-compose.yml` / `.dockerignore` 已写好**（仓库根目录）。
+  基础镜像是 `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`，
+  compose 里两个服务：`rsshub`（`diygod/rsshub`，端口 1200）+ `bot`（本仓库构建）。
+- **本地 `docker compose` 全链路验证通过**，实测覆盖到：
+  - 镜像能构建；容器内配置解析正确（`rsshub=http://rsshub:1200`、`db=/app/data/bot.db`）
+  - 机器人连上网关
+  - **双容器互通实测 HTTP 200，抓到 150KB 真实 feed**（这是原来唯一没验过的环节）
+  - 代理分流正确：bot 侧为空、rsshub 侧走 `192.168.0.63:6152`
+  - C2C 主动推送 HTTP 200
+  - 挂载的 `data/` 里正常生成了 `bot.db`
+
+### 目标机上已就绪
+
+代码与配置已通过 tar-over-ssh 传到 `/volume1/docker/qq-rss-bot/`：
+
+- `Dockerfile`、`docker-compose.yml`、`.dockerignore`、`pyproject.toml`、`uv.lock`、
+  `README.md`、`CLAUDE.md`、`src/`、`scripts/`
+- `.env` 已生成并设为 **600**，其中 `RSSHUB_BASE=http://rsshub:1200`、
+  `DB_PATH=/app/data/bot.db` 已按容器口径改写
+- `.venv` / `.git` / `botpy.log` **未上传**（`.dockerignore` 也排除了它们）
+- `data/` 目录已建、可写
+
+**构建期网络实测**（2026-10-17，目标机）：
+
+| 目标 | 结果 |
+|---|---|
+| `ghcr.io/v2/` | HTTP 401，0.68s —— 可达（401 是未带 token 的正常响应） |
+| `registry-1.docker.io/v2/` | HTTP 401，0.85s —— 可达 |
+| 经 `192.168.0.63:6152` 取 ghcr | HTTP 401，0.56s |
+
+所以**拉镜像不需要代理**，compose 里只有 rsshub 配了代理是为了抓被污染的上游。
+`/volume1` 余量 8.3T，绰绰有余。
+
+### 唯一剩下的阻塞：docker 权限
+
+`JackLin` 跑不了 docker：
+
+```
+uid=1026(JackLin) gid=100(users) groups=100(users),101(administrators)
+srw-rw---- 1 root root  /var/run/docker.sock      ← 只给 root
+docker: command not found                          ← CLI 也不在非 root 的 PATH 里
+sudo: a password is required
+```
+
+注意 **`administrators` 组不给 docker 权限** —— DSM 上容器只认 root。
+CLI 实际在 `/usr/local/bin/docker`（软链到 Container Manager 的安装目录），
+PATH 是 `/usr/bin:/bin:/usr/sbin:/sbin`，所以连绝对路径都要显式写。
+
+三条出路，任选其一（都需要用户本人操作，SSH 会话拿不到 root）：
+
+1. **Container Manager UI 建项目**（推荐，原生工作流、以 root 运行）
+2. 用户自己跑 `sudo docker compose -f /volume1/docker/qq-rss-bot/docker-compose.yml up -d --build`
+3. 给 root 配 NOPASSWD sudo，或把 `JackLin` 加进 docker 组（DSM 上非标准，不推荐）

@@ -45,6 +45,24 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 目标机实机实测（规格、内存账、容器网络可达性、迁移坑）见
 `docs/synology-migration.md`——那份是实机数据，别按规格重新推算。
 
+### 部署到群晖（2026-10-17）
+
+代码在 `/volume1/docker/qq-rss-bot/`，`docker-compose.yml` 起 `rsshub` + `bot` 两个容器。
+
+- **`JackLin` 跑不了 docker，这是硬阻塞**：`/var/run/docker.sock` 是 `root:root 660`，
+  而 **`administrators` 组不给 docker 权限**（DSM 上容器只认 root）。CLI 在
+  `/usr/local/bin/docker`，但 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
+  非 root 连命令都找不到；`sudo` 要密码。所以**部署这步只能用户本人做**
+  （Container Manager UI 建项目，或他自己 `sudo docker compose`），
+  SSH 里干不了。别反复试。
+- **拉镜像不需要代理**：目标机实测 `ghcr.io/v2/` 与 `registry-1.docker.io/v2/`
+  都返回 401（未带 token 的正常响应），0.7–0.9s。compose 里给 rsshub 配代理
+  是为了抓被污染的上游，跟构建无关。
+- `.env` 在目标机上是 **600**，`RSSHUB_BASE=http://rsshub:1200`、
+  `DB_PATH=/app/data/bot.db`。传文件用 **tar-over-ssh**：
+  群晖的 `rsync` 是 openrsync（协议 29），不认 `--info=stats2`，
+  且它 fork 出来的 ssh 拿不到密钥，`rsync -av` 直接 `Permission denied`。
+
 ## 已验证的 botpy 1.2.1 事实（不要再凭印象改）
 
 这些是读 `.venv` 里源码确认过的，写代码时直接信：
