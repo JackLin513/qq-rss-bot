@@ -32,12 +32,49 @@ _log = logging.getLogger("qq_rss_bot.compat")
 _PATCH_FLAG = "_qq_rss_bot_patched"
 
 
+class Mention:
+    """保留平台给出的**全部** mention 字段。
+
+    botpy 的 ``_User`` 只取 ``id / username / bot / avatar``，丢掉了
+    **``is_you``** —— 而 ``is_you`` 是判断「这条 @ 是不是冲着机器人来的」
+    最精确的依据，也是唯一能认出指令面板那种 @ 的东西：
+    面板插入的是 openid 占位符 ``<@C371C51B...>``，靠匹配显示名根本对不上。
+
+    和 ``member_role`` 是同一类问题：报文里有，botpy 不要，只能自己捡回来。
+    """
+
+    __slots__ = (
+        "id",
+        "username",
+        "bot",
+        "avatar",
+        "is_you",
+        "member_openid",
+        "member_role",
+        "scope",
+    )
+
+    def __init__(self, data: dict) -> None:
+        self.id = data.get("id")
+        self.username = data.get("username")
+        self.bot = data.get("bot")
+        self.avatar = data.get("avatar")
+        self.is_you = data.get("is_you")
+        self.member_openid = data.get("member_openid")
+        self.member_role = data.get("member_role")
+        self.scope = data.get("scope")
+
+    def __repr__(self) -> str:
+        return f"Mention(username={self.username!r}, is_you={self.is_you!r})"
+
+
 class GroupMessageWithRole(GroupMessage):
-    """补上 ``member_role`` 的群消息。
+    """补上 botpy 丢掉的字段：``member_role`` 和完整的 ``mentions``。
 
     实测报文里 ``author`` 带 ``member_role``（群主是 ``"owner"``），
-    但 botpy 只保留了 ``member_openid``。``GroupMessage`` 用了 ``__slots__``，
-    所以不能事后挂属性，只能用子类加一个槽位。
+    ``mentions[]`` 里带 ``is_you`` —— 但 botpy 两个都丢。
+    ``GroupMessage`` 用了 ``__slots__``，不能事后挂新属性，
+    所以用子类加槽位，并把 ``mentions`` 整个重建。
     """
 
     __slots__ = ("member_role",)
@@ -45,6 +82,9 @@ class GroupMessageWithRole(GroupMessage):
     def __init__(self, api, event_id, data) -> None:
         super().__init__(api, event_id, data)
         self.member_role = (data.get("author") or {}).get("member_role")
+        # 重建 mentions，把 is_you / member_openid 救回来
+        raw = data.get("mentions") or []
+        self.mentions = [Mention(m) for m in raw if isinstance(m, dict)]
 
 
 def _make_parser(event: str):

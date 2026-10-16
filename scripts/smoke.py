@@ -295,10 +295,20 @@ check("@队友闲聊不误触发",
 check("纯闲聊不触发", is_bot_mentioned("111", [], "猪排爱好者") is False)
 check("占位符在中间不算（已知局限）",
       is_bot_mentioned("看 <@A1> /help", [], "猪排爱好者") is False)
-# 已知局限：@队友后面跟裸指令名会被误判。代价可接受（比漏掉面板消息好），
-# 因为占位符形态和「@张三」一模一样，拿不到机器人自己的 openid 来精确比对。
-check("已知局限：@队友+裸指令名会误判",
-      is_bot_mentioned("<@DEADBEEF00112233> ping", [], "猪排爱好者") is True)
+# 真实报文里 mentions 带 is_you，平台直接标了「这个 @ 就是你」——
+# 比任何字符串匹配都可靠，也不需要启发式。
+_BOT_MENTION = [{"id": "C371C51B", "is_you": True, "bot": True, "username": "猪排爱好者"}]
+_OTHER_MENTION = [{"id": "DEADBEEF", "is_you": False, "bot": False, "username": "张三"}]
+check("is_you=True → 命中（面板形态，最可靠）",
+      is_bot_mentioned("<@C371C51B> /help ", _BOT_MENTION, "猪排爱好者") is True)
+check("@队友（is_you=False）→ 明确否定",
+      is_bot_mentioned("<@DEADBEEF> /help", _OTHER_MENTION, "猪排爱好者") is False)
+# 有了 is_you，连「@队友 + 裸指令名」都不会再误判 —— 启发式在这条路上不生效
+check("@队友 + 裸指令名也不再误判",
+      is_bot_mentioned("<@DEADBEEF> ping", _OTHER_MENTION, "猪排爱好者") is False)
+# 没有 mentions 字段时才退化到启发式，此时占位符+裸指令名仍会误判（已知局限）
+check("无 mentions 时退化到启发式（已知局限仍在）",
+      is_bot_mentioned("<@DEADBEEF> ping", [], "猪排爱好者") is True)
 
 check("looks_like_command 认裸名", looks_like_command("sub /x") is True)
 check("looks_like_command 认斜杠", looks_like_command("/sub") is True)
@@ -351,6 +361,23 @@ check("member_openid 仍正常", _msg.author.member_openid == "u1")
 check("报文缺 author 不炸", GroupMessageWithRole(None, "e", {"id": "m"}).member_role is None)
 check("报文缺 member_role 得 None",
       GroupMessageWithRole(None, "e", {"author": {"member_openid": "u"}}).member_role is None)
+
+# botpy 的 _User 只留 id/username/bot/avatar，把 is_you 丢了 ——
+# 而 is_you 是唯一能精确认出「指令面板那种 @」的字段
+_msg_m = GroupMessageWithRole(None, "evt", {
+    "id": "m2", "group_openid": "G", "content": "<@C371C51B> /help ",
+    "author": {"member_openid": "u1", "member_role": "owner"},
+    "mentions": [{"id": "C371C51B", "is_you": True, "bot": True, "username": "猪排爱好者",
+                  "member_openid": "C371C51B", "member_role": "member", "scope": "single"}],
+})
+check("mentions 保住了 is_you", _msg_m.mentions[0].is_you is True)
+check("mentions 保住了 member_openid",
+      _msg_m.mentions[0].member_openid == "C371C51B")
+check("mentions 保住了 scope", _msg_m.mentions[0].scope == "single")
+check("端到端：面板报文被认成 @ 了机器人",
+      is_bot_mentioned(_msg_m.content, _msg_m.mentions, "猪排爱好者") is True)
+check("报文没有 mentions 字段时 mentions 为空列表",
+      GroupMessageWithRole(None, "e", {"id": "m"}).mentions == [])
 
 
 async def _check_permissions() -> None:

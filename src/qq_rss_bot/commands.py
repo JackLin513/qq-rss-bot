@@ -41,20 +41,42 @@ def strip_mention(text: str | None, bot_name: str | None = None) -> str:
     return text.strip()
 
 
+def _field(item: object, name: str):
+    """从 mention 里取字段，dict 和对象两种形态都支持。"""
+    if isinstance(item, dict):
+        return item.get(name)
+    return getattr(item, name, None)
+
+
 def is_bot_mentioned(
     content: str | None, mentions: object, bot_name: str | None
 ) -> bool:
     """判断这条群消息是否 @ 了机器人。
 
-    优先用结构化的 mentions 数组（报文里有就说明平台提供了），
-    没有就退化成匹配正文里的 "@显示名" —— 实测 2026 新协议的报文里
-    **不带 mentions 字段**，所以这个退化分支才是实际生效的那条。
+    按可靠性从高到低：
+
+    1. **``is_you``** —— 平台直接标了「这个 @ 就是你」。这是唯一精确的依据，
+       也是唯一能认出指令面板那种 @ 的东西：面板插入的是 openid 占位符
+       ``<@C371C51B...>`` 而不是显示名，字符串匹配对不上。
+       （botpy 的 ``_User`` 会丢掉 ``is_you``，由 ``compat.Mention`` 捡回来。）
+    2. ``mentions`` **非空但没一个 ``is_you``** → 明确是在 @ 别人，直接否定。
+       有了这条，「@队友 + 恰好一个指令名」不再误触发。
+    3. 没有 ``mentions`` 字段 —— 手工 @ 的报文就是这样，平台把 @ 展开成
+       显示名写进正文。退化成匹配 ``@显示名``；
+       再退化成「开头是占位符 + 后面跟已知指令名」。
     """
-    for item in mentions or []:  # type: ignore[union-attr]
-        for attr in ("member_openid", "id", "username", "name"):
-            value = item.get(attr) if isinstance(item, dict) else getattr(item, attr, None)
-            if value and bot_name and value == bot_name:
-                return True
+    items = list(mentions or [])  # type: ignore[arg-type]
+
+    for item in items:
+        if _field(item, "is_you") is True:
+            return True
+        # 老报文可能没有 is_you，退化成比对用户名
+        if bot_name:
+            for attr in ("username", "name"):
+                if _field(item, attr) == bot_name:
+                    return True
+    if items:
+        return False
 
     text = content or ""
 
@@ -62,10 +84,9 @@ def is_bot_mentioned(
     if bot_name and f"@{bot_name}" in text:
         return True
 
-    # 指令面板 @：正文开头是 <@OPENID> 占位符。
-    # 这里**刻意要求占位符后面跟的是已知指令名**，而不是「有占位符就算」：
-    # 占位符形态和「@张三」完全一样，而我们拿不到机器人自己的 openid
-    # 来精确比对，只能靠后面跟的内容来区分。
+    # 兜底：正文开头是 <@OPENID> 占位符。刻意要求后面跟的是**已知指令名**，
+    # 否则「@张三 你看这个」会被误判 —— 占位符形态和 @ 人一模一样，
+    # 拿不到机器人自己的 openid 就分不出来。
     stripped = _LEADING_MENTIONS_RE.sub("", text).strip()
     if stripped != text.strip():
         return looks_like_command(stripped)

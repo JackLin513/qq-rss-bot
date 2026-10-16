@@ -68,14 +68,22 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - **群消息事件是 `GROUP_MESSAGE_CREATE`，不是 `group_at_message_create`**。
   QQ 2026 新协议下平台推全量群消息，botpy 1.2.1 无此解析器会静默丢弃。
   `compat.py` 负责补上；`bot.py` 里两个 handler 都要保留（老协议可能仍被启用）。
-  报文**没有 mentions 字段**，@ 是明文混在 content 里的，只能字符串匹配。
+  **@ 有没有 `mentions` 字段取决于客户端形态**：手工 @ 的报文**没有** mentions，
+  @ 以显示名明文混在 content 里；指令面板 @ 的报文**有** mentions 且带 `is_you`。
+  早期笔记写成「一律没有 mentions 字段」是错的。
 - **@ 有三种形态，正则漏一种就是「面板点了没反应」**：显示名明文
   `@猪排爱好者 /ping`（手工 @）、`<@OPENID>` 占位符（**指令面板按钮发的就是这个**）、
   老数字 `<@!123456>`。占位符里是 **32 位十六进制 openid 不是 QQ 号**，
   `_PLACEHOLDER_RE` 曾经写成 `<@!?\d+>` 只认数字，于是面板消息全部被
   `忽略非 @ 消息` 丢掉（DEBUG 级，INFO 下完全看不见）。
-  现在正则用 `[0-9A-Za-z_-]+`；`is_bot_mentioned` 对「开头占位符」要求后面
-  跟的是**已知指令名**才认，否则 `@队友 你看这个` 会误触发。
+  现在正则用 `[0-9A-Za-z_-]+`。
+- **判「有没有 @ 机器人」要优先用 `mentions[].is_you`**：平台直接标了
+  「这个 @ 就是你」，是唯一精确的依据。**但 botpy 的 `_User` 把它丢了**
+  （只留 `id/username/bot/avatar`），和 `member_role` 一样要在 `compat.Mention`
+  里捡回来。判据优先级：`is_you` → 有 mentions 但没 `is_you` 就**明确否定**
+  （所以「@队友 + 恰好一个指令名」不会误触发）→ 无 mentions 时才退化成
+  显示名匹配 → 再退化成「开头占位符 + 已知指令名」。
+  最后那层退化有已知误判（`@队友 ping`），只在完全拿不到 mentions 时才走到。
 - **排查「收不到事件」先把 `LOG_LEVEL=DEBUG` 打开**：`compat.py` 会把原始报文
   打出来。这次就是靠它直接看到 `<@OPENID> /help`，不用猜。
 - **`compat.py` 还会替换 `parse_group_at_message_create`**，不只是补新事件。
@@ -140,8 +148,15 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - `/sub /v2ex/topics/hot`：成功，抓到 title 并建立 baseline（`initialized=1`）
 - **主动消息：HTTP 200 成功**，群内「机器人主动在群聊内发言」开关是开的
 - **指令面板按钮真的会补 @，补的是 `<@OPENID>` 占位符形态**（实测 18:42）：
-  手动 @ 是 `@猪排爱好者 /ping`，面板是 `<@C371C51BA906A22E4...> /help `。
-  两种都被正确识别后，面板与手工 @ 均可触发。
+  手动 @ 是 `@猪排爱好者 /ping`（content 里是**显示名**，无 mentions 字段），
+  面板是 `<@C371C51BA906A22E4...> /help `（**有** mentions 且 `is_you: true`）。
+  两种形态现已都能触发。
+- **平台会给 `mentions[].is_you`**，实测报文：
+  `'mentions': [{'bot': True, 'is_you': True, 'username': '猪排爱好者',
+  'id': 'C371C51B...', 'member_openid': 'C371C51B...', 'member_role': 'member',
+  'scope': 'single'}]`。机器人自己的 openid 是 `C371C51BA906A22E47B2CFC35138A24D`。
+  注意 `username` 会随改名变（18:48 还是「猪排爱好者」，18:52 已变成「炸猪排爱好者」），
+  所以**不能**靠显示名做长期判据。
 - **指令面板：`POST /v2/panels` 创建成功**，`panel_id = p_Y8uv4aayeceLDxBMGeKjGB`
   （scope=group、target_type=all、6 个元素），回读与代码完全一致。
   改内容：`scripts/setup_panel.py --update p_Y8uv4aayeceLDxBMGeKjGB`
