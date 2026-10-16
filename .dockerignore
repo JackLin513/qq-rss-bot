@@ -1,0 +1,20 @@
+# 依赖和虚拟环境：镜像里会重新装
+.venv/
+__pycache__/
+*.py[cod]
+
+# 凭证和运行时状态，绝不能进镜像
+.env
+data/
+*.db
+*.sqlite3
+botpy.log
+
+# 和运行无关
+.git/
+.gitignore
+docs/
+.claude/
+.DS_Store
+.idea/
+.vscode/

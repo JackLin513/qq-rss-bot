@@ -1,0 +1,56 @@
+# 群晖 DS220+ 部署用（Container Manager → 项目）。
+#
+# 两个必须记住的差异（都是实机实测结论，见 docs/synology-migration.md）：
+#
+#   * bot 的 RSSHUB_BASE 要用**服务名 rsshub**，不是 127.0.0.1
+#     —— 容器里的 loopback 是容器自己。忘了改的症状是抓取全部超时。
+#   * **代理只给 rsshub，绝不能给 bot**。bot 要访问 http://rsshub:1200
+#     这个 Docker 内部服务名，走代理必然解析不了；而且 bot 的命脉
+#     api.sgroup.qq.com 是国内站，直连更快更稳，套代理等于凭空多一个
+#     「代理挂了我就掉线」的依赖。
+#
+# 代码本身不用改：RSSHUB_BASE 一直是环境变量。
+
+services:
+  rsshub:
+    image: diygod/rsshub
+    restart: unless-stopped
+    ports:
+      - "1200:1200"
+    environment:
+      - NODE_ENV=production
+      - TZ=Asia/Shanghai
+      # 全部上游走代理：v2ex / github 这些容器内直连不通（v2ex 实测 DNS 被
+      # 污染到 Facebook 的 IP 段），国内源经代理实测无延迟代价（Surge 在做规则分流）。
+      # ⚠️ 这个地址是 Apple TV 上的 Surge，**给它做 DHCP 固定**，否则路由器重启后
+      #    地址一变，所有 RSS 抓取会停。
+      - HTTP_PROXY=http://192.168.0.63:6152
+      - HTTPS_PROXY=http://192.168.0.63:6152
+      - NO_PROXY=localhost,127.0.0.1
+    # RSSHub 的内存**不回落**（Node 堆保留 + 路由缓存，压测后 30 秒仍是 646MB）。
+    # 6GB 的机器上无顾虑；真一路涨到 2GB 以上说明有路由泄漏，届时开这个当安全网
+    # （OOM 被杀后自动重启，只表现为一次推送延迟）。
+    # mem_limit: 2g
+
+  bot:
+    build: .
+    image: qq-rss-bot:latest
+    restart: unless-stopped
+    depends_on:
+      - rsshub
+    env_file:
+      - .env
+    environment:
+      # 内部服务名，绝不能走代理
+      - RSSHUB_BASE=http://rsshub:1200
+      # 绝对路径：不依赖 config.PROJECT_ROOT 的推算，换安装方式也不会写错地方
+      - DB_PATH=/app/data/bot.db
+      - TZ=Asia/Shanghai
+      # 显式清空。dockerd.json 里配了 proxies，但实测运行中的守护进程没应用它；
+      # 万一哪天生效了，上面两条内部调用会被打断。
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - NO_PROXY=localhost,127.0.0.1,rsshub,api.sgroup.qq.com,bots.qq.com
+    volumes:
+      # SQLite 和 RSSHub 路由缓存都落在这里，必须持久化
+      - ./data:/app/data
