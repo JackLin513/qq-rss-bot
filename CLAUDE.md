@@ -12,6 +12,8 @@ uv run python scripts/integration.py           # 15 项端到端（假推送，�
 uv run python scripts/probe_events.py 20       # 事件探针（先停掉正式实例）
 uv run python scripts/check_sources.py         # 复测 RSSHub 各路由可用性
 uv run python scripts/test_push.py             # 测主动消息（不占 WS 会话，可并行）
+uv run python scripts/setup_panel.py --list    # 指令面板：查询（只读，先跑这个）
+uv run python scripts/setup_panel.py --create  # 指令面板：创建
 ```
 
 ## 运行平台
@@ -67,6 +69,20 @@ uv run python scripts/test_push.py             # 测主动消息（不占 WS 会
   QQ 2026 新协议下平台推全量群消息，botpy 1.2.1 无此解析器会静默丢弃。
   `compat.py` 负责补上；`bot.py` 里两个 handler 都要保留（老协议可能仍被启用）。
   报文**没有 mentions 字段**，@ 是明文混在 content 里的，只能字符串匹配。
+- **`compat.py` 还会替换 `parse_group_at_message_create`**，不只是补新事件。
+  原因：botpy 的 `GroupMessage._User` 只取 `member_openid`，
+  **把 `author.member_role` 丢了**，而 `/sub`、`/unsub` 的管理员限制要靠它。
+  补法是子类 `GroupMessageWithRole` 加一个 `__slots__` 槽位——
+  `GroupMessage` 用了 `__slots__`，不能事后挂属性。
+  两个解析器都替换，幂等靠函数上的 `_qq_rss_bot_patched` 标记。
+- **受限指令用 token 判，别名也要列进 `RESTRICTED_TOKENS`**（`sub`/`subscribe`/`订阅`/…），
+  只列规范名会漏掉中文别名。
+- **角色拿不到时放行（fail-open）并记警告**。宁可漏管，也不能让机器人整个不可用。
+  放开限制的开关是 `RESTRICT_ADMIN_COMMANDS=false`。
+- **指令面板 API 的两个坑**：`GET /v2/panels` 的 **`scope` 是必填查询参数**
+  （官方文档把它放在参数表里，容易漏，漏了返回 30011「生效场景不合法」）；
+  错误码**文档写 `40030011`、运行时返回 `30011`**，映射时要做归一化。
+  host 与消息接口相同（`https://api.sgroup.qq.com`），文档没写但实测可用。
 - **发图是两步**：先 `post_group_file(group_openid, file_type=1, url=图片URL, srv_send_msg=False)`
   拿 `file_info`，再 `post_group_message(msg_type=7, media={"file_info": ...}, content=...)`。
   `url` 传的是**图片地址，QQ 服务器自己去下载**，不需要我们先下来再上传。

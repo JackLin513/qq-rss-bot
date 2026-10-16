@@ -54,8 +54,19 @@ HELP_TEXT = """RSS 订阅机器人
 /list                              查看本群订阅
 /check <编号>                      立刻抓一次并预览
 /ping                              存活检测
+/help                              本说明
 
-例：/sub /github/trending/daily/python 30"""
+订阅是按群共享的：群里任何人订阅，全群都会收到推送。
+/sub 与 /unsub 仅群主和管理员可用。
+
+例：/sub /36kr/newsflashes 30"""
+
+# 只有群主/管理员能用的指令（按 token 判，别名也要列进来）
+RESTRICTED_TOKENS = frozenset({"sub", "subscribe", "订阅", "unsub", "取消"})
+
+# 实测群主是 "owner"；"admin" 是按常见约定加的，若真实值不同，
+# 拒绝时会把实际角色打进日志，照着改这里即可。
+ADMIN_ROLES = frozenset({"owner", "admin"})
 
 
 class Replier(Protocol):
@@ -66,6 +77,9 @@ class Replier(Protocol):
 class CommandContext:
     group_openid: str
     reply: Replier
+    # 发起人在群里的角色（owner / admin / …）。由 compat.py 的补丁补上，
+    # 老协议路径或 botpy 行为变化时可能为 None —— 见 CommandHandler._is_admin。
+    member_role: str | None = None
 
 
 class CommandHandler:
@@ -104,11 +118,37 @@ class CommandHandler:
                 await ctx.reply(f"未知指令：/{command}\n\n{HELP_TEXT}")
             return
 
+        if self._restricted(command) and not self._is_admin(ctx):
+            _log.info(
+                "拒绝受限指令 %s：发起人角色=%r（群 %s）",
+                command,
+                ctx.member_role,
+                ctx.group_openid,
+            )
+            await ctx.reply("这个指令只允许群主和管理员使用。")
+            return
+
         try:
             await handler(ctx, args)
         except Exception:
             _log.exception("处理指令 %s 失败", command)
             await ctx.reply("执行出错，已记录日志。")
+
+    def _restricted(self, command: str) -> bool:
+        return self.cfg.restrict_admin_commands and command in RESTRICTED_TOKENS
+
+    def _is_admin(self, ctx: CommandContext) -> bool:
+        role = (ctx.member_role or "").strip().lower()
+        if role in ADMIN_ROLES:
+            return True
+        if not role:
+            # 角色拿不到时放行：宁可漏管，也不能让机器人直接不可用。
+            # 真出现这行日志说明 compat.py 的解析器补丁没生效。
+            _log.warning(
+                "拿不到发起人角色，放行受限指令 %s（检查 compat.py 补丁）", ctx.group_openid
+            )
+            return True
+        return False
 
     # ---------- 各指令 ----------
 

@@ -101,10 +101,14 @@ class RssBot(botpy.Client):
     async def _handle_group_message(self, message: GroupMessage) -> None:
         self.db.touch_group(message.group_openid)
         text = strip_mention(message.content, getattr(self.robot, "name", None))
-        _log.info("群 %s 指令: %r", message.group_openid, text)
+        # 把角色一起记下来：普通成员的实际取值目前还没实测到，
+        # 这行日志能直接看出来（补 ADMIN_ROLES 时用得上）
+        role = getattr(message, "member_role", None)
+        _log.info("群 %s 指令: %r（角色=%r）", message.group_openid, text, role)
         ctx = CommandContext(
             group_openid=message.group_openid,
             reply=self._make_replier(message),
+            member_role=role,
         )
         await self.commands.handle(ctx, text)
 

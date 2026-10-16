@@ -1,0 +1,209 @@
+"""配置 QQ 官方机器人的「指令面板」（群聊场景）。
+
+指令面板的用途：用户在 QQ 客户端输入框里打 `/` 时会弹出半屏面板，
+展示本机器人可用的指令，点击即把指令填进输入框。
+
+接口（官方文档 api-v2，host 与消息接口相同）：
+    GET    /v2/panels                  查询指令面板列表
+    POST   /v2/panels                  创建，限 10 QPM，一个机器人最多 20 个面板
+    GET    /v2/panels/{panel_id}       查询详情
+    PUT    /v2/panels/{panel_id}       修改
+    DELETE /v2/panels/{panel_id}       删除
+    PUT    /v2/panels/{panel_id}/target 修改关联对象
+
+文档没写 host，这里按消息接口的 host 走（`https://api.sgroup.qq.com`）。
+脚本会先打一条只读的 GET 验证这一点，再动任何东西。
+
+注意：指令面板是较新的能力（约 2026-08 起），**需要较新版 QQ 客户端**才会显示，
+且手机版优先、桌面版可能延后。所以「接口返回成功但客户端看不到」是可能发生的，
+属于灰度发布的正常现象，不是配错了。
+
+跑法：
+    uv run python scripts/setup_panel.py --list       # 只读，先看现有的
+    uv run python scripts/setup_panel.py --create     # 创建群聊面板
+    uv run python scripts/setup_panel.py --update <panel_id>
+    uv run python scripts/setup_panel.py --delete <panel_id>
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+import httpx  # noqa: E402
+
+TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
+API_BASE = "https://api.sgroup.qq.com"
+
+SCOPE = "group"
+TARGET_TYPE = "all"  # 该场景下所有群都生效（机器人在群里的 openid 要进群后才知道，
+# 所以不用 specific —— 那需要先把 group_openid 列进去）
+
+# 官方限制：name ≤14 字符、desc ≤30 字符、单面板 ≤20 个元素
+NAME_LIMIT = 14
+DESC_LIMIT = 30
+
+# only_admin 与代码里的 RESTRICTED_TOKENS 对齐：
+# /sub 和 /unsub 在代码里就是仅群主/管理员可用，面板上也标上，UI 语义才一致。
+PANEL_ITEMS = [
+    {"name": "/sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
+    {"name": "/unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
+    {"name": "/list", "desc": "查看本群所有订阅", "type": "command", "only_admin": False},
+    {"name": "/check", "desc": "立刻抓一次验证源是否可用", "type": "command", "only_admin": False},
+    {"name": "/ping", "desc": "检查机器人在线状态", "type": "command", "only_admin": False},
+    {"name": "/help", "desc": "查看完整用法说明", "type": "command", "only_admin": False},
+]
+
+PANEL_REMARK = "qq-rss-bot 指令面板（由 scripts/setup_panel.py 生成）"
+
+# 官方错误码 → 人话。
+# 注意：文档写的是 4003xxxx，实测运行时返回的是后 5 位（如 30011），
+# 所以这里按规范化后的短码做键，两种写法都能命中。
+ERROR_HINTS = {
+    "30001": "参数错误，检查请求参数",
+    "30008": "链接格式错误，必须以 https:// 开头",
+    "30009": "有并发的面板操作在进行，稍后重试",
+    "30011": "生效场景不合法，scope 只能是 c2c / group / channel / dm",
+    "30012": "target_type 非法，或 channel/dm 只支持 all",
+    "30013": "数量超限（单面板 ≤20 元素，单请求 openids ≤20）",
+    "30015": "元素 type 非法，只能是 command / link",
+    "30016": "缺少必填字段",
+    "30018": "该场景不支持此操作",
+    "30020": "内容未通过安全检查",
+    "30021": "全局面板不能带 specific 目标",
+}
+
+
+def _norm_code(code: object) -> str:
+    """把 40030011 / 30011 都归一到 '30011'。"""
+    s = str(code)
+    return s[3:] if s.startswith("400") and len(s) == 8 else s
+
+
+def validate(items: list[dict]) -> list[str]:
+    """本地先校验一遍字数，免得被接口打回来还要猜原因。"""
+    problems: list[str] = []
+    if len(items) > 20:
+        problems.append(f"元素数 {len(items)} 超过上限 20")
+    for i, item in enumerate(items):
+        name, desc = item.get("name", ""), item.get("desc", "")
+        if len(name) > NAME_LIMIT:
+            problems.append(f"第 {i + 1} 个元素 name 长 {len(name)}，上限 {NAME_LIMIT}：{name!r}")
+        if len(desc) > DESC_LIMIT:
+            problems.append(f"第 {i + 1} 个元素 desc 长 {len(desc)}，上限 {DESC_LIMIT}：{desc!r}")
+        if item.get("type") not in ("command", "link"):
+            problems.append(f"第 {i + 1} 个元素 type 非法：{item.get('type')!r}")
+        if item.get("type") == "link" and not str(item.get("link", "")).startswith("https://"):
+            problems.append(f"第 {i + 1} 个元素是 link 但 link 不以 https:// 开头")
+    return problems
+
+
+def explain(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except Exception:
+        return f"HTTP {resp.status_code} {resp.text[:200]}"
+    code = body.get("code")
+    text = f"HTTP {resp.status_code} code={code} {body.get('message', '')}"
+    if resp.status_code == 200:
+        return text
+    hint = ERROR_HINTS.get(_norm_code(code))
+    # 失败时把原始响应也带上：错误码映射可能不全，原文最可靠
+    return f"{text}\n  原始响应: {resp.text[:300]}" + (f"\n  → {hint}" if hint else "")
+
+
+async def main() -> int:
+    argv = sys.argv[1:]
+    mode = "list"
+    panel_id = None
+    if "--create" in argv:
+        mode = "create"
+    elif "--update" in argv:
+        mode, panel_id = "update", argv[argv.index("--update") + 1]
+    elif "--delete" in argv:
+        mode, panel_id = "delete", argv[argv.index("--delete") + 1]
+    elif "--list" in argv:
+        mode = "list"
+
+    from qq_rss_bot.config import load_config
+
+    cfg = load_config()
+
+    problems = validate(PANEL_ITEMS)
+    if problems:
+        print("本地校验不通过，未发起任何请求：")
+        for p in problems:
+            print(f"  ✗ {p}")
+        return 1
+    print(f"本地校验通过：{len(PANEL_ITEMS)} 个元素，名称/描述均在官方字数限制内")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            TOKEN_URL, json={"appId": cfg.appid, "clientSecret": cfg.secret}
+        )
+        token = resp.json().get("access_token") if resp.status_code == 200 else None
+        if not token:
+            print(f"取 token 失败: HTTP {resp.status_code} {resp.text[:200]}")
+            return 1
+        headers = {
+            "Authorization": f"QQBot {token}",
+            "X-Union-Appid": cfg.appid,
+            "Content-Type": "application/json",
+        }
+
+        # 先只读探测一次，确认 host 和路径是对的，再动任何东西。
+        # scope 是必填查询参数（文档写在 GET /v2/panels 的参数表里，漏了会返回
+        # 30011「生效场景不合法」）。
+        resp = await client.get(
+            f"{API_BASE}/v2/panels", params={"scope": SCOPE}, headers=headers
+        )
+        print(f"GET /v2/panels?scope={SCOPE} → {explain(resp)}")
+        if resp.status_code != 200:
+            print("\n只读查询就失败了，先别继续。可能是 host 与文档不符，或账号无此能力。")
+            return 1
+        existing = resp.json().get("records") or []
+        print(f"当前 scope={SCOPE} 下已有 {len(existing)} 个面板")
+        for p in existing:
+            print(
+                f"  {p.get('panel_id')}  target={p.get('target_type')}"
+                f"  items={len((p.get('panel') or {}).get('items') or [])}"
+            )
+
+        if mode == "list":
+            return 0
+
+        if mode == "delete":
+            resp = await client.delete(f"{API_BASE}/v2/panels/{panel_id}", headers=headers)
+            print(f"DELETE {panel_id} → {explain(resp)}")
+            return 0 if resp.status_code == 200 else 1
+
+        body = {
+            "scope": SCOPE,
+            "target_type": TARGET_TYPE,
+            "panel": {"items": PANEL_ITEMS, "remark": PANEL_REMARK, "version": 1},
+        }
+
+        if mode == "create":
+            resp = await client.post(f"{API_BASE}/v2/panels", headers=headers, json=body)
+            print(f"POST /v2/panels → {explain(resp)}")
+            if resp.status_code == 200:
+                pid = resp.json().get("panel_id")
+                print(f"\n✅ 创建成功，panel_id = {pid}")
+                print("   以后改内容用：uv run python scripts/setup_panel.py --update " + str(pid))
+                print("\n   如果 QQ 客户端里打 / 看不到面板：需要较新版客户端，")
+                print("   手机版优先、桌面版可能延后，属灰度期的正常现象。")
+                return 0
+            return 1
+
+        # mode == update
+        resp = await client.put(f"{API_BASE}/v2/panels/{panel_id}", headers=headers, json=body)
+        print(f"PUT {panel_id} → {explain(resp)}")
+        return 0 if resp.status_code == 200 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

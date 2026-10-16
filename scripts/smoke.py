@@ -21,7 +21,7 @@ import httpx  # noqa: E402
 
 from qq_rss_bot.config import load_config  # noqa: E402
 from qq_rss_bot.db import Database, utcnow  # noqa: E402
-from qq_rss_bot.commands import is_bot_mentioned, strip_mention  # noqa: E402
+from qq_rss_bot.commands import HELP_TEXT, is_bot_mentioned, strip_mention  # noqa: E402
 from qq_rss_bot.compat import install_new_protocol_support  # noqa: E402
 from qq_rss_bot.rss import Entry, fetch_feed, resolve_url  # noqa: E402
 from qq_rss_bot.scheduler import format_entry  # noqa: E402
@@ -55,6 +55,7 @@ def cfg_stub():
         db_path=Path("/tmp/unused.db"),
         log_level="INFO",
         attach_images=True,
+        restrict_admin_commands=True,
     )
 
 
@@ -282,7 +283,85 @@ check("类上出现 parse_group_message_create", "group_message_create" in metho
 state = ConnectionState(lambda *a, **k: None, None)
 check("解析表里真的注册了", "group_message_create" in state.parsers)
 check("老 @ 事件仍在", "group_at_message_create" in state.parsers)
-check("重复安装安全", install_new_protocol_support() is False)
+check("重复安装安全", install_new_protocol_support() == [])
+check("解析器带补丁标记（幂等依据）",
+      getattr(ConnectionState.parse_group_message_create, "_qq_rss_bot_patched", False) is True)
+
+print("[4.7] 群内角色提取与权限限制")
+import dataclasses  # noqa: E402
+
+from qq_rss_bot.commands import (  # noqa: E402
+    ADMIN_ROLES,
+    RESTRICTED_TOKENS,
+    CommandContext,
+    CommandHandler,
+)
+from qq_rss_bot.compat import GroupMessageWithRole  # noqa: E402
+
+_msg = GroupMessageWithRole(
+    None, "evt",
+    {"id": "m1", "group_openid": "G", "content": "hi",
+     "author": {"member_openid": "u1", "member_role": "owner"}},
+)
+check("从报文提取 member_role", _msg.member_role == "owner")
+check("member_openid 仍正常", _msg.author.member_openid == "u1")
+check("报文缺 author 不炸", GroupMessageWithRole(None, "e", {"id": "m"}).member_role is None)
+check("报文缺 member_role 得 None",
+      GroupMessageWithRole(None, "e", {"author": {"member_openid": "u"}}).member_role is None)
+
+
+async def _check_permissions() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        h = CommandHandler(cfg_stub(), db, None)
+
+        def ctx(role):
+            return CommandContext(group_openid="G", reply=None, member_role=role)
+
+        check("owner 是管理员", h._is_admin(ctx("owner")) is True)
+        check("admin 是管理员", h._is_admin(ctx("admin")) is True)
+        check("member 不是管理员", h._is_admin(ctx("member")) is False)
+        check("大小写不敏感", h._is_admin(ctx("OWNER")) is True)
+        check("角色缺失时放行（fail-open，不能把机器人锁死）",
+              h._is_admin(ctx(None)) is True)
+
+        check("/sub 受限", h._restricted("sub") is True)
+        check("别名 订阅 同样受限", h._restricted("订阅") is True)
+        check("/unsub 受限", h._restricted("unsub") is True)
+        check("/list 不受限", h._restricted("list") is False)
+        check("/ping 不受限", h._restricted("ping") is False)
+
+        off = CommandHandler(dataclasses.replace(cfg_stub(), restrict_admin_commands=False), db, None)
+        check("开关关掉后不再受限", off._restricted("sub") is False)
+
+        # 端到端：普通成员发 /unsub 应被拒
+        replies: list[str] = []
+
+        async def reply(text: str) -> None:
+            replies.append(text)
+
+        await h.handle(CommandContext("G", reply, "member"), "/unsub 1")
+        check("普通成员发 /unsub 被拒", any("只允许群主" in r for r in replies), str(replies))
+
+        replies.clear()
+        await h.handle(CommandContext("G", reply, "owner"), "/unsub 1")
+        check("群主发 /unsub 能执行（走到底：没这个订阅）",
+              any("没找到" in r for r in replies), str(replies))
+
+        replies.clear()
+        await h.handle(CommandContext("G", reply, "member"), "/list")
+        check("普通成员 /list 可用", any("还没有订阅" in r for r in replies), str(replies))
+        db.close()
+
+
+asyncio.run(_check_permissions())
+
+print("[4.8] 帮助文案里不该出现跑不通的示例")
+# /github/trending/* 默认 503（需 GITHUB_ACCESS_TOKEN），不能在帮助里当例子
+check("帮助不含 github/trending 示例", "github/trending" not in HELP_TEXT)
+check("帮助含可用路由示例", "/36kr/newsflashes" in HELP_TEXT)
+check("帮助说明了订阅是群共享的", "按群共享" in HELP_TEXT)
+check("帮助说明了受限指令", "仅群主和管理员可用" in HELP_TEXT)
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

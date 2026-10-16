@@ -41,6 +41,7 @@ class Config:
     db_path: Path
     log_level: str
     attach_images: bool
+    restrict_admin_commands: bool
 
 
 def load_config() -> Config:
@@ -72,4 +73,7 @@ def load_config() -> Config:
         # DEBUG 能看到「非 @ 消息被忽略」这类细节，排查协议问题很有用
         log_level=(os.environ.get("LOG_LEVEL") or "INFO").strip().upper(),
         attach_images=_env_bool("ATTACH_IMAGES", True),
+        # 关掉就退回「谁都能订阅/退订」。留这个开关是为了角色识别万一失灵时
+        # 有条退路，不至于把机器人锁死。
+        restrict_admin_commands=_env_bool("RESTRICT_ADMIN_COMMANDS", True),
     )
