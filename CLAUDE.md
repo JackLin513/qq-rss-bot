@@ -69,14 +69,25 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   QQ 2026 新协议下平台推全量群消息，botpy 1.2.1 无此解析器会静默丢弃。
   `compat.py` 负责补上；`bot.py` 里两个 handler 都要保留（老协议可能仍被启用）。
   报文**没有 mentions 字段**，@ 是明文混在 content 里的，只能字符串匹配。
+- **@ 有三种形态，正则漏一种就是「面板点了没反应」**：显示名明文
+  `@猪排爱好者 /ping`（手工 @）、`<@OPENID>` 占位符（**指令面板按钮发的就是这个**）、
+  老数字 `<@!123456>`。占位符里是 **32 位十六进制 openid 不是 QQ 号**，
+  `_PLACEHOLDER_RE` 曾经写成 `<@!?\d+>` 只认数字，于是面板消息全部被
+  `忽略非 @ 消息` 丢掉（DEBUG 级，INFO 下完全看不见）。
+  现在正则用 `[0-9A-Za-z_-]+`；`is_bot_mentioned` 对「开头占位符」要求后面
+  跟的是**已知指令名**才认，否则 `@队友 你看这个` 会误触发。
+- **排查「收不到事件」先把 `LOG_LEVEL=DEBUG` 打开**：`compat.py` 会把原始报文
+  打出来。这次就是靠它直接看到 `<@OPENID> /help`，不用猜。
 - **`compat.py` 还会替换 `parse_group_at_message_create`**，不只是补新事件。
   原因：botpy 的 `GroupMessage._User` 只取 `member_openid`，
   **把 `author.member_role` 丢了**，而 `/sub`、`/unsub` 的管理员限制要靠它。
   补法是子类 `GroupMessageWithRole` 加一个 `__slots__` 槽位——
   `GroupMessage` 用了 `__slots__`，不能事后挂属性。
   两个解析器都替换，幂等靠函数上的 `_qq_rss_bot_patched` 标记。
-- **受限指令用 token 判，别名也要列进 `RESTRICTED_TOKENS`**（`sub`/`subscribe`/`订阅`/…），
-  只列规范名会漏掉中文别名。
+- **指令别名表 `COMMAND_ALIASES` 是唯一事实来源**：`COMMAND_TOKENS`（什么算指令）、
+  `RESTRICTED_TOKENS`（哪些要管理员）、`COMMAND_METHODS`（派发到哪个方法）
+  全从它派生。曾经是手工维护三份，`RESTRICTED_TOKENS` 漏一个中文别名就等于没限制。
+  加指令只改 `COMMAND_ALIASES` + 写一个 `_xxx` 方法 + 在 `COMMAND_METHODS` 挂上。
 - **角色拿不到时放行（fail-open）并记警告**。宁可漏管，也不能让机器人整个不可用。
   放开限制的开关是 `RESTRICT_ADMIN_COMMANDS=false`。
 - **指令面板的字数限制是显示宽度，不是字符数**（name ≤14 / desc ≤30，中文按 2 算）。
@@ -122,6 +133,9 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - `@` 过滤：发 `111` 被正确忽略，日志 `忽略非 @ 消息: '111'`
 - `/sub /v2ex/topics/hot`：成功，抓到 title 并建立 baseline（`initialized=1`）
 - **主动消息：HTTP 200 成功**，群内「机器人主动在群聊内发言」开关是开的
+- **指令面板按钮真的会补 @，补的是 `<@OPENID>` 占位符形态**（实测 18:42）：
+  手动 @ 是 `@猪排爱好者 /ping`，面板是 `<@C371C51BA906A22E4...> /help `。
+  两种都被正确识别后，面板与手工 @ 均可触发。
 - **指令面板：`POST /v2/panels` 创建成功**，`panel_id = p_Y8uv4aayeceLDxBMGeKjGB`
   （scope=group、target_type=all、6 个元素），回读与代码完全一致。
   改内容：`scripts/setup_panel.py --update p_Y8uv4aayeceLDxBMGeKjGB`

@@ -51,6 +51,9 @@ def _make_parser(event: str):
     """生成一个把事件路由到 ``event`` 的解析器，构造带角色的群消息。"""
 
     def parse(self, payload: dict) -> None:
+        # DEBUG 级转储原始报文。@ 的形态、有没有 mentions 字段这类事猜不出来 ——
+        # 指令面板的 <@OPENID> 占位符就是靠这个抓到的（正则只认 \d+ 时全部漏掉）。
+        _log.debug("原始报文 %s: %r", event, payload)
         # 报文结构与 @ 消息一致（d.group_openid / d.id / d.content 都在），
         # 所以直接复用 GroupMessage，包括 message.reply() 的被动回复能力。
         message = GroupMessageWithRole(self.api, payload.get("id"), payload.get("d", {}))

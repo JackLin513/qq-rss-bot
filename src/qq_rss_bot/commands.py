@@ -18,10 +18,19 @@ from .rss import fetch_feed, resolve_url
 
 _log = logging.getLogger("qq_rss_bot.commands")
 
-# QQ 消息里 @ 有两种形态，都得剥掉：
-#   1. 老协议占位符 <@!123456>
-#   2. 2026 新协议直接把显示名写进正文，如 "@猪排爱好者 /ping"
-_PLACEHOLDER_RE = re.compile(r"<@!?\d+>")
+# QQ 消息里 @ 的形态（既要能剥掉，也要能认出来）：
+#   1. 显名明文     "@猪排爱好者 /ping"        —— 手工 @ 时平台展开成这样
+#   2. openid 占位符 "<@C371C51BA906A22E4...>" —— **指令面板插入的是这种**
+#   3. 老数字占位符  "<@!123456>"               —— 老协议
+#
+# 踩过的坑：正则曾经写成 <@!?\d+>，只认纯数字（老协议的 QQ 号）。
+# 新协议的占位符里是 **32 位十六进制 openid**，于是面板的消息
+# 一条都匹配不上 —— 表现是「面板完美显示，点了没反应」，
+# 而丢在 DEBUG 级日志里，从外面完全看不出原因。
+_OPENID = r"[0-9A-Za-z_-]+"
+_PLACEHOLDER_RE = re.compile(rf"<@!?{_OPENID}>")
+# 开头的连续占位符（可能 @ 了多个），用于判断「这条是不是冲着机器人来的」
+_LEADING_MENTIONS_RE = re.compile(rf"^(?:\s*<@!?{_OPENID}>)+")
 
 
 def strip_mention(text: str | None, bot_name: str | None = None) -> str:
@@ -46,7 +55,21 @@ def is_bot_mentioned(
             value = item.get(attr) if isinstance(item, dict) else getattr(item, attr, None)
             if value and bot_name and value == bot_name:
                 return True
-    return bool(bot_name and f"@{bot_name}" in (content or ""))
+
+    text = content or ""
+
+    # 手工 @：平台把 @ 展开成显示名写进正文
+    if bot_name and f"@{bot_name}" in text:
+        return True
+
+    # 指令面板 @：正文开头是 <@OPENID> 占位符。
+    # 这里**刻意要求占位符后面跟的是已知指令名**，而不是「有占位符就算」：
+    # 占位符形态和「@张三」完全一样，而我们拿不到机器人自己的 openid
+    # 来精确比对，只能靠后面跟的内容来区分。
+    stripped = _LEADING_MENTIONS_RE.sub("", text).strip()
+    if stripped != text.strip():
+        return looks_like_command(stripped)
+    return False
 
 HELP_TEXT = """RSS 订阅机器人
 /sub <RSSHub路由或URL> [间隔分钟]  订阅，默认 15 分钟
@@ -61,8 +84,56 @@ HELP_TEXT = """RSS 订阅机器人
 
 例：/sub /36kr/newsflashes 30"""
 
-# 只有群主/管理员能用的指令（按 token 判，别名也要列进来）
-RESTRICTED_TOKENS = frozenset({"sub", "subscribe", "订阅", "unsub", "取消"})
+# 指令别名 → 规范名。键是群里实际能敲的 token（不带斜杠）。
+# 这张表是「什么算指令」的唯一依据 —— 别名、权限、@ 识别都从它派生，
+# 免得加个别名时忘了同步别处。
+COMMAND_ALIASES = {
+    "help": "help",
+    "帮助": "help",
+    "?": "help",
+    "sub": "sub",
+    "subscribe": "sub",
+    "订阅": "sub",
+    "unsub": "unsub",
+    "取消": "unsub",
+    "list": "list",
+    "列表": "list",
+    "check": "check",
+    "ping": "ping",
+}
+
+COMMAND_TOKENS = frozenset(COMMAND_ALIASES)
+
+# 规范名 → 处理方法名
+COMMAND_METHODS = {
+    "help": "_help",
+    "sub": "_sub",
+    "unsub": "_unsub",
+    "list": "_list",
+    "check": "_check",
+    "ping": "_ping",
+}
+
+# 只有群主/管理员能用的指令。**从别名表派生**，加别名不会漏 ——
+# 曾经是手工列 {"sub","subscribe","订阅",...}，漏一个中文别名就等于没限制。
+RESTRICTED_TOKENS = frozenset(
+    token for token, canonical in COMMAND_ALIASES.items() if canonical in ("sub", "unsub")
+)
+
+
+def looks_like_command(text: str | None) -> bool:
+    """首词是不是已知指令名（带不带斜杠都认）。
+
+    用于判断一条**没有明确 @ 显示名**的消息是不是冲着机器人来的：
+    指令面板插入的 @ 是 openid 占位符，剥掉之后剩下的就是指令名。
+
+    刻意只认**已知**指令名，不认「以 / 开头的任意词」：
+    否则群里正常的斜杠用法会触发机器人刷「未知指令」。
+    """
+    parts = (text or "").strip().split()
+    if not parts:
+        return False
+    return parts[0].lstrip("/").lower() in COMMAND_TOKENS
 
 # 实测群主是 "owner"；"admin" 是按常见约定加的，若真实值不同，
 # 拒绝时会把实际角色打进日志，照着改这里即可。
@@ -97,20 +168,8 @@ class CommandHandler:
         parts = text.split()
         command, args = parts[0].lstrip("/").lower(), parts[1:]
 
-        handler = {
-            "help": self._help,
-            "帮助": self._help,
-            "?": self._help,
-            "sub": self._sub,
-            "subscribe": self._sub,
-            "订阅": self._sub,
-            "unsub": self._unsub,
-            "取消": self._unsub,
-            "list": self._list,
-            "列表": self._list,
-            "check": self._check,
-            "ping": self._ping,
-        }.get(command)
+        canonical = COMMAND_ALIASES.get(command)
+        handler = getattr(self, COMMAND_METHODS[canonical]) if canonical else None
 
         if handler is None:
             # 群里随便聊天时不要刷屏，只有看起来像指令才回

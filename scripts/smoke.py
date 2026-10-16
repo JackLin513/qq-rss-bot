@@ -21,7 +21,12 @@ import httpx  # noqa: E402
 
 from qq_rss_bot.config import load_config  # noqa: E402
 from qq_rss_bot.db import Database, utcnow  # noqa: E402
-from qq_rss_bot.commands import HELP_TEXT, is_bot_mentioned, strip_mention  # noqa: E402
+from qq_rss_bot.commands import (  # noqa: E402
+    HELP_TEXT,
+    is_bot_mentioned,
+    looks_like_command,
+    strip_mention,
+)
 from qq_rss_bot.compat import install_new_protocol_support  # noqa: E402
 from qq_rss_bot.rss import Entry, fetch_feed, resolve_url  # noqa: E402
 from qq_rss_bot.scheduler import format_entry  # noqa: E402
@@ -267,6 +272,40 @@ check("mentions 里有别人 → 不算", is_bot_mentioned("hi", [{"username": "
 check("mentions 为 None 不炸", is_bot_mentioned("hi", None, "bot") is False)
 check("已知局限：@名字前缀会被误判", is_bot_mentioned("@bot2 hi", [], "bot") is True)
 
+print("[4.58] @ 的三种形态（含指令面板的 openid 占位符）")
+# 回归：面板插入的 @ 是 <@OPENID> 占位符，不是显示名。
+# 正则曾经写成 <@!?\d+> 只认纯数字（老协议 QQ 号），
+# 于是面板的消息全部漏掉 —— 症状是「面板完美显示，点了没反应」。
+_PANEL = "<@C371C51BA906A22E47B2CFC35138A24D> /help "
+check("面板形态：占位符+指令 → 命中",
+      is_bot_mentioned(_PANEL, [], "猪排爱好者") is True)
+check("面板形态能剥干净", strip_mention(_PANEL, "猪排爱好者") == "/help")
+check("面板形态不带斜杠也认",
+      is_bot_mentioned("<@ABC123> ping", [], "猪排爱好者") is True)
+check("连续多个占位符",
+      is_bot_mentioned("<@A1> <@B2> /list", [], "猪排爱好者") is True)
+check("老数字占位符仍认",
+      is_bot_mentioned("<@!123456> /ping", [], "猪排爱好者") is True)
+check("手工 @ 显示名仍认",
+      is_bot_mentioned("@猪排爱好者 /ping", [], "猪排爱好者") is True)
+
+# 反向：@ 队友 + 闲聊 绝不能被当成在叫机器人（否则群里每次 @ 人都刷屏）
+check("@队友闲聊不误触发",
+      is_bot_mentioned("<@DEADBEEF00112233> 你看这个", [], "猪排爱好者") is False)
+check("纯闲聊不触发", is_bot_mentioned("111", [], "猪排爱好者") is False)
+check("占位符在中间不算（已知局限）",
+      is_bot_mentioned("看 <@A1> /help", [], "猪排爱好者") is False)
+# 已知局限：@队友后面跟裸指令名会被误判。代价可接受（比漏掉面板消息好），
+# 因为占位符形态和「@张三」一模一样，拿不到机器人自己的 openid 来精确比对。
+check("已知局限：@队友+裸指令名会误判",
+      is_bot_mentioned("<@DEADBEEF00112233> ping", [], "猪排爱好者") is True)
+
+check("looks_like_command 认裸名", looks_like_command("sub /x") is True)
+check("looks_like_command 认斜杠", looks_like_command("/sub") is True)
+check("looks_like_command 拒闲聊", looks_like_command("你看这个") is False)
+check("looks_like_command 拒空", looks_like_command("") is False)
+check("looks_like_command 拒未知指令", looks_like_command("/whatever") is False)
+
 print("[4.55] 逐条推送的配图路由")
 asyncio.run(_check_push_routing())
 
@@ -292,10 +331,14 @@ import dataclasses  # noqa: E402
 
 from qq_rss_bot.commands import (  # noqa: E402
     ADMIN_ROLES,
+    COMMAND_ALIASES,
+    COMMAND_METHODS,
     RESTRICTED_TOKENS,
     CommandContext,
     CommandHandler,
 )
+
+_COMMAND_METHODS_KEYS = frozenset(COMMAND_METHODS)
 from qq_rss_bot.compat import GroupMessageWithRole  # noqa: E402
 
 _msg = GroupMessageWithRole(
@@ -325,6 +368,11 @@ async def _check_permissions() -> None:
         check("角色缺失时放行（fail-open，不能把机器人锁死）",
               h._is_admin(ctx(None)) is True)
 
+        check("RESTRICTED_TOKENS 由别名表派生（加别名不会漏限制）",
+              RESTRICTED_TOKENS == {"sub", "subscribe", "订阅", "unsub", "取消"},
+              str(sorted(RESTRICTED_TOKENS)))
+        check("每个别名都指向已知规范名",
+              all(c in _COMMAND_METHODS_KEYS for c in COMMAND_ALIASES.values()))
         check("/sub 受限", h._restricted("sub") is True)
         check("别名 订阅 同样受限", h._restricted("订阅") is True)
         check("/unsub 受限", h._restricted("unsub") is True)
