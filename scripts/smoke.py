@@ -426,6 +426,42 @@ check("21 个元素被抓",
 _hint = setup_panel.ERROR_HINTS["30013"]
 check("30013 提示包含宽度信息", "宽度" in _hint, _hint)
 
+print("[4.77] 面板比对：归一化掉假差异")
+check("斜杠归一 /sub → sub", setup_panel._name_key("/sub") == "sub")
+check("裸名原样", setup_panel._name_key("sub") == "sub")
+check("None 不炸", setup_panel._name_key(None) == "")
+
+check("PANEL_ITEMS 用裸名（服务端会剥掉斜杠）",
+      all(not i["name"].startswith("/") for i in setup_panel.PANEL_ITEMS))
+
+# 服务端真实回读形态：裸名、only_admin=false 时字段被省略
+_remote = [
+    {"name": "sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
+    {"name": "unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
+    {"name": "list", "desc": "查看本群所有订阅", "type": "command"},
+    {"name": "check", "desc": "立刻抓一次验证源是否可用", "type": "command"},
+    {"name": "ping", "desc": "检查机器人在线状态", "type": "command"},
+    {"name": "help", "desc": "查看完整用法说明", "type": "command"},
+]
+check("真实回读形态 == 完全一致", setup_panel.compare_items(_remote) == [],
+      str(setup_panel.compare_items(_remote)))
+
+# 带斜杠的历史数据也该被认成一致（不能报「缺少 /sub / 多出 sub」）
+_slashy = [dict(i, name="/" + i["name"]) for i in _remote]
+check("带斜杠的旧数据不算差异", setup_panel.compare_items(_slashy) == [],
+      str(setup_panel.compare_items(_slashy)))
+
+# 真差异必须仍然抓得到，归一化不能把问题一起抹掉
+check("真缺元素仍被抓", "缺少元素 ping" in
+      " ".join(setup_panel.compare_items([i for i in _remote if i["name"] != "ping"])))
+check("描述改错仍被抓", any("desc" in d for d in setup_panel.compare_items(
+    [dict(i, desc="改过了") if i["name"] == "list" else i for i in _remote])))
+check("顺序变了仍被抓", any("顺序" in d for d in setup_panel.compare_items(
+    list(reversed(_remote)))))
+check("重名被抓", setup_panel.validate(
+    [{"name": "sub", "desc": "a", "type": "command"},
+     {"name": "/sub", "desc": "b", "type": "command"}]) != [])
+
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
 print(f"  rsshub = {cfg.rsshub_base}")

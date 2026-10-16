@@ -54,13 +54,15 @@ DESC_LIMIT = 30
 
 # only_admin 与代码里的 RESTRICTED_TOKENS 对齐：
 # /sub 和 /unsub 在代码里就是仅群主/管理员可用，面板上也标上，UI 语义才一致。
+# 名称用**裸名**（不带斜杠）：实测服务端会把开头的 `/` 剥掉存成 `sub`，
+# 客户端点击时自己补 `/`。写成 `/sub` 不会被拒，但回读时对不上，制造假差异。
 PANEL_ITEMS = [
-    {"name": "/sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
-    {"name": "/unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
-    {"name": "/list", "desc": "查看本群所有订阅", "type": "command", "only_admin": False},
-    {"name": "/check", "desc": "立刻抓一次验证源是否可用", "type": "command", "only_admin": False},
-    {"name": "/ping", "desc": "检查机器人在线状态", "type": "command", "only_admin": False},
-    {"name": "/help", "desc": "查看完整用法说明", "type": "command", "only_admin": False},
+    {"name": "sub", "desc": "订阅 RSS 源，可加间隔分钟", "type": "command", "only_admin": True},
+    {"name": "unsub", "desc": "取消本群某个订阅", "type": "command", "only_admin": True},
+    {"name": "list", "desc": "查看本群所有订阅", "type": "command", "only_admin": False},
+    {"name": "check", "desc": "立刻抓一次验证源是否可用", "type": "command", "only_admin": False},
+    {"name": "ping", "desc": "检查机器人在线状态", "type": "command", "only_admin": False},
+    {"name": "help", "desc": "查看完整用法说明", "type": "command", "only_admin": False},
 ]
 
 PANEL_REMARK = "qq-rss-bot 指令面板（由 scripts/setup_panel.py 生成）"
@@ -91,6 +93,15 @@ def _norm_code(code: object) -> str:
     return s[3:] if s.startswith("400") and len(s) == 8 else s
 
 
+def _name_key(name: object) -> str:
+    """指令名归一：去掉开头斜杠后比对。
+
+    服务端存的是裸名，但不同来源（代码、手配、历史数据）可能带斜杠。
+    不归一的话会报出一堆「缺少 /sub / 多出 sub」的假差异，把真正的问题淹掉。
+    """
+    return str(name or "").lstrip("/")
+
+
 def compare_items(remote: list[dict]) -> list[str]:
     """把线上面板和代码里的 PANEL_ITEMS 对比，返回差异描述。
 
@@ -98,8 +109,8 @@ def compare_items(remote: list[dict]) -> list[str]:
     所以这个对比是「适配」的核心检查。
     """
     diffs: list[str] = []
-    local = {i["name"]: i for i in PANEL_ITEMS}
-    online = {i.get("name"): i for i in remote}
+    local = {_name_key(i["name"]): i for i in PANEL_ITEMS}
+    online = {_name_key(i.get("name")): i for i in remote}
 
     for name in sorted(local.keys() - online.keys()):
         diffs.append(f"面板缺少元素 {name}")
@@ -107,12 +118,14 @@ def compare_items(remote: list[dict]) -> list[str]:
         diffs.append(f"面板多出元素 {name}（代码里没有）")
     for name in sorted(local.keys() & online.keys()):
         for field in ("desc", "type", "only_admin"):
-            if local[name].get(field) != online[name].get(field):
-                diffs.append(
-                    f"{name} 的 {field}：代码={local[name].get(field)!r} "
-                    f"面板={online[name].get(field)!r}"
-                )
-    if [i["name"] for i in PANEL_ITEMS] != [i.get("name") for i in remote]:
+            want, got = local[name].get(field), online[name].get(field)
+            if field == "only_admin":
+                # 服务端在 false 时**省略该字段**，回读成 None。
+                # 不归一的话每个非管理员指令都会报一条假差异。
+                want, got = bool(want), bool(got)
+            if want != got:
+                diffs.append(f"{name} 的 {field}：代码={want!r} 面板={got!r}")
+    if [_name_key(i["name"]) for i in PANEL_ITEMS] != [_name_key(i.get("name")) for i in remote]:
         diffs.append("元素顺序不一致（代码里的顺序视为期望顺序）")
     return diffs
 
@@ -146,6 +159,10 @@ def validate(items: list[dict]) -> list[str]:
             problems.append(f"第 {i + 1} 个元素 type 非法：{item.get('type')!r}")
         if item.get("type") == "link" and not str(item.get("link", "")).startswith("https://"):
             problems.append(f"第 {i + 1} 个元素是 link 但 link 不以 https:// 开头")
+    keys = [_name_key(i.get("name")) for i in items]
+    dupes = {k for k in keys if keys.count(k) > 1}
+    if dupes:
+        problems.append(f"指令名重复（归一后）：{sorted(dupes)}")
     return problems
 
 

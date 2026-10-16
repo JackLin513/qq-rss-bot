@@ -82,6 +82,11 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - **指令面板的字数限制是显示宽度，不是字符数**（name ≤14 / desc ≤30，中文按 2 算）。
   用 `len()` 校验会放行超宽的纯中文描述，到接口才回 `30013`；而该码在文档里写作
   「超出数量限制」，极易误判成「元素太多」。`scripts/setup_panel.py::_width()` 是正确口径。
+- **面板的指令名存成裸名**：`POST` 时给 `/sub`，服务端剥成 `sub`（客户端自己补斜杠）。
+  `PANEL_ITEMS` 直接写裸名，`compare_items` 用 `_name_key()` 两边归一 ——
+  否则回读时每个指令都会报一对「缺少 /sub / 多出 sub」的假差异。
+- **`only_admin=false` 时服务端省略该字段**，回读成 `None`。比对要 `bool()` 归一，
+  不然每个非管理员指令都报一条假差异。
 - **平台 UI 配的面板和我们 API 建的不是同一份数据**（实测：UI 里配了，`GET /v2/panels`
   四个 scope 全返回 0，客户端打 `/` 显示「这里还没有指令」）。UI 那条路配完要
   **扫码确认修改**才生效，且「使用场景」必须勾「QQ群」、「不能勾「消息列表」」。
@@ -117,6 +122,9 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - `@` 过滤：发 `111` 被正确忽略，日志 `忽略非 @ 消息: '111'`
 - `/sub /v2ex/topics/hot`：成功，抓到 title 并建立 baseline（`initialized=1`）
 - **主动消息：HTTP 200 成功**，群内「机器人主动在群聊内发言」开关是开的
+- **指令面板：`POST /v2/panels` 创建成功**，`panel_id = p_Y8uv4aayeceLDxBMGeKjGB`
+  （scope=group、target_type=all、6 个元素），回读与代码完全一致。
+  改内容：`scripts/setup_panel.py --update p_Y8uv4aayeceLDxBMGeKjGB`
 
 ## 约定
 
