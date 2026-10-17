@@ -1837,6 +1837,59 @@ def _check_db_extras() -> None:
 
 _check_db_extras()
 
+print("[4.93] 文件日志（容器里唯一的可见通道）")
+
+
+async def _check_file_logging() -> None:
+    """`LOG_FILE` 那条路必须真的能用 —— 容器里它是**唯一**看得到的日志。
+
+    实测踩到过：`docker logs` 要 root，群晖上非 root 连 `/volume1/@docker`
+    都进不去，于是 bot 起没起来、为什么连不上网关，全都没法看。
+    所以日志要同时落一份到挂载卷。
+    """
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    from qq_rss_bot.__main__ import setup_logging
+    from qq_rss_bot.bot import RssBot
+
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / "sub" / "bot.log"   # 父目录不存在，要能自动建
+        cfg = dataclasses.replace(load_config(), log_file=str(log_path),
+                                  db_path=Path(td) / "b.db")
+
+        handler = setup_logging(cfg)
+        check("装了文件 handler", isinstance(handler, RotatingFileHandler))
+        check("父目录被自动创建", log_path.parent.is_dir())
+
+        # ★ 关键回归：botpy 的 configure_logging 会动 root 的 logger，
+        # 文件 handler 必须能扛过 RssBot 的构造 —— 被冲掉的话真机上
+        # 日志文件会一直是空的，而恰恰是出问题的时候才需要它。
+        bot = RssBot(cfg)
+        await bot.rss_http.aclose()
+        bot.db.close()
+        logging.getLogger("qq_rss_bot").info("MARKER-构造之后")
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        text = log_path.read_text(encoding="utf-8")
+        check("构造 RssBot 后仍写进文件", "MARKER-构造之后" in text, text[-120:])
+        check("root 上留了两个 handler（stdout + 文件）",
+              len(logging.getLogger().handlers) == 2,
+              str([type(h).__name__ for h in logging.getLogger().handlers]))
+
+        # 没配就不该建 handler
+        plain = dataclasses.replace(load_config(), log_file="", db_path=Path(td) / "c.db")
+        check("未配 LOG_FILE 时不装 handler", setup_logging(plain) is None)
+    # 收尾：把这一轮加的 handler 摘掉，免得影响后面的用例
+    root = logging.getLogger()
+    for h in [h for h in root.handlers if isinstance(h, RotatingFileHandler)]:
+        root.removeHandler(h)
+        h.close()
+
+
+asyncio.run(_check_file_logging())
+
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
 print(f"  rsshub = {cfg.rsshub_base}")

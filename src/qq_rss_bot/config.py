@@ -67,6 +67,11 @@ class Config:
     # 启动时还会给「一个订阅都没有」的已有群补上（只补零订阅的，见
     # autosub.AutoSubscriber.backfill —— 一律补会把故意退订的群重新订回来）。
     auto_subscribe_feed: str = ""
+    # 日志同时落一份到文件。**留空 = 只写 stdout**（本地开发就是这样，
+    # botctl.sh 已经重定向了）。容器里必须开 —— `docker logs` 要 root，
+    # 而群晖上普通账号连 `/volume1/@docker` 都进不去，出问题时完全看不到原因。
+    # 指向挂载卷里的路径（如 /app/data/bot.log），这样就任何人都读得到。
+    log_file: str = ""
 
 
 def load_config() -> Config:
@@ -107,4 +112,5 @@ def load_config() -> Config:
         max_fail_before_pause=_env_int("MAX_FAIL_BEFORE_PAUSE", 5),
         notify_openids=_env_list("NOTIFY_OPENIDS"),
         auto_subscribe_feed=(os.environ.get("AUTO_SUBSCRIBE_FEED") or "").strip(),
+        log_file=(os.environ.get("LOG_FILE") or "").strip(),
     )

@@ -62,6 +62,18 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   `DB_PATH=/app/data/bot.db`。传文件用 **tar-over-ssh**：
   群晖的 `rsync` 是 openrsync（协议 29），不认 `--info=stats2`，
   且它 fork 出来的 ssh 拿不到密钥，`rsync -av` 直接 `Permission denied`。
+- **容器里的日志必须同时落一份到挂载卷**（`LOG_FILE=/app/data/bot.log`，
+  由 `__main__.setup_logging` 装 `RotatingFileHandler`）。原因：`docker logs`
+  要 root，`/volume1/@docker` 是 `drwx--x--- root root`，非 root 完全看不到 ——
+  于是「容器起没起来、为什么连不上网关」这种问题在 SSH 里**无从下手**。
+  写到挂载卷后宿主上直接 `cat data/bot.log` 就行。
+  **`setup_logging` 必须跑在 `RssBot(...)` 构造之前**：botpy 的
+  `configure_logging` 会动 root 的 logger。`smoke.py` 的 `[4.93]` 钉住了这条
+  （构造完 RssBot 后文件 handler 还在、还能写进去）。
+- **不要用「主动消息能否发出」判断机器人在不在线**：实测本机实例**已停**的情况下，
+  `scripts/test_c2c.py` 发主动 C2C 照样 **HTTP 200**。脚本里 `50054 机器人不在线`
+  那条提示是当初的推测，**不成立**。要判在线只能看有没有到 `api.sgroup.qq.com`
+  的 ESTABLISHED 连接（`netstat -an | grep ESTABLISHED`），或者看日志。
 
 ## 已验证的 botpy 1.2.1 事实（不要再凭印象改）
 

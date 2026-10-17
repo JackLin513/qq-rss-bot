@@ -45,6 +45,8 @@ services:
       - RSSHUB_BASE=http://rsshub:1200
       # 绝对路径：不依赖 config.PROJECT_ROOT 的推算，换安装方式也不会写错地方
       - DB_PATH=/app/data/bot.db
+      # 日志同时写进挂载卷 —— docker logs 要 root，写这儿非 root 也能读
+      - LOG_FILE=/app/data/bot.log
       - TZ=Asia/Shanghai
       # 显式清空。dockerd.json 里配了 proxies，但实测运行中的守护进程没应用它；
       # 万一哪天生效了，上面两条内部调用会被打断。
