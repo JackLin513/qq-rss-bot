@@ -70,10 +70,19 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   **`setup_logging` 必须跑在 `RssBot(...)` 构造之前**：botpy 的
   `configure_logging` 会动 root 的 logger。`smoke.py` 的 `[4.93]` 钉住了这条
   （构造完 RssBot 后文件 handler 还在、还能写进去）。
-- **不要用「主动消息能否发出」判断机器人在不在线**：实测本机实例**已停**的情况下，
-  `scripts/test_c2c.py` 发主动 C2C 照样 **HTTP 200**。脚本里 `50054 机器人不在线`
-  那条提示是当初的推测，**不成立**。要判在线只能看有没有到 `api.sgroup.qq.com`
-  的 ESTABLISHED 连接（`netstat -an | grep ESTABLISHED`），或者看日志。
+- **判断「容器里的 bot 到底连上网关没有」，只能看日志，别信 netstat。**
+  两条都被实测证伪过：
+  - **主动消息不能当探针**：本机实例**已经停掉**的情况下，`scripts/test_c2c.py`
+    发主动 C2C 照样 **HTTP 200**。脚本里 `50054 机器人不在线` 那条提示是当初的
+    推测，**不成立**。
+  - **宿主 `netstat` 看不到容器命名空间里的套接字**：群晖上实测 bot 明明
+    `启动成功 / 已上线 / 心跳维持启动`，而宿主 `netstat -an | grep ESTABLISHED`
+    里**一条到 `:443` 的外部连接都没有**。据此推断「没连上」是**错的**，
+    白白绕了一大圈。（容器出网连接会不会出现在宿主 netstat 取决于网络模式，
+    别拿它当判据。）
+  - 唯一可靠的来源是**容器日志**。而 `docker logs` 要 root、
+    `/volume1/@docker` 非 root 进不去 —— 所以上面那条 `LOG_FILE` 是必需品，
+    不是锦上添花。要么开 `LOG_FILE`，要么让用户在 Container Manager UI 里看。
 
 ## 已验证的 botpy 1.2.1 事实（不要再凭印象改）
 
