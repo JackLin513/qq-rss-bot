@@ -91,10 +91,17 @@ class RssBot(botpy.Client):
                 # 路由写错时这里看不出问题（要等首拍抓取失败才暴露），
                 # 所以把**解析后**的 URL 明确打出来，配的时候好核对。
                 _log.info(
-                    "进群自动订阅已启用：%s；本次补了 %d 个群（原本一个订阅都没有的）",
+                    "进群自动订阅已启用：%s；本次给 %d 个群补上了",
                     self.autosub.url,
                     len(added),
                 )
+                if not added and not self.db.known_groups():
+                    # 全新部署最常见的情形：库是空的，一个群都不认识。
+                    # 不说清楚的话，「补了 0 个群」看起来像功能坏了。
+                    _log.info(
+                        "（库里还没有任何已知的群，所以没得补。"
+                        "在群里 @ 一次机器人让平台把群号报过来，之后重启就会自动订上。）"
+                    )
 
     async def close(self) -> None:
         self.poller.stop()

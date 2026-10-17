@@ -1734,21 +1734,43 @@ def _check_autosub() -> None:
         check("★ 欢迎语失败不影响订阅本身（新群多半没开主动发言）",
               db.count_subscriptions("NOPUSH") == 1)
 
-        # ---- 启动补订阅 ----
+        # ---- 启动补订阅：给所有已知的群都补 ----
         db.touch_group("EMPTY")          # 一个订阅都没有 → 该补
-        db.touch_group("HASONE")         # 已经有订阅 → 不该动
+        db.touch_group("HASONE")         # 订的是**别的**源 → 也该补
         db.add_subscription("HASONE", "https://x.com/1", "别动我", 900)
 
         added = sub.backfill()
-        check("补订阅只碰零订阅的群", set(added) == {"EMPTY"}, str(added))
+        check("★ 所有已知群都补（含已有别的订阅的）",
+              set(added) == {"EMPTY", "HASONE"}, str(added))
         check("零订阅的群被补上", db.count_subscriptions("EMPTY") == 1)
-        check("★ 已有订阅的群一律不动（不把故意退掉的重订回来）",
-              db.count_subscriptions("HASONE") == 1
-              and db.list_subscriptions("HASONE")[0].title == "别动我")
+        check("★ 已有别的订阅的群也会补上这个源",
+              db.count_subscriptions("HASONE") == 2,
+              str([x.title for x in db.list_subscriptions("HASONE")]))
+        check("★ 群里原有的订阅一条没动",
+              "别动我" in [x.title for x in db.list_subscriptions("HASONE")])
+        check("已经订过这个源的群不重复加（幂等）",
+              db.count_subscriptions("NEW") == 1 and db.count_subscriptions("NOPUSH") == 1)
         check("补订阅不发消息（启动时刷一堆太吵）", len(pusher.sent) == 1, str(len(pusher.sent)))
         check("补订阅幂等：再跑一次没人需要补", sub.backfill() == [])
+        # 保留的旧开关：True = 退回「只补一个订阅都没有的群」。
+        # 造一个零订阅的群来验 —— 否则「所有群都已订阅」时两种模式都返回空，
+        # 断言必然通过，等于没测。
+        db.touch_group("ONLYEMPTY")
+        check("★ only_if_empty=True 只补零订阅的群，有订阅的一律跳过",
+              sub.backfill(only_if_empty=True) == ["ONLYEMPTY"])
+        check("默认（False）则所有群都补，此时已无空缺", sub.backfill() == [])
         check("没配源时补订阅什么也不做",
               AutoSubscriber(cfg_stub(), db, pusher).backfill() == [])
+
+        # ★ 全新部署的空库一个群都不认识 —— 补订阅只能空转。
+        #   这正是迁移到新机器时日志写「补了 0 个群」的原因：
+        #   群必须先被事件看见一次（有人 @ 机器人），此后重启才会自动补上。
+        with tempfile.TemporaryDirectory() as td2:
+            fresh = Database(Path(td2) / "fresh.db")
+            check("★ 空库（一个已知群都没有）补订阅就是空转",
+                  AutoSubscriber(_autocfg(), fresh, _FakePusher()).backfill() == []
+                  and fresh.known_groups() == [])
+            fresh.close()
 
         # ---- 退群 ----
         # ★ 退群必须连 groups 那行一起删，否则下次启动会把退掉的群当「零订阅的新群」
