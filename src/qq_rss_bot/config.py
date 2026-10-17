@@ -72,6 +72,10 @@ class Config:
     # 而群晖上普通账号连 `/volume1/@docker` 都进不去，出问题时完全看不到原因。
     # 指向挂载卷里的路径（如 /app/data/bot.log），这样就任何人都读得到。
     log_file: str = ""
+    # 群里有人分享 bilibili 链接时，自动回一张带封面和数据的卡片。
+    # 走**被动回复**（不占主动消息配额）；关掉它不影响 RSS 推送。
+    # 四种分享形态和实现见 bilibili.py 的模块说明。
+    bilibili_preview: bool = True
 
 
 def load_config() -> Config:
@@ -113,4 +117,5 @@ def load_config() -> Config:
         notify_openids=_env_list("NOTIFY_OPENIDS"),
         auto_subscribe_feed=(os.environ.get("AUTO_SUBSCRIBE_FEED") or "").strip(),
         log_file=(os.environ.get("LOG_FILE") or "").strip(),
+        bilibili_preview=_env_bool("BILIBILI_PREVIEW", True),
     )

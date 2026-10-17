@@ -66,6 +66,7 @@ class FeedPoller:
         self.quota = quota
         self._sem = asyncio.Semaphore(5)
         self._stopped = asyncio.Event()
+        self._ticks = 0
 
     def stop(self) -> None:
         self._stopped.set()
@@ -73,6 +74,14 @@ class FeedPoller:
     async def run(self) -> None:
         _log.info("轮询启动，每 %ss 扫描一次", self.cfg.tick_sec)
         while not self._stopped.is_set():
+            # 低频心跳。**这不是冗余日志**：出问题时第一个要回答的就是
+            # 「进程还活着吗、事件循环还在转吗」，而在此之前 INFO 级别下
+            # 这个问题的答案是「不知道」—— 实测踩到过：群里发消息没反应，
+            # 日志静默 22 分钟，分不清是没收到消息还是整个进程卡死了。
+            # 每 20 拍（默认 10 分钟）一条，一天 144 行，不构成噪音。
+            self._ticks += 1
+            if self._ticks % 20 == 1:
+                _log.info("轮询心跳：第 %d 拍，进程正常", self._ticks)
             try:
                 await self.poll_once()
             except asyncio.CancelledError:

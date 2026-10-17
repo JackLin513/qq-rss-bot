@@ -229,9 +229,13 @@ class Replier(Protocol):
 
 
 class CardReplier(Protocol):
-    """带按钮的回复（markdown + keyboard）。"""
+    """markdown 卡片回复。
 
-    async def __call__(self, markdown: str, keyboard: dict) -> None: ...
+    ``keyboard`` 为 None 时**不发按钮**（bilibili 预览卡片就是这样 —— 空
+    ``{"content": {"rows": []}}`` 有被平台静默丢弃的风险，干脆整个参数不传）。
+    """
+
+    async def __call__(self, markdown: str, keyboard: dict | None = None) -> None: ...
 
 
 @dataclass

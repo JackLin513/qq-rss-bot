@@ -69,19 +69,24 @@ class Mention:
 
 
 class GroupMessageWithRole(GroupMessage):
-    """补上 botpy 丢掉的字段：``member_role`` 和完整的 ``mentions``。
+    """补上 botpy 丢掉的字段：``member_role``、``mentions``、卡片消息的两个键。
 
     实测报文里 ``author`` 带 ``member_role``（群主是 ``"owner"``），
-    ``mentions[]`` 里带 ``is_you`` —— 但 botpy 两个都丢。
+    ``mentions[]`` 里带 ``is_you``，卡片消息（群里分享的链接）带
+    ``message_type=3`` 和 ``ark_data`` —— 但 botpy 全都丢。
     ``GroupMessage`` 用了 ``__slots__``，不能事后挂新属性，
     所以用子类加槽位，并把 ``mentions`` 整个重建。
     """
 
-    __slots__ = ("member_role",)
+    __slots__ = ("member_role", "message_type", "ark_data")
 
     def __init__(self, api, event_id, data) -> None:
         super().__init__(api, event_id, data)
         self.member_role = (data.get("author") or {}).get("member_role")
+        # 卡片消息靠这两个认：message_type=3 是 ark，ark_data["fields"] 里才有
+        # 标题和 jump_url。见 bilibili.py 里四种分享形态的说明。
+        self.message_type = data.get("message_type")
+        self.ark_data = data.get("ark_data")
         # 重建 mentions，把 is_you / member_openid 救回来
         raw = data.get("mentions") or []
         self.mentions = [Mention(m) for m in raw if isinstance(m, dict)]

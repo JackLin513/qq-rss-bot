@@ -49,6 +49,61 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 
 代码在 `/volume1/docker/qq-rss-bot/`，`docker-compose.yml` 起 `rsshub` + `bot` 两个容器。
 
+- **GUI 和命令行不能交叉管同一个项目 —— 会出现「幽灵容器」。** 症状是
+  Container Manager 里多出一个点不开的条目，提示「不存在」，所有操作都
+  `failed`。成因：容器被 GUI 之外的东西重建过（比如命令行的 `up -d`），
+  GUI 记录里还存着旧 ID。
+  **判据在 Container Manager 的事件日志里**（GUI 可导出 CSV）：
+  | 日志形态 | 含义 |
+  |---|---|
+  | `Signal container qq-rss-bot-rsshub-1.` | 记录正常 |
+  | `Signal container 81e9c6491674_qq-rss-bot-bot-1 failed.` | **记录过期** —— `81e9c6491674` 是容器 ID 前 12 位，那个「奇怪字母前缀」就是它 |
+  **修法：GUI 项目 → 停止 → 启动**（项目级操作会重新扫描容器，把 ID 刷回来）。
+  实测有效，**不用删项目** —— 删项目有碰到 `data/` 的风险，别轻易走那步。
+  根治就是上面那条：同一个项目只用一个入口。
+- ⚠️ **GUI 的「构建」不可信**：事件日志里连着五次 `Build project 'qq-rss-bot'
+  successfully.`（11:06 / 13:06 / 13:52 / 16:40 / 17:28），而镜像时间戳一直停在
+  **09:56:40**、容器里 `bot.py` 的 mtime 一直是 **09:08** —— 一次都没真重建。
+  判据同上：`COPY` 保留源文件 mtime，所以 `docker exec … ls -l
+  /app/src/qq_rss_bot/bot.py` 的时间就是**构建时**源码的时间。
+  **挂了 `./src` 之后这条不再要紧**（不需要构建了），但别拿「构建成功」当依据。
+- **日常改代码走热更新，不用重建镜像。** compose 里挂了 `./src:/app/src:ro`
+  （`uv sync` 装的是**可编辑版**，`.pth` 指向 `/app/src`，容器是运行时去那儿
+  import 的），所以改完代码只要：
+  ```bash
+  sudo docker compose restart bot     # 约 2 秒
+  ```
+  **改 `docker-compose.yml` 本身**（比如加这个挂载）才需要 `up -d` 一次。
+  改 `src/` 下的代码**永远不用重建**。
+- **配套的判据：启动日志里的 `运行代码 …（最新改动 <时间>）`**
+  （`__main__.code_identity`）。它报的是包内 .py 的**最新** mtime：
+  - 那个时间 = **你刚保存的时间** → 代码生效了
+  - 那个时间 = **镜像构建时间** → 改的东西没进去
+
+  **这条日志是热更新的前提，别删。** 挂了卷之后「镜像 ≠ 正在跑的代码」，
+  而 2026-10-17 那次事故的本质就是这种不一致**完全没有提示**。
+- ⚠️ **改完代码必须 `build` + `up` 两步，只 `up` 等于什么都没做。**
+  （只在你**没挂** `./src` 时适用；挂了卷就走上面那条。）
+  ```bash
+  cd /volume1/docker/qq-rss-bot
+  sudo docker compose build bot && sudo docker compose up -d
+  ```
+  **`docker compose up -d` 不会构建**，它只会用现有镜像重建容器。Container
+  Manager 图形界面的「清除 + 重新构建」实测同样**不会重建镜像** —— 它等价于
+  `up -d`：容器被删了、用旧镜像重开一个，镜像时间戳一动不动。
+  代价是**完全静默**：没有报错、日志看起来也正常（`已上线`、`轮询启动` 都在），
+  只是新代码一行都没生效。实测为此绕了一大圈 —— 早上 09:56 构建的镜像，
+  下午连着三次「重建」都还是它，而源码早就在 13:34 就换过了。
+  **判据**（改完代码验一次，别靠感觉）：
+  ```bash
+  sudo docker images --format '{{.Repository}}:{{.Tag}}  {{.CreatedAt}}' | grep qq-rss-bot
+  sudo docker exec qq-rss-bot-bot-1 grep -c '<你新加的函数名>' /app/src/qq_rss_bot/bot.py
+  ```
+  镜像时间要是**刚才**，第二条要 **≥1**。第二条最直接 —— 它绕过日志，
+  直接回答「容器肚子里的文件到底是不是我改的那份」。
+- **「镜像已存在所以不构建」是错的**：`docker compose build` 哪怕 tag 已存在
+  也照样重跑 COPY 层（实测自证）。所以别把「没生效」归到这个机制上，
+  真正的原因是那条路径里根本没有 build 这一步。
 - **`JackLin` 跑不了 docker，这是硬阻塞**：`/var/run/docker.sock` 是 `root:root 660`，
   而 **`administrators` 组不给 docker 权限**（DSM 上容器只认 root）。CLI 在
   `/usr/local/bin/docker`，但 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
@@ -273,6 +328,24 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - **判「机器人到底有没有在跑」要 `lsof -p <pid> | grep TCP`** 看有没有
   `ESTABLISHED ... :443`。进程活着 ≠ 网关连上了，登录失败时进程也在。
 
+- **群里分享的卡片消息，`content` 不是空的** —— 平台把卡片**预渲染成了全文**，
+  连 `jump_url:` 那一行都在里面。实测形态：
+  `[卡片消息] 图文H5\n摘要: …\ntitle: …\ndesc: 来自哔哩哔哩\njump_url: https://b23.tv/xxx\ntag: …`。
+  所以解析分享链接**只扫 `content` 就够**，别一上来就去挖 `ark_data`。
+- **`ark_data` 的数据嵌在 `fields` 子字典里**，不是平铺。真实结构是
+  `{ark_name, ark_type, fields: {title, preview, source, jump_url, …}, prompt}`，
+  直接 `ark_data["title"]` 取不到。botpy 的 `GroupMessage` 还**整个丢掉**
+  `ark_data` 和 `message_type` —— 两个都要在 `compat.GroupMessageWithRole`
+  的 `__slots__` 里自己捡回来（和 `member_role` 是同一手法）。
+- **httpx 的 `raise_for_status()` 把 3xx 也算失败**（`is_success` 只认 2xx）。
+  短链的正常形态就是 302，所以「跟一次重定向读 Location」这条路上**绝对
+  不能**调它 —— 否则所有短链都静默解析失败，日志里一行错都没有。只有
+  `>= 400` 才是真错。
+- **bilibili 的 `wbi/search` 要 Chrome UA 和 `Referer` 同时带**，缺一个就是
+  「HTTP 200 + `code=0` + **空结果**」的静默失败（项目自己的 UA 无论如何
+  都是 0 条）。旧的 `search/type` 接口则被 **412 风控**拦死。四组对照见
+  「群里分享 bilibili 链接」那一节。
+
 ## 现场验证过的结论（2026-10-16）
 
 - **主动私聊（C2C）能发**：`scripts/test_c2c.py --listen` 抓到的群消息
@@ -389,6 +462,142 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   所以只记警告，绝不让它影响订阅本身。
 - **`on_ready` 断线重连会再跑一次**，所以补订阅必须幂等（它确实是）。
 
+## 群里分享 bilibili 链接自动回卡片（2026-10-17 加）
+
+群里任何人发 bilibili 链接（**不需要 @ 机器人**），回一张带封面/标题/UP 主/
+播放数据的 markdown 卡片。走**被动回复**（`msg_id` 就在手上），不占主动消息
+配额。开关是 `BILIBILI_PREVIEW`（默认开）。实现全在 `src/qq_rss_bot/bilibili.py`。
+
+**能做的前提**：新协议推的是全量群消息，非 @ 的分享本来就会到达机器人 ——
+以前被 `is_bot_mentioned` 直接丢掉。**旧协议收不到这些消息，这个功能无从谈起。**
+
+### 四种分享形态（2026-10-17 抓的 5 条真实报文实测）
+
+| 形态 | `message_type` | 视频 ID 在哪 | 处理 |
+|---|---|---|---|
+| QQ 小程序卡片 | 3 (ark) | **报文里没有** | 拿标题反查 |
+| 纯文本 + `b23.tv` | 0 | `content` 里的短链 | 302 拿 BV |
+| 图文 H5 卡片 | 3 (ark) | `content` 里的 `jump_url` | 302 拿 BV |
+| 纯文本 + BV 号 | 0 | `content` | 直接用 |
+
+`scripts/smoke.py [4.94]` 把这四条 `content` **原样**当回归样本；
+`scripts/probe_bilibili.py` 能在真发到群里之前先把渲染结果打出来看
+（**默认什么都不发**，要真发必须显式给 `--send <group_openid>`）。
+
+### 标题反查（只有小程序卡片需要）
+
+接口用 **`wbi/search`**（`search/type` 被 412 拦死），且**必须同时带
+Chrome UA 和 `Referer: https://www.bilibili.com/`**：
+
+| UA | Referer | 结果 |
+|---|---|---|
+| 项目 UA | 无 | `code=0`，**0 条** |
+| 项目 UA | 有 | `code=0`，**0 条** |
+| Chrome UA | 无 | `code=0`，**0 条** |
+| Chrome UA | 有 | `code=0`，**20 条** ✓ |
+
+**判据是「去标点归一化后恰好一条相等」**，0 条或 ≥2 条都放弃 ——
+宁可不回，也不能回错视频。实测分享标题和线上标题就差标点：分享版
+`…拿起了刀《机器纪元》`，线上是 `…拿起了刀！！！《机器纪元》`，
+归一化后相等（36 字），20 条结果里**唯一命中** `BV1JzeK66EQB`。
+归一化长度不足 8 字（「测试」「哈哈」）直接不查 —— 短标题必然误判。
+
+### 其它实测结论
+
+- `api.bilibili.com/x/web-interface/view?bvid=` **无需 cookie**，项目自己的
+  UA 就能过。返回 `title` / `pic` / `owner.name` / `duration` /
+  `stat.{view,danmaku,reply,like,…}`。
+- 封面 `pic` 返回的是 **`http://`**，改 `https://` 同样 200；加图床后缀
+  `@480w_270h_1c.jpg` 后 **214KB → 33KB**（QQ 要自己下载转存这张图）。
+- QQ 群 markdown **支持图片**，语法 `![文字 #宽px #高px](url)`，
+  **尺寸提示是必填的**（官方示例就带尺寸），平台自己下载转存，
+  所以防盗链、图床都不用管。
+- 标题**不能**放进 `[文字](url)` —— 实测 100 条热门标题里 7 条含
+  `|` / `[` / `]` / `!`。所以标题单独一行加粗，并把星号、下划线、
+  反斜杠、波浪号和反引号剥掉，
+  链接另起一行写「在 bilibili 打开」。
+- **不做去重**（用户明确选的）：同一条视频发两遍就回两遍。单条消息里含
+  多个链接时只取第一个 —— 这是「一条消息回一次」，不是跨消息去重。
+- **对群里静默，对日志不静默**：解析不出来就什么都不发，异常在
+  `bot._preview_bilibili` 里全吃掉 —— 但**日志按 INFO/WARNING 记全**。
+  见下。
+
+### ⚠️ 失败路径一律不许写 DEBUG（2026-10-17 血的教训）
+
+第一版把 `lookup` 的每条失败路径都写成 `_log.debug`，理由是「这是顺手的
+额外功能，坏了不该刷日志」。**这个理由是错的**，代价是：线上群里发了链接
+毫无反应，而日志里**也毫无痕迹** —— 当时 `LOG_LEVEL=INFO`，所有失败原因
+全被吞掉，排查只能靠猜，猜了一轮全猜错。
+
+判据很简单：**这行日志只在「有人分享 bilibili 链接」时才可能出现**，
+频率天然极低；而它一旦出现，就意味着「有人分享了但我们没回」——
+**这正是唯一需要看见的事件**。这种日志写 DEBUG 等于没写。
+
+现在的分工：
+
+| 位置 | 级别 | 为什么 |
+|---|---|---|
+| 认出分享 / 成功回卡片 | INFO | 频率极低，是正常路径的痕迹 |
+| 认出了但没解析出视频 | **WARNING** | 「有人分享了我们没回」——必须看得见 |
+| `lookup` 内部各步放弃的原因 | INFO | 上面那条 WARNING 的具体原因 |
+| 异常栈 | **WARNING**（带 `exc_info`） | 对群里静默，日志留全栈 |
+| 「忽略非 @ 消息」 | DEBUG | 保持原样，量大且无信息量 |
+
+### 轮询心跳：`INFO` 级别下必须能看出「进程还活着」
+
+`scheduler.FeedPoller.run()` 每 **20 拍**（默认 10 分钟）打一条
+`轮询心跳：第 N 拍，进程正常`（INFO）。一天 144 行，不构成噪音。
+
+**这不是冗余日志。** 踩到的原状是：群里发消息没反应，日志**静默 22 分钟**，
+而当时唯一的周期日志 `本轮待抓取` 是 DEBUG，`LOG_LEVEL=INFO` 下看不到 ——
+于是「消息没到机器人」和「整个进程卡死了」**在日志上完全一样**，而这两个
+方向的排查完全不同。加上心跳后这条线是明确的：
+
+| 有心跳 | 无心跳 |
+|---|---|
+| 进程和事件循环都正常 → 去查消息链路 | 进程死了或事件循环冻结 → 先看容器 |
+
+`poll_once()` 在没有到期订阅时**直接 return**（不记日志），所以
+`本轮待抓取` 不能当心跳用 —— 订阅间隔 15 分钟，它 15 分钟才可能出现一次。
+
+### 启动自检：一条命令定位三种故障
+
+`bot.py` 的 `_announce_bilibili()` 在 `on_ready` 里探一次 bilibili 并打日志
+（`bilibili.probe()`，最多等 6 秒）。**`on_ready` 每次断线重连都会再跑**，
+所以这条线还会顺便证明「网关掉过没有」。
+
+日志长这样：
+
+```
+bilibili 预览已启用；出站代理环境变量 {'HTTP_PROXY': '', 'HTTPS_PROXY': '', ...}
+bilibili 预览连通性自检：✅ 正常（BV15eJt6pEam 【中字熟肉】气象厅の狠活！…）
+```
+
+三种故障的判读方式**互不重叠**：
+
+| 现象 | 结论 |
+|---|---|
+| 自检 ❌ | 容器出网有问题（DNS / 代理 / CA），后面全都不用查了 |
+| 自检 ⚠️「网络通但接口非 0」 | 网络没问题，只是样例视频没了 —— **别当成连不上** |
+| 自检 ✅，发链接后**没有任何** bilibili 行 | 消息没到机器人（网关/群配置），不是这个功能的问题 |
+| 自检 ✅，有「消息里有 bilibili 字样但没认出链接」 | 消息到了，是 `find_target` 没认出这个形态 |
+| 自检 ✅，有「认出 bilibili 分享」但没有成功行 | 消息和识别都没问题，卡在 `lookup`，下一行 INFO 写了原因 |
+
+**别拿宿主机的网络结果推断容器。** 实测在群晖宿主机上：`curl -4 -k` 返回
+200、`openssl s_client` 验证通过、Python 裸 socket 直连 16 个解析 IP **全部
+通过**，但 `urllib.request.urlopen` 五次全挂在
+`self-signed certificate in certificate chain` —— 猴补 `wrap_socket` 才发现
+对端是 `192.168.0.63:6152`（那台 Surge），而 `getproxies()` 返回 `{}`、
+没有任何 `_proxy` 环境变量、没有 `/etc/docker/daemon.json`。**容器里的
+Debian Python 不会继承这套东西**，所以宿主机上的结论对容器无效。
+
+### 还没实测的（第一次真发到群里时要盯这三条）
+
+- `![封面 #208px #117px](url)` 这套尺寸语法 QQ 认不认 —— 文档说要用，
+  但没人见过实际渲染效果
+- 标题里的 `|` / `[` 会不会破坏卡片排版
+- `i1.hdslb.com` 的封面平台能不能下载转存（项目里只验证过 idolmaster 那个源的图）
+
 ## 限流、配额与出错通知（2026-10-16 加）
 
 - **推送必须全局节流，`_PUSH_GAP_SEC` 挡不住**。scheduler 用信号量并发跑
@@ -473,5 +682,9 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
 - `FeedPoller` 的推送出口是 `Pusher` 协议（`send_text` / `send_rich`），
   `RssBot` 自己实现它。测试里换成假实现就不碰 QQ，见 `scripts/smoke.py`。
 - 配图抽取在 `rss.first_image()`，必须在 `_clean_text` 剥标签**之前**做，否则 URL 就没了。
+- **bilibili 预览的提取只扫 `content`**（理由见「群里分享 bilibili 链接」那节）。
+  `bilibili.find_target` 是唯一入口，`bot._preview_bilibili` 是唯一调用点。
+  以后加新的分享形态：先往 `smoke.py [4.94]` 里加一条**真实 `content` 原文**
+  当样本，再改提取逻辑。
 - 数据库 schema 改动写在 `db.SCHEMA` 里；目前没有迁移机制，
   表结构变更需要手动处理已有 `data/bot.db`。

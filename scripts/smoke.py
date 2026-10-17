@@ -1912,6 +1912,528 @@ async def _check_file_logging() -> None:
 
 asyncio.run(_check_file_logging())
 
+print("[4.93.1] 轮询心跳（回答「进程还活着吗」）")
+
+
+async def _check_poller_heartbeat() -> None:
+    """INFO 级别下必须能看出「进程还活着、事件循环还在转」。
+
+    实测踩到过：群里发消息没反应，日志静默 22 分钟 —— 而当时唯一的
+    周期日志（`本轮待抓取`）是 DEBUG，`LOG_LEVEL=INFO` 下什么都看不到，
+    分不清「没收到消息」和「整个进程卡死了」。这两个方向的排查完全不同。
+    """
+    import logging
+
+    class _Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.INFO)
+            self.lines: list[str] = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    grab = _Grab()
+    sched_log = logging.getLogger("qq_rss_bot.scheduler")
+    sched_log.addHandler(grab)
+    prev_level = sched_log.level
+    sched_log.setLevel(logging.INFO)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "hb.db")
+            # tick 压到 0.01s，让它快速跑够 20 拍以上
+            cfg = dataclasses.replace(cfg_stub(), tick_sec=0, db_path=Path(td) / "hb.db")
+            poller = FeedPoller(cfg, db, None, _NoopPusher())
+            task = asyncio.create_task(poller.run())
+            await asyncio.sleep(0.05)
+            poller.stop()
+            await asyncio.wait_for(task, timeout=2)
+            db.close()
+
+        beats = [ln for ln in grab.lines if "轮询心跳" in ln]
+        check("★ 心跳按 INFO 打出来了（INFO 级别下看得见）", len(beats) >= 2, str(grab.lines[:6]))
+        check("心跳带上了拍数", beats and "第 1 拍" in beats[0], beats[:1])
+        check("启动/停止也都有记录",
+              any("轮询启动" in ln for ln in grab.lines) and any("轮询已停止" in ln for ln in grab.lines),
+              str(grab.lines))
+        # ★ 不能每拍都打 —— 30s 一拍的话那是一天 2880 行。
+        # 精确判据：第 1、21、41… 拍各一条，所以条数必然等于 ceil(tick/20)。
+        expect = (poller._ticks + 19) // 20
+        check("★ 心跳是低频的（20 拍才一条）", len(beats) == expect,
+              f"跑了 {poller._ticks} 拍，心跳 {len(beats)} 条，应为 {expect}")
+    finally:
+        sched_log.removeHandler(grab)
+        sched_log.setLevel(prev_level)
+
+
+class _NoopPusher:
+    async def send_text(self, group_openid, content):
+        pass
+
+    async def send_rich(self, group_openid, content, image_url):
+        pass
+
+
+asyncio.run(_check_poller_heartbeat())
+
+print("[4.93.2] 启动时报出「跑的是哪份代码」")
+
+
+def _check_code_identity() -> None:
+    """一条日志回答「我改的代码到底生效了没有」。
+
+    实测踩到过：镜像从早上 09:56 就没重建过，源码 13:34 就换过了 —— 连着三次
+    「重建」都只是用旧镜像重开容器。日志看起来完全正常（`已上线`、`轮询启动`
+    都在），新代码一行都没生效，**而且没有任何地方提示**。这条日志就是那个提示。
+    """
+    import time as _time
+
+    from qq_rss_bot.__main__ import code_identity
+
+    pkg = Path(__file__).resolve().parents[1] / "src" / "qq_rss_bot"
+    ident = code_identity()
+    check("报出了包目录", str(pkg) in ident, ident)
+    check("报出了改动时间", "最新改动" in ident, ident)
+    # ★ 关键是报**最新**的那个 .py，不是固定某个文件 ——
+    # 否则改了 bilibili.py 而 bot.py 没动，时间戳就不变，等于没提示
+    newest = max(f.stat().st_mtime for f in pkg.glob("*.py"))
+    stamp = _time.strftime("%m-%d %H:%M:%S", _time.localtime(newest))
+    check("★ 时间取的是包内最新的 mtime", stamp in ident, f"期望 {stamp}，得到 {ident}")
+
+
+_check_code_identity()
+
+print("[4.94] bilibili 链接预览（全离线）")
+
+import qq_rss_bot.bilibili as _bili  # noqa: E402
+
+
+# 2026-10-17 抓到的**真实群消息 content**，原样贴进来当回归样本。
+# 四种分享形态的差异全在这几段字符串里，改提取逻辑时这几条必须还是绿的。
+_MINIAPP = (
+    "[卡片消息] 小程序\n"
+    "摘要: [QQ小程序]\u201c男人声称机器人杀了他的狗，要求保险公司给他赔偿，"
+    "谁知保险员却拿起了刀《机器纪元》\u201d\n"
+    "source_logo: https://open.gtimg.cn/open/app_icon/00/95/17/76/100951776_100_m.png?t=1792028716\n"
+    "title: \u201c男人声称机器人杀了他的狗，要求保险公司给他赔偿，谁知保险员却拿起了刀《机器纪元》\u201d\n"
+    "preview: https://pic.ugcimg.cn/5248e67e658cc9c3c54f616ce575790b/jpg1\n"
+    "source: 哔哩哔哩"
+)
+_MINIAPP_ARK = {
+    "ark_name": "小程序",
+    "ark_type": "miniapp",
+    "prompt": "[QQ小程序]…",
+    "fields": {
+        "preview": "https://pic.ugcimg.cn/5248e67e658cc9c3c54f616ce575790b/jpg1",
+        "source": "哔哩哔哩",
+        "title": "\u201c男人声称机器人杀了他的狗，要求保险公司给他赔偿，"
+                 "谁知保险员却拿起了刀《机器纪元》\u201d",
+    },
+}
+_SHORT_TEXT = "【\u201c男人声称机器人杀了他的狗…\u201d-哔哩哔哩】 https://b23.tv/uyKBSFP"
+_H5_CARD = (
+    "[卡片消息] 图文H5\n"
+    "摘要: [分享]【中字熟肉】气象厅の狠活！10月16日误报9.9级末日大震惊…\n"
+    "title: 【中字熟肉】气象厅の狠活！10月16日误报9.9级末日大震惊…\n"
+    "desc: 来自哔哩哔哩\n"
+    "jump_url: https://b23.tv/e1Xp08V\n"
+    "tag: 哔哩哔哩HD"
+)
+_BV_TEXT = "https://www.bilibili.com/video/BV15eJt6pEam"
+_CHITCHAT = "测试123"
+# 反向样本：另一家的小程序卡片，长得和形态 1 一模一样，只有 source 不同
+_MUSIC_CARD = (
+    "[卡片消息] 小程序\n摘要: [QQ小程序]某首歌\ntitle: 某首歌\n"
+    "preview: https://pic.ugcimg.cn/abcdef/jpg1\nsource: QQ音乐"
+)
+_MUSIC_ARK = {"ark_name": "小程序", "fields": {"source": "QQ音乐", "title": "某首歌"}}
+
+# 分享版标题（无「！！！」）和线上真实标题（有，且搜索接口带 <em> 高亮标签）
+_TITLE_SHARED = "男人声称机器人杀了他的狗，要求保险公司给他赔偿，谁知保险员却拿起了刀《机器纪元》"
+_TITLE_ONLINE = (
+    "男人声称机器人杀了他的狗，要求保险公司给他赔偿，谁知保险员却拿起了刀！！！"
+    '<em class="keyword">《机器纪元》</em>'
+)
+
+print("[4.94.1] 四种分享形态的提取")
+
+
+def _check_bili_extract() -> None:
+    t = _bili.find_target(_SHORT_TEXT)
+    check("纯文本里的 b23.tv 短链被抽出", t is not None and t.short == "https://b23.tv/uyKBSFP",
+          repr(t))
+
+    # ★ 形态 3 的关键：卡片消息的 content 是平台预渲染的全文，jump_url 就在里面，
+    # 根本不用碰 ark_data。这条一红说明提取逻辑退回去挖 ark_data 了。
+    t = _bili.find_target(_H5_CARD)
+    check("★ 图文H5 卡片从 content 的 jump_url 抽出短链",
+          t is not None and t.short == "https://b23.tv/e1Xp08V", repr(t))
+
+    t = _bili.find_target(_BV_TEXT)
+    check("纯文本里的 BV 号被抽出", t is not None and t.bvid == "BV15eJt6pEam", repr(t))
+
+    t = _bili.find_target("看看这个 https://www.bilibili.com/video/BV1cku962EVm?p=2&t=30 挺好")
+    check("带 ?p=2 等参数的链接也能抽出 BV",
+          t is not None and t.bvid == "BV1cku962EVm", repr(t))
+
+    t = _bili.find_target("https://www.bilibili.com/video/av170001")
+    check("老式 av 号被抽出", t is not None and t.bvid == "av170001", repr(t))
+
+    # 形态 1：报文里没有任何视频 ID，只能拿标题反查
+    t = _bili.find_target(_MINIAPP, _MINIAPP_ARK)
+    check("小程序卡片退化成标题反查", t is not None and t.title and not t.bvid and not t.short,
+          repr(t))
+
+    check("闲聊消息不触发", _bili.find_target(_CHITCHAT) is None)
+    check("空 content 不触发", _bili.find_target("") is None)
+
+    # ★ 反向用例：别家小程序卡片长得一模一样，只有 source 不同。
+    # 不筛 source 的话，群里每分享一张卡片都会去搜一次 bilibili。
+    check("★ 非 bilibili 的小程序卡片不触发（不误搜）",
+          _bili.find_target(_MUSIC_CARD, _MUSIC_ARK) is None)
+    # 有标题但完全没有「哔哩哔哩」字样时也不能触发
+    check("★ 无 bilibili 来源标记的卡片不触发",
+          _bili.find_target("title: 某首歌\nsource: 某音乐", {"fields": {"title": "某首歌"}}) is None)
+
+    # BILI_HINT 只用来决定「认不出链接时要不要记一行日志」，判宽了会刷屏。
+    for hit in ("https://b23.tv/x", "www.bilibili.com/video/BV1", "哔哩哔哩 分享", "B23.TV/x"):
+        check(f"BILI_HINT 命中 {hit!r}", _bili.BILI_HINT.search(hit) is not None)
+    for miss in ("", "今天天气不错", "https://www.youtube.com/watch?v=x", "https://b23.tv"):
+        # 最后一个是**故意留的漏网**：没有 token 的裸域名不算分享，
+        # 但它确实含 b23.tv，所以这里只断言前三个不命中
+        if miss == "https://b23.tv":
+            continue
+        check(f"BILI_HINT 不命中 {miss!r}", _bili.BILI_HINT.search(miss) is None)
+
+
+_check_bili_extract()
+
+print("[4.94.2] 标题归一化与数字格式")
+
+
+def _check_bili_format() -> None:
+    a, b = _bili.norm_title(_TITLE_SHARED), _bili.norm_title(_TITLE_ONLINE)
+    check("★ 分享版与线上版标题归一化后相等", a == b and len(a) > 20, f"{a!r} vs {b!r}")
+    check("归一化剥掉了 HTML 高亮标签", "<em" not in b and "keyword" not in b, repr(b))
+    check("归一化留下了标点以外的字", "机器纪元" in a, repr(a))
+    check("归一化丢掉了标点", "，" not in a and "《" not in a, repr(a))
+
+    check("播放数：9999 不加单位", _bili.fmt_count(9999) == "9999")
+    check("播放数：10000 → 1.0万", _bili.fmt_count(10000) == "1.0万")
+    check("播放数：30510 → 3.1万", _bili.fmt_count(30510) == "3.1万")
+    # ★ 四舍五入溢出：直接按 1e8 分档的话这里会输出「10000.0万」
+    check("★ 播放数：99999999 → 1.0亿（不出现 10000.0万）",
+          _bili.fmt_count(99999999) == "1.0亿", _bili.fmt_count(99999999))
+    check("播放数：123456789 → 1.2亿", _bili.fmt_count(123456789) == "1.2亿")
+
+    check("时长：59 → 00:59", _bili.fmt_duration(59) == "00:59")
+    check("时长：60 → 01:00", _bili.fmt_duration(60) == "01:00")
+    check("时长：187 → 03:07", _bili.fmt_duration(187) == "03:07")
+    check("时长：3723 → 1:02:03", _bili.fmt_duration(3723) == "1:02:03")
+
+
+_check_bili_format()
+
+print("[4.94.3] 卡片渲染")
+
+
+def _check_bili_render() -> None:
+    # pic 是 http://，要改成 https 并加上图床缩放后缀
+    md = _bili.render({
+        "bvid": "BV15eJt6pEam", "title": "标题", "pic": "http://i1.hdslb.com/bfs/archive/x.jpg",
+        "owner": {"name": "UP主"}, "duration": 187,
+        "stat": {"view": 30510, "danmaku": 62, "reply": 332, "like": 1041},
+    })
+    check("封面改成 https", "https://i1.hdslb.com" in md and "http://i1" not in md, md)
+    check("封面带上缩放后缀", "@480w_270h_1c.jpg" in md, md)
+    # ★ QQ markdown 的图片语法尺寸是必填的（官方示例带尺寸）
+    check("★ 图片语法带 #宽px #高px", "![封面 #208px #117px](" in md, md)
+    check("标题加粗", "**标题**" in md, md)
+    check("UP 主和时长同一行", "UP主 · 03:07" in md, md)
+    check("四项数据都在", all(k in md for k in ("播放 3.1万", "弹幕 62", "评论 332", "点赞 1041")), md)
+    check("带可点的视频链接", "[在 bilibili 打开](https://www.bilibili.com/video/BV15eJt6pEam)" in md, md)
+
+    # ★ 四项数据必须**固定分两行**，不能挤成一行 —— 挤一行的话手机窄屏上由
+    # QQ 自己折行，折点不受控（实测「播放…弹幕…评论…点赞」会在中间断开）。
+    _STAT_LABELS = ("播放", "弹幕", "评论", "点赞")
+    stat_lines = [ln for ln in md.split("\n") if ln.startswith(_STAT_LABELS)]
+    check("★ 四项数据固定分成两行（2 + 2）",
+          stat_lines == ["播放 3.1万 · 弹幕 62", "评论 332 · 点赞 1041"], repr(stat_lines))
+    check("★ 每行最多两项", all(ln.count("·") <= 1 for ln in stat_lines), repr(stat_lines))
+
+    three = _bili.render({"title": "t", "stat": {"view": 1, "danmaku": 2, "reply": 3}})
+    check("三项数据 → 两行（2 + 1）",
+          [ln for ln in three.split("\n") if ln.startswith(_STAT_LABELS)] == ["播放 1 · 弹幕 2", "评论 3"],
+          repr(three))
+    one = _bili.render({"title": "t", "stat": {"view": 1}})
+    check("一项数据 → 一行",
+          [ln for ln in one.split("\n") if ln.startswith(_STAT_LABELS)] == ["播放 1"], repr(one))
+
+    # ★ 实测 100 条热门标题里 7 条含 | [ ] ! —— 这些不能破坏结构
+    weird = _bili.render({
+        "bvid": "BV1xx411c7mD", "title": "《绝区零》菲欧妮 | 不要*死*挑战 [上]", "pic": "",
+        "owner": {"name": "UP"}, "duration": 60, "stat": {"view": 5},
+    })
+    check("★ 标题里的 * 被剥掉（不然 ** 会被吃掉）", "**《绝区零》菲欧妮 | 不要死挑战 [上]**" in weird,
+          weird)
+    check("没有封面时不输出图片行", "![" not in weird, weird)
+
+    empty = _bili.render({"bvid": "BV1xx411c7mD"})
+    check("字段全缺也不炸，仍有标题占位", "**（无标题）**" in empty, empty)
+    check("时长缺省为 00:00", "00:00" in empty, empty)
+
+
+_check_bili_render()
+
+print("[4.94.4] 解析与反查判据（假 http）")
+
+
+class _FakeResp:
+    def __init__(self, payload=None, headers=None, status=200):
+        self._payload = payload
+        self.headers = headers or {}
+        self.status_code = status
+
+    def raise_for_status(self):
+        # 和 httpx 一致：**3xx 也算失败**。_expand 曾经在上面踩过 ——
+        # 302 是短链的正常形态，调了 raise_for_status 就变成永远解析失败。
+        if not 200 <= self.status_code < 300:
+            raise httpx.HTTPStatusError(
+                f"status {self.status_code}", request=None, response=None
+            )
+
+    def json(self):
+        return self._payload
+
+
+class _FakeHttp:
+    """按 URL 关键字路由的假 httpx.AsyncClient，顺便记录每次调用的参数。"""
+
+    def __init__(self, search=None, view=None, location="", status=302):
+        self.calls: list[tuple[str, dict]] = []
+        self._search, self._view = search, view
+        self._location, self._status = location, status
+
+    async def get(self, url, **kw):
+        self.calls.append((url, kw))
+        if "b23.tv" in url:
+            return _FakeResp(headers={"location": self._location}, status=self._status)
+        if "/wbi/search" in url:
+            return _FakeResp(payload=self._search)
+        if url.endswith("/view"):
+            return _FakeResp(payload=self._view)
+        raise AssertionError("没预期的 URL: %s" % url)
+
+
+def _search_payload(*titles):
+    return {"code": 0, "data": {"result": [
+        {"bvid": "BV1" + str(i) * 9, "title": t} for i, t in enumerate(titles)
+    ]}}
+
+
+_VIEW_OK = {"code": 0, "data": {
+    "bvid": "BV15eJt6pEam", "title": "T", "pic": "", "owner": {"name": "UP"},
+    "duration": 60, "stat": {"view": 1},
+}}
+
+
+async def _check_bili_lookup() -> None:
+    # 短链 → 302 → BV → view
+    http = _FakeHttp(view=_VIEW_OK,
+                     location="https://www.bilibili.com/video/BV15eJt6pEam?buvid=x&p=1")
+    data = await _bili.lookup(http, _bili.find_target(_SHORT_TEXT))
+    check("短链展开后取到视频信息", data is not None and data["bvid"] == "BV15eJt6pEam", repr(data))
+    # ★ 共享客户端默认 follow_redirects=True，跟下去会把整个视频页 HTML 拉下来
+    short_calls = [kw for url, kw in http.calls if "b23.tv" in url]
+    check("★ 展开短链时按请求关掉了 follow_redirects",
+          short_calls and short_calls[0].get("follow_redirects") is False, repr(short_calls))
+
+    # ★ 反查判据：恰好一条才认
+    http = _FakeHttp(search=_search_payload(_TITLE_ONLINE), view=_VIEW_OK)
+    data = await _bili.lookup(http, _bili.Target(title=_TITLE_SHARED))
+    check("★ 标题反查恰好一条命中 → 采纳", data is not None, repr(data))
+
+    # 0 条（风控/空结果/真没有，一律放弃）
+    http = _FakeHttp(search=_search_payload("完全不相干的标题"), view=_VIEW_OK)
+    data = await _bili.lookup(http, _bili.Target(title=_TITLE_SHARED))
+    check("★ 标题反查 0 条命中 → 放弃", data is None, repr(data))
+    check("0 条命中时不该再去查 view",
+          not any(u.endswith("/view") for u, _ in http.calls), repr(http.calls))
+
+    # ≥2 条（同名视频）→ 宁可不回，也不能回错
+    http = _FakeHttp(search=_search_payload(_TITLE_ONLINE, _TITLE_ONLINE), view=_VIEW_OK)
+    data = await _bili.lookup(http, _bili.Target(title=_TITLE_SHARED))
+    check("★ 标题反查 2 条命中 → 放弃（宁可不回也不回错）", data is None, repr(data))
+
+    # 标题太短直接不查
+    http = _FakeHttp(search=_search_payload("测试"), view=_VIEW_OK)
+    data = await _bili.lookup(http, _bili.Target(title="测试"))
+    check("标题太短时不发反查请求", data is None and not http.calls, repr(http.calls))
+
+    # 反向：view 返回业务错误码（HTTP 200 + code != 0）
+    http = _FakeHttp(view={"code": -404, "message": "啥都木有"})
+    data = await _bili.lookup(http, _bili.Target(bvid="BV15eJt6pEam"))
+    check("view 业务错误码 → 放弃（不是当成成功）", data is None, repr(data))
+
+
+asyncio.run(_check_bili_lookup())
+
+print("[4.94.5] 非 @ 消息的预览出口（不该发的绝不发）")
+
+from qq_rss_bot.bot import RssBot as _RssBot  # noqa: E402
+
+
+class _FakeApi:
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def post_group_message(self, **kw):
+        self.sent.append(kw)
+        return {"code": 0}
+
+
+class _FakeMsg:
+    def __init__(self, content, ark_data=None, group="G", mid="M1"):
+        self.content, self.ark_data = content, ark_data
+        self.group_openid, self.id = group, mid
+
+
+class _BotStub:
+    """只借用 RssBot 的两个方法，不真造一个 botpy Client（那要事件循环和网络）。"""
+
+    _preview_bilibili = _RssBot._preview_bilibili
+    _make_repliers = _RssBot._make_repliers
+
+    def __init__(self, cfg, http, api):
+        self.cfg, self.rss_http, self.api = cfg, http, api
+
+
+async def _check_bili_preview() -> None:
+    cfg = load_config()
+
+    # 闲聊 → 什么都不发
+    api = _FakeApi()
+    bot = _BotStub(cfg, _FakeHttp(), api)
+    check("闲聊消息返回「没回」", await bot._preview_bilibili(_FakeMsg(_CHITCHAT)) is False)
+    check("★ 闲聊消息一条都没发", api.sent == [], repr(api.sent))
+
+    # 别家卡片 → 什么都不发
+    api = _FakeApi()
+    bot = _BotStub(cfg, _FakeHttp(), api)
+    await bot._preview_bilibili(_FakeMsg(_MUSIC_CARD, _MUSIC_ARK))
+    check("★ 非 bilibili 卡片一条都没发", api.sent == [], repr(api.sent))
+
+    # 开关关掉 → 什么都不发
+    api = _FakeApi()
+    bot = _BotStub(dataclasses.replace(cfg, bilibili_preview=False),
+                   _FakeHttp(view=_VIEW_OK), api)
+    check("开关关掉时返回「没回」",
+          await bot._preview_bilibili(_FakeMsg(_BV_TEXT)) is False)
+    check("★ BILIBILI_PREVIEW=false 时一条都没发", api.sent == [], repr(api.sent))
+
+    # 正常路径 → 发一条 markdown 卡片
+    api = _FakeApi()
+    bot = _BotStub(cfg, _FakeHttp(view=_VIEW_OK), api)
+    check("正常路径返回「回了」", await bot._preview_bilibili(_FakeMsg(_BV_TEXT)) is True)
+    check("恰好发了一条", len(api.sent) == 1, repr(api.sent))
+    sent = api.sent[0]
+    check("msg_type=2（markdown）", sent.get("msg_type") == 2, repr(sent))
+    check("带 msg_id（被动回复，不占主动配额）", sent.get("msg_id") == "M1", repr(sent))
+    check("msg_seq=1", sent.get("msg_seq") == 1, repr(sent))
+    check("markdown 是外层 content 包裹", "content" in (sent.get("markdown") or {}), repr(sent))
+    # ★ 没有按钮的卡片必须整个不传 keyboard，不能塞空的 rows
+    check("★ 不传 keyboard（不是传空 rows）", "keyboard" not in sent, repr(sent.keys()))
+
+    # 解析不出来 → 一条都不发
+    api = _FakeApi()
+    bot = _BotStub(cfg, _FakeHttp(view={"code": -404, "message": "x"}), api)
+    check("解析失败返回「没回」", await bot._preview_bilibili(_FakeMsg(_BV_TEXT)) is False)
+    check("★ 解析失败时一条都没发", api.sent == [], repr(api.sent))
+
+    # ★ 异常要被吃掉：发消息抛异常也不能冒到 botpy 的 _run_event
+    class _BoomApi:
+        async def post_group_message(self, **kw):
+            raise RuntimeError("boom")
+
+    bot = _BotStub(cfg, _FakeHttp(view=_VIEW_OK), _BoomApi())
+    check("★ 发送异常被吞掉并返回「没回」",
+          await bot._preview_bilibili(_FakeMsg(_BV_TEXT)) is False)
+
+
+asyncio.run(_check_bili_preview())
+
+print("[4.94.6] compat 补的两个槽位")
+
+
+def _check_bili_slots() -> None:
+    from qq_rss_bot.compat import GroupMessageWithRole
+
+    msg = GroupMessageWithRole(
+        None, "E1",
+        {"id": "M1", "content": _H5_CARD, "group_openid": "G",
+         "message_type": 3, "ark_data": {"ark_type": "tuwen", "fields": {"jump_url": "x"}},
+         "author": {"member_role": "owner"}},
+    )
+    check("message_type 取得到", msg.message_type == 3, repr(msg.message_type))
+    check("ark_data 取得到", isinstance(msg.ark_data, dict) and msg.ark_data.get("ark_type") == "tuwen",
+          repr(msg.ark_data))
+    check("member_role 没被挤掉", msg.member_role == "owner", repr(msg.member_role))
+
+    plain = GroupMessageWithRole(None, "E2", {"id": "M2", "content": "hi", "group_openid": "G"})
+    check("纯文本消息的 message_type 是 None", plain.message_type is None, repr(plain.message_type))
+    check("纯文本消息的 ark_data 是 None", plain.ark_data is None, repr(plain.ark_data))
+
+
+_check_bili_slots()
+
+print("[4.94.7] 启动自检的探测（必须永远不抛）")
+
+
+class _BoomHttp:
+    """连不上时的假客户端：get 直接抛。"""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def get(self, url, **kw):
+        raise self._exc
+
+
+async def _check_bili_probe() -> None:
+    # 通 —— 拿得到 code=0
+    msg = await _bili.probe(_FakeHttp(view=_VIEW_OK))
+    check("探测：正常时给 ✅", msg.startswith("✅"), msg)
+    check("探测：正常时带上样例 BV", "BV15eJt6pEam" in msg, msg)
+
+    # ★ 视频被删：**网络是通的**，不能报成「连不上」—— 这两种情况的排查方向
+    # 完全相反，混在一起会把人带沟里
+    msg = await _bili.probe(_FakeHttp(view={"code": -404, "message": "啥都木有"}))
+    check("探测：接口非 0 时报「网络通」而不是连不上", msg.startswith("⚠️") and "网络通" in msg, msg)
+    check("探测：接口非 0 时带上业务码", "-404" in msg, msg)
+
+    # ★★ 这个功能的意义就在这条：**探测本身绝不能抛**。
+    # 它在 on_ready 里跑，抛出去会把启动流程带崩 —— 那还不如没有。
+    for exc in (
+        httpx.ConnectError("dns 挂了"),
+        httpx.ConnectTimeout("超时"),
+        httpx.ProxyError("代理不通"),
+        httpx.TransportError("SSL: self-signed certificate in certificate chain"),
+    ):
+        msg = await _bili.probe(_BoomHttp(exc))
+        check(f"探测：{type(exc).__name__} 不抛且报 ❌", msg.startswith("❌"), msg)
+    check("探测：异常信息原样带出来（排查全靠它）",
+          "self-signed" in await _bili.probe(_BoomHttp(httpx.TransportError("self-signed"))))
+
+    # 响应体不是 JSON 也不能抛（比如被劫持成一个 HTML 登录页）
+    class _NotJson(_FakeHttp):
+        async def get(self, url, **kw):
+            return _FakeResp(payload=None)
+
+    msg = await _bili.probe(_NotJson(view=None))
+    check("探测：响应体不是 JSON 时也不抛", msg.startswith("⚠️"), msg)
+
+
+asyncio.run(_check_bili_probe())
+
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
 print(f"  rsshub = {cfg.rsshub_base}")

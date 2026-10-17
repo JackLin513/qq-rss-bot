@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -40,6 +41,28 @@ def setup_logging(cfg: Config) -> RotatingFileHandler | None:
     return handler
 
 
+def code_identity() -> str:
+    """报出「正在跑的是哪份代码」：包目录 + 最新一次改动的时间。
+
+    **这不是装饰。** 出过一次很难查的事故：镜像从早上 09:56 就没再重建过，
+    而源码 13:34 就换过了 —— 连着三次「重建」实际都只是用旧镜像重开容器，
+    日志看起来完全正常（`已上线`、`轮询启动` 一个不少），新代码一行都没生效，
+    而且**没有任何地方提示**。这条日志就是那个提示。
+
+    报的是包内 .py 的**最新** mtime（不是某个固定文件），所以改哪个模块都会
+    变 —— 一眼就能看出「我刚改的那行到底进去了没有」：
+
+      * 挂了 `./src` 卷（热更新）→ 这里就是你刚保存的时间
+      * 跑的是烤进镜像的代码 → 这里是镜像构建时的时间
+
+    两者对不上，就说明代码没生效，不用再去猜日志了。
+    """
+    pkg = Path(__file__).resolve().parent
+    newest = max((f.stat().st_mtime for f in pkg.glob("*.py")), default=0.0)
+    stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(newest)) if newest else "?"
+    return f"{pkg}（最新改动 {stamp}）"
+
+
 def main() -> None:
     cfg = load_config()
     setup_logging(cfg)
@@ -55,6 +78,7 @@ def main() -> None:
         cfg.rsshub_base,
         cfg.db_path,
     )
+    logging.getLogger("qq_rss_bot").info("运行代码 %s", code_identity())
     RssBot(cfg).run(appid=cfg.appid, secret=cfg.secret)
 
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 from typing import Any
 
 import botpy
 import httpx
 from botpy.message import GroupMessage
 
+from . import bilibili
 from .autosub import AutoSubscriber
 from .commands import (
     ADMIN_ROLES,
@@ -74,6 +76,7 @@ class RssBot(botpy.Client):
 
     async def on_ready(self) -> None:
         _log.info("机器人「%s」已上线", self.robot.name)
+        await self._announce_bilibili()
         # 轮询器和 botpy 共用一个事件循环，在 on_ready 里挂上去最省事
         if self._poller_task is None:
             self._poller_task = self.loop.create_task(
@@ -102,6 +105,29 @@ class RssBot(botpy.Client):
                         "（库里还没有任何已知的群，所以没得补。"
                         "在群里 @ 一次机器人让平台把群号报过来，之后重启就会自动订上。）"
                     )
+
+    async def _announce_bilibili(self) -> None:
+        """启动时把「bilibili 预览到底能不能用」写进日志。
+
+        加这个是因为线上真的踩到了：群里发了链接**毫无反应**，而日志里
+        也**毫无痕迹** —— 失败路径当时全是 DEBUG，INFO 下什么都看不到，
+        排查只能靠猜。启动先探一次，把结论钉在日志里。
+
+        顺带把出站代理环境变量打出来。容器的网络和宿主机不是一回事，
+        实测宿主机上那个 Python 的 urllib 会莫名走 Surge，而容器不会 ——
+        所以别拿宿主机的结果推断容器，看这里的实测输出。
+        """
+        if not self.cfg.bilibili_preview:
+            _log.info("bilibili 预览已关闭（BILIBILI_PREVIEW=false）")
+            return
+        proxied = sorted(k for k in os.environ if k.lower().endswith("_proxy"))
+        _log.info(
+            "bilibili 预览已启用；出站代理环境变量 %s",
+            {k: os.environ[k] for k in proxied} or "（无）",
+        )
+        # 探测最多 6 秒，放在 on_ready 里等它 —— 启动慢几秒没关系，
+        # 换来的是一条能直接判读的结论。
+        _log.info("bilibili 预览连通性自检：%s", await bilibili.probe(self.rss_http))
 
     async def close(self) -> None:
         self.poller.stop()
@@ -151,10 +177,16 @@ class RssBot(botpy.Client):
 
         所以必须自己筛 @，否则群里任何人说话都会触发机器人。
         见 compat.py 了解为什么需要单独解析这个事件。
+
+        非 @ 的消息里**分享的 bilibili 链接要回一张卡片** —— 见
+        `_preview_bilibili`。这是全量推送白送的能力（旧协议收不到这些消息）。
         """
         bot_name = getattr(self.robot, "name", None)
         if not is_bot_mentioned(message.content, message.mentions, bot_name):
-            _log.debug("忽略非 @ 消息: %r", message.content)
+            # 只有真的没做任何事才记「忽略」——这行日志是当初发现
+            # 「平台在推全量群消息」的线索，语义别改。
+            if not await self._preview_bilibili(message):
+                _log.debug("忽略非 @ 消息: %r", message.content)
             return
         await self._handle_group_message(message)
 
@@ -196,6 +228,57 @@ class RssBot(botpy.Client):
 
     # ---------- 内部工具 ----------
 
+    async def _preview_bilibili(self, message: GroupMessage) -> bool:
+        """非 @ 的群消息里如果有 bilibili 链接，回一张带封面和数据的卡片。
+
+        返回是否**真的回了**（调用方据此决定要不要记「忽略非 @ 消息」）。
+
+        **全程静默**：解析不出来就什么都不发。群里没人希望机器人因为认不出
+        链接而回一句报错。异常也全在这里吃掉 —— 冒到 botpy 的 `_run_event`
+        会打成 on_error，而这条路上的失败根本不值得报警。
+
+        走**被动回复**：`msg_id` 就在手上，不占主动消息配额（配额要留给推送），
+        也不需要群里开「机器人主动在群聊内发言」。
+        """
+        if not self.cfg.bilibili_preview:
+            return False
+        try:
+            target = bilibili.find_target(
+                message.content or "", getattr(message, "ark_data", None)
+            )
+            if target is None:
+                # 看着像 bilibili 分享、却没认出链接 —— 这条必须留痕，
+                # 否则和「消息压根没到机器人」长得一模一样，没法区分。
+                # 只在带 bilibili 字样的消息上触发，不会刷日志。
+                if bilibili.BILI_HINT.search(message.content or ""):
+                    _log.info(
+                        "群 %s：消息里有 bilibili 字样但没认出链接：%r",
+                        message.group_openid,
+                        (message.content or "")[:120],
+                    )
+                return False
+            _log.info("群 %s：认出 bilibili 分享 %r", message.group_openid, target)
+            data = await bilibili.lookup(self.rss_http, target)
+            if data is None:
+                # **这条必须看得见。** 具体原因由 bilibili.lookup 内部按 INFO 记，
+                # 以前这些全是 DEBUG —— 结果线上「发了没反应」在日志里毫无痕迹。
+                _log.warning(
+                    "群 %s：认出了 bilibili 分享但没解析出视频，不会回消息",
+                    message.group_openid,
+                )
+                return False
+            # 非 @ 的消息不会有别人回，所以这条必定消耗 msg_seq=1，没有撞号风险
+            _reply, reply_card = self._make_repliers(message)
+            await reply_card(bilibili.render(data))
+        except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
+            # 对**群里**静默，但日志要留痕：没有这个栈，线上出问题只能靠猜
+            _log.warning("bilibili 预览失败", exc_info=True)
+            return False
+        _log.info(
+            "群 %s 分享了 bilibili %s，已回卡片", message.group_openid, data.get("bvid")
+        )
+        return True
+
     def _make_repliers(self, message: GroupMessage):
         """被动回复的两个出口：纯文本 / 带按钮的 markdown。
 
@@ -221,7 +304,10 @@ class RssBot(botpy.Client):
                 content=text,
             )
 
-        async def reply_card(markdown: str, keyboard: dict) -> None:
+        async def reply_card(markdown: str, keyboard: dict | None = None) -> None:
+            # keyboard 为 None 时**整个参数都不传**：塞一个空的
+            # {"content": {"rows": []}} 有被平台静默丢弃的风险，而 bilibili
+            # 预览卡片本来就没有按钮。
             resp = await self.api.post_group_message(
                 group_openid=message.group_openid,
                 msg_type=2,
@@ -229,7 +315,7 @@ class RssBot(botpy.Client):
                 msg_seq=next(seq),
                 markdown={"content": markdown},
                 # 必须是外层结构 {"content": {...}}，见 menu.keyboard() 的说明
-                keyboard=keyboard,
+                **({"keyboard": keyboard} if keyboard is not None else {}),
             )
             # botpy 只在 **HTTP** 非 2xx 时抛异常，业务错误码是 200 带 code 回来的。
             # 不判这一下，304036 / 40034127「无 Markdown 模板权限」会被当成发送成功，

@@ -56,3 +56,13 @@ services:
     volumes:
       # SQLite 和 RSSHub 路由缓存都落在这里，必须持久化
       - ./data:/app/data
+      # **热更新**：`uv sync` 装的是可编辑版（.pth 指向 /app/src），容器是
+      # **运行时**去这个目录 import 的 —— 把宿主的 src 挂进去，改完代码只要
+      # `docker compose restart bot`（约 2 秒），不用重建镜像。
+      # `:ro` = 容器不许写；Python 因此写不了 __pycache__，从源码跑，无所谓。
+      #
+      # 代价：**镜像不再等于「正在跑什么」**。所以启动日志里多了一条
+      # `运行代码 /app/src/qq_rss_bot（最新改动 <时间>）`（见 __main__.code_identity）：
+      # 那个时间是**你刚保存的时间**才说明生效了；是镜像构建时间就说明没生效。
+      # —— 那条日志是挂载的前提，别删。
+      - ./src:/app/src:ro
