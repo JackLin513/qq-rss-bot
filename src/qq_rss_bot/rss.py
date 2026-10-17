@@ -34,8 +34,32 @@ _IMG_URL_RE = re.compile(
 )
 
 
-def first_image(*html_parts: str | None) -> str | None:
-    """从若干段 HTML 里取第一张图，取不到返回 None。"""
+# 一条资讯最多带几张图。**不是随便定的**：这条走的是主动消息，每张图
+# **各占一条配额**（20 条/分钟、每天还有上限），4 张图就是 4 条配额。
+# 上限压在这个数，是为了让「一条资讯」不至于吃掉一天的额度。
+MAX_IMAGES = 4
+
+
+def all_images(*html_parts: str | None, limit: int = MAX_IMAGES) -> tuple[str, ...]:
+    """从若干段 HTML 里按出现顺序取图，去重、限量。取不到就是空元组。
+
+    顺序沿用 `first_image` 时代的老规矩：**段内先 `<img src>`、再扫裸 URL**，
+    段落之间按传入顺序 —— 换成「先把所有 `<img>` 收完」会打乱正文里的图序。
+
+    多图之后**去重变成必需品**（单图时代第一张就返回了，重复无所谓）：
+    不少源会把同一张图既放进 `<img>` 又留一个裸链接，不去重就会发两遍。
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def take(url: str) -> bool:
+        """收下一张；返回 True 表示已经够数了，可以停。"""
+        if not url or url in seen:
+            return False
+        seen.add(url)
+        out.append(url)
+        return len(out) >= limit
+
     for html in html_parts:
         if not html:
             continue
@@ -43,12 +67,14 @@ def first_image(*html_parts: str | None) -> str | None:
             url = match.group(1).strip()
             if url.startswith("//"):
                 url = "https:" + url
-            if url.startswith(("http://", "https://")):
-                return url
-        found = _IMG_URL_RE.search(html)
-        if found:
-            return found.group(0)
-    return None
+            if not url.startswith(("http://", "https://")):
+                continue
+            if take(url):
+                return tuple(out)
+        for found in _IMG_URL_RE.finditer(html):
+            if take(found.group(0)):
+                return tuple(out)
+    return tuple(out)
 
 
 def resolve_url(raw: str, base: str) -> str:
@@ -82,7 +108,26 @@ class Entry:
     link: str
     published: datetime | None
     summary: str
-    image: str | None = None
+    images: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """防呆：`images` 传成**字符串**时要在这里拦住。
+
+        它不会报错，只会静默变成「一串单字符的图片 URL」—— 症状是群里冒出
+        `（图 2/19）`…`（图 19/19）` 十九条消息，每个字符一条。写测试时用
+        位置参数传了个字符串就踩到了，所以加这道闸。
+        """
+        if isinstance(self.images, str):
+            self.images = (self.images,) if self.images else ()
+
+    @property
+    def image(self) -> str | None:
+        """第一张图。
+
+        **保留是为了不炸旧调用点**（scheduler / commands / smoke 都在用）。
+        新的多图代码请直接用 `images` —— 它才是真相。
+        """
+        return self.images[0] if self.images else None
 
     @classmethod
     def from_raw(cls, raw: dict) -> "Entry":
@@ -114,8 +159,11 @@ class Entry:
             title=title,
             link=link,
             published=published,
-            summary=_clean_text(raw.get("summary")),
-            image=first_image(raw.get("summary"), *contents),
+            # **别在这里切太狠。** 很多源的 `<description>` 是完整导语（几百字），
+            # 以前默认 200 一刀下去，后面怎么调 `SUMMARY_CHARS` 都没用 ——
+            # 内容在进对象的这一步就没了。真正的长度上限在 `format_entry`。
+            summary=_clean_text(raw.get("summary"), 4000),
+            images=all_images(raw.get("summary"), *contents),
         )
 
 

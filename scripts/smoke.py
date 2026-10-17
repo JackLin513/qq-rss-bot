@@ -73,6 +73,8 @@ async def _check_push_routing() -> None:
 
     用合成条目，不联网，所以结果是确定的。
     """
+    import dataclasses  # noqa: PLC0415 —— 这个文件按节就近 import
+
     from qq_rss_bot.rss import Entry as E
     from qq_rss_bot.scheduler import FeedPoller
 
@@ -96,8 +98,8 @@ async def _check_push_routing() -> None:
         db.mark_polled(sid, title="源名", mark_initialized=True)
         sub = db.list_subscriptions("G")[0]
 
-        with_img = E("k1", "标题1", "https://a.com/1", None, "", "https://a.com/1.jpg")
-        no_img = E("k2", "标题2", "https://a.com/2", None, "", None)
+        with_img = E("k1", "标题1", "https://a.com/1", None, "", ("https://a.com/1.jpg",))
+        no_img = E("k2", "标题2", "https://a.com/2", None, "", ())
 
         fake = Fake()
         await FeedPoller(cfg_stub(), db, None, fake)._push_entries(
@@ -114,7 +116,99 @@ async def _check_push_routing() -> None:
         boom = Fake(explode=True)
         await FeedPoller(cfg_stub(), db, None, boom)._push_entries(sub, "源名", [with_img])
         check("配图失败退回纯文字", len(boom.text) == 1 and not boom.rich)
+
+        # --- ★ 多图：一条资讯 3 张图 → 连发 3 条 ---
+        multi = E("k3", "标题3", "https://a.com/3", None, "",
+                  ("https://a.com/3a.jpg", "https://a.com/3b.jpg", "https://a.com/3c.jpg"))
+        many = Fake()
+        await FeedPoller(cfg_stub(), db, None, many)._push_entries(sub, "源名", [multi])
+        check("★ RSS 多图连发 3 条", len(many.rich) == 3, str(many.rich))
+        check("第一条带正文", "标题3" in many.rich[0][0], str(many.rich[0]))
+        check("★ 后续条是占位文案", many.rich[1][0] == "（图 2/3）", str(many.rich[1]))
+        check("★ 图片顺序不乱",
+              [r[1] for r in many.rich] == ["https://a.com/3a.jpg",
+                                            "https://a.com/3b.jpg",
+                                            "https://a.com/3c.jpg"], str(many.rich))
+        check("★ 多图成功时一条纯文字都不发", many.text == [], str(many.text))
+
+        # 开关关掉 → 回到只发第一张
+        single = Fake()
+        await FeedPoller(dataclasses.replace(cfg_stub(), rss_multi_image=False),
+                         db, None, single)._push_entries(sub, "源名", [multi])
+        check("★ RSS_MULTI_IMAGE=false 时只发 1 条", len(single.rich) == 1, str(single.rich))
+        check("关掉时发的是第一张",
+              single.rich and single.rich[0][1] == "https://a.com/3a.jpg", str(single.rich))
         db.close()
+
+
+async def _check_send_entry_images() -> None:
+    """`send_entry_images` 的失败语义 —— 中间某张挂了不能拖垮整条。
+
+    这条最容易被写反：把**后续**那张的异常也抛出去，调用方就会以为整条没发成，
+    退回纯文字再发一遍 —— 正文已经发过了，用户看到的是**重复刷屏**。
+
+    失败注入按 **URL** 而不是「第几次」：后者会被重试绕过，测不出真实语义。
+    """
+    import qq_rss_bot.scheduler as sched
+    from qq_rss_bot.scheduler import send_entry_images
+
+    saved_gap = sched.IMAGE_RETRY_GAP
+    sched.IMAGE_RETRY_GAP = 0.0  # 测试不该为了等 sleep 花掉好几秒
+    try:
+        class P:
+            def __init__(self, bad: "set[str] | None" = None) -> None:
+                self.rich: list[tuple[str, str]] = []
+                self._bad = bad or set()
+
+            async def send_rich(self, group_openid: str, content: str, url: str) -> None:
+                self.rich.append((content, url))
+                if url in self._bad:
+                    raise RuntimeError("这张图坏了")
+
+        p = P()
+        r = await send_entry_images(p, "G", "正文", ("u1", "u2", "u3"))
+        check("★ 3 张图发 3 条", len(p.rich) == 3, str(p.rich))
+        check("★ 全成功时返回空列表（调用方据此不告警）", r == [], repr(r))
+        check("第一条带正文", p.rich[0][0] == "正文", str(p.rich[0]))
+        check("★ 后续条是占位文案", p.rich[1][0] == "（图 2/3）", str(p.rich[1]))
+        check("★ 顺序与传入一致", [r[1] for r in p.rich] == ["u1", "u2", "u3"], str(p.rich))
+
+        # 第一条一直挂 → 重试一次后**必须抛出去**，调用方才能退回纯文字
+        p = P(bad={"u1"})
+        raised = False
+        try:
+            await send_entry_images(p, "G", "正文", ("u1", "u2"))
+        except Exception:  # noqa: BLE001
+            raised = True
+        check("★ 第一条重试后仍失败要抛出去（调用方据此退回纯文字）", raised, str(p.rich))
+        check("★ 第一条确实重试了（共 2 次调用）", len(p.rich) == 2, str(p.rich))
+
+        # 中间那张一直挂 → 重试一次后吞掉，后面的照发
+        p = P(bad={"u2"})
+        r = await send_entry_images(p, "G", "正文", ("u1", "u2", "u3"))
+        check("★ 中间某张失败不中断，后面的照发",
+              bool(p.rich) and p.rich[-1][1] == "u3", str(p.rich))
+        check("★ 返回的是**没发出去**的那张，不是全部", r == ["u2"], repr(r))
+        check("★ 中间那张重试了一次（1 + 2 + 1 = 4 次调用）", len(p.rich) == 4, str(p.rich))
+
+        # 偶发失败（QQ 那种「请稍后重试」）→ 重试就成，不算丢图
+        class Flaky:
+            def __init__(self) -> None:
+                self.rich: list[tuple[str, str]] = []
+                self.n = 0
+
+            async def send_rich(self, group_openid: str, content: str, url: str) -> None:
+                self.n += 1
+                self.rich.append((content, url))
+                if self.n == 2:
+                    raise RuntimeError("偶发 500")
+
+        f = Flaky()
+        await send_entry_images(f, "G", "正文", ("u1", "u2"))
+        check("★ 偶发失败重试后成功（函数正常返回，不抛）", len(f.rich) == 3, str(f.rich))
+        check("★ 重试发的是同一张图", f.rich[-1][1] == "u2", str(f.rich))
+    finally:
+        sched.IMAGE_RETRY_GAP = saved_gap
 
 
 async def _check_retry_on_push_failure() -> None:
@@ -325,6 +419,9 @@ asyncio.run(_check_push_routing())
 
 print("[4.56] 推送失败必须可重试（不丢消息）")
 asyncio.run(_check_retry_on_push_failure())
+
+print("[4.57] 多图连发的失败语义")
+asyncio.run(_check_send_entry_images())
 
 print("[4.6] botpy 新协议适配器注册")
 import inspect  # noqa: E402
@@ -754,9 +851,13 @@ class _FakePusher:
         self.sent.append((group_openid, content, image_url))
 
 
-def _entry(title: str, image: str | None = None) -> Entry:
+def _entry(
+    title: str, image: str | None = None, images: "tuple[str, ...] | None" = None
+) -> Entry:
+    """造一条假 Entry。`images` 优先；只给 `image` 就是单图（老用法）。"""
+    covers = images if images is not None else ((image,) if image else ())
     return Entry(key=f"k-{title}", title=title, link=f"https://e.com/{title}",
-                 published=None, summary="", image=image)
+                 published=None, summary="", images=covers)
 
 
 async def _check_new_command() -> None:
@@ -2188,10 +2289,11 @@ print("[4.94.4] 解析与反查判据（假 http）")
 
 
 class _FakeResp:
-    def __init__(self, payload=None, headers=None, status=200):
+    def __init__(self, payload=None, headers=None, status=200, content=b""):
         self._payload = payload
         self.headers = headers or {}
         self.status_code = status
+        self.content = content
 
     def raise_for_status(self):
         # 和 httpx 一致：**3xx 也算失败**。_expand 曾经在上面踩过 ——
@@ -2433,6 +2535,946 @@ async def _check_bili_probe() -> None:
 
 
 asyncio.run(_check_bili_probe())
+
+print("[4.95] YouTube / X 链接预览（全离线）")
+
+import base64 as _b64  # noqa: E402
+
+from qq_rss_bot import preview as _pv  # noqa: E402
+
+# 假的 youtubei 响应。**字段名照着真实响应抄** —— 抄错了测试就成了摆设。
+_YTI_OK = {
+    "playabilityStatus": {"status": "OK"},
+    "videoDetails": {
+        "title": "Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)",
+        "author": "Rick Astley",
+        "lengthSeconds": "213",
+        "viewCount": "1827523566",
+    },
+}
+# 假的 fxtwitter 响应（这条是带图的）
+_FX_OK = {
+    "code": 200,
+    "tweet": {
+        "url": "https://x.com/BarackObama/status/896523232098078720",
+        "text": "No one is born hating another person because of the color of his skin",
+        "likes": 3400843,
+        "retweets": 1216441,
+        "replies": 58226,
+        "author": {"name": "Barack Obama", "screen_name": "BarackObama"},
+        "media": {
+            "photos": [
+                {
+                    "type": "photo",
+                    "url": "https://pbs.twimg.com/media/DHEXH7RV0AAUwKj.jpg?name=orig",
+                }
+            ]
+        },
+    },
+}
+# 同一条的「无图」版本
+_FX_NO_PHOTO = {**_FX_OK, "tweet": {**_FX_OK["tweet"], "media": None}}
+
+# 三张配图的推文 —— 多图那条路的主力 fixture
+_FX_MULTI = {
+    **_FX_OK,
+    "tweet": {
+        **_FX_OK["tweet"],
+        "media": {
+            "photos": [
+                {"url": "https://pbs.twimg.com/media/A.jpg?name=orig"},
+                {"url": "https://pbs.twimg.com/media/B.jpg?name=orig"},
+                {"url": "https://pbs.twimg.com/media/C.jpg?name=orig"},
+            ]
+        },
+    },
+}
+
+
+class _FakeMediaHttp:
+    """YouTube / X 的假客户端：按 URL 路由，图片给字节。"""
+
+    def __init__(self, yti=None, fx=None, oembed=None, image=b"\xff\xd8fake", image_status=200):
+        self.calls: list[tuple[str, str]] = []
+        self._yti, self._fx, self._oembed = yti, fx, oembed
+        self._image, self._image_status = image, image_status
+
+    async def post(self, url, **kw):
+        self.calls.append(("post", url))
+        if "youtubei" in url:
+            return _FakeResp(payload=self._yti)
+        raise AssertionError("没预期的 POST: %s" % url)
+
+    async def get(self, url, **kw):
+        self.calls.append(("get", url))
+        if "youtube.com/oembed" in url:
+            return _FakeResp(payload=self._oembed)
+        if "fxtwitter" in url:
+            return _FakeResp(payload=self._fx)
+        if "publish.twitter.com" in url:
+            return _FakeResp(payload=self._oembed)
+        # 图片下载：ytimg（YouTube 封面）/ twimg（推文配图）
+        if "ytimg.com" in url or "twimg.com" in url:
+            return _FakeResp(content=self._image, status=self._image_status)
+        raise AssertionError("没预期的 GET: %s" % url)
+
+
+class _MediaApi:
+    """假的 QQ 接口，把「上传」和「发消息」分开记 —— 两者是两条独立的路。
+
+    `fail_after` / `msg_fail_after` 用来模拟「第 N 次之后开始失败」，
+    多图的部分失败全靠它。
+    """
+
+    def __init__(self, upload_ok=True, upload_raises=False,
+                 fail_after=None, msg_fail_after=None):
+        self.sent: list[dict] = []
+        self.uploaded: list[dict] = []
+        self._ok, self._raises = upload_ok, upload_raises
+        self._fail_after, self._msg_fail_after = fail_after, msg_fail_after
+        self._rich_sent = 0
+
+    async def post_group_message(self, **kw):
+        self.sent.append(kw)
+        # `msg_fail_after` **只数富媒体（msg_type=7）**。按「所有消息」数的话，
+        # 兜底的 markdown 卡片会跟着一起挂，就测不出「退回卡片」那条路了。
+        if kw.get("msg_type") == 7:
+            self._rich_sent += 1
+            if self._msg_fail_after is not None and self._rich_sent > self._msg_fail_after:
+                raise RuntimeError("send boom")
+        return {"code": 0}
+
+    async def post_group_file(self, **kw):
+        self.uploaded.append(kw)
+        if self._raises:
+            raise RuntimeError("upload boom")
+        if self._fail_after is not None and len(self.uploaded) > self._fail_after:
+            return {}  # 没拿到 file_info = 这张传不上去
+        return {"file_info": "FI"} if self._ok else {}
+
+
+class _SpyNotifier:
+    """记账用的 notifier 替身 —— `notify` 只把 (群, 文案, key) 收进列表。
+
+    **不实现冷却**：冷却逻辑属于 `C2CNotifier` 自己，这里要断言的是
+    「该不该报、报了什么、key 用的是什么」，把冷却混进来只会让用例难读。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def notify(self, group_openid: str, text: str, *, key: str = "") -> bool:
+        self.calls.append((group_openid, text, key))
+        return True
+
+
+class _MediaBotStub:
+    """只借 RssBot 的预览出口，不真造 botpy Client（那要事件循环和网络）。"""
+
+    _preview_media = _RssBot._preview_media
+    _upload_image = _RssBot._upload_image
+    _make_repliers = _RssBot._make_repliers
+
+    def __init__(self, cfg, media_http, api, notifier=None):
+        self.cfg, self.media_http, self.api = cfg, media_http, api
+        # 配图失败要私聊告警 —— 这里给个真的 `C2CNotifier` 替身，
+        # 否则「失败了到底有没有报」这件事测不了。
+        self.notifier = notifier or _SpyNotifier()
+
+
+_YT_TEXT = "看看这个 https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+_X_TEXT = "https://x.com/BarackObama/status/896523232098078720"
+
+
+async def _check_media_preview() -> None:
+    import qq_rss_bot.scheduler as _sched
+
+    saved_gap = _sched.IMAGE_RETRY_GAP
+    _sched.IMAGE_RETRY_GAP = 0.0
+    try:
+        await _check_media_preview_inner()
+    finally:
+        _sched.IMAGE_RETRY_GAP = saved_gap
+
+
+async def _check_media_preview_inner() -> None:
+    cfg = load_config()
+
+    # --- 不该管的消息：一条都不发 ---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
+    check("闲聊返回「没回」", await bot._preview_media(_FakeMsg("测试123")) is False)
+    check("★ 闲聊一条都没发", api.sent == [] and api.uploaded == [], repr(api.sent))
+
+    # bilibili 链接必须**留给 bilibili 那条路**，不能被这里截胡
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
+    check("★ bilibili 链接不被 YouTube/X 认领",
+          await bot._preview_media(_FakeMsg("https://www.bilibili.com/video/BV15eJt6pEam")) is False)
+    check("★ 认领失败时也一条都没发", api.sent == [], repr(api.sent))
+
+    # 开关关掉
+    api = _MediaApi()
+    bot = _MediaBotStub(dataclasses.replace(cfg, youtube_preview=False), _FakeMediaHttp(yti=_YTI_OK), api)
+    check("YOUTUBE_PREVIEW=false 时返回「没回」",
+          await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
+    check("★ 开关关掉时一条都没发", api.sent == [] and api.uploaded == [], repr(api.sent))
+
+    # --- YouTube 正常路径：上传字节 + 富媒体 ---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK, image=b"\xff\xd8yt"), api)
+    check("YouTube 返回「回了」", await bot._preview_media(_FakeMsg(_YT_TEXT)) is True)
+    check("恰好上传一次", len(api.uploaded) == 1, repr(api.uploaded))
+    up = api.uploaded[0]
+    check("file_type=1（图片）", up.get("file_type") == 1, repr(up))
+    check("srv_send_msg=False（只上传，不单独发一条）", up.get("srv_send_msg") is False, repr(up))
+    check("★ 走 file_data 而不是 url", "file_data" in up and "url" not in up, repr(list(up)))
+    check("★ file_data 是图片的 base64", _b64.b64decode(up["file_data"]) == b"\xff\xd8yt")
+    check("恰好发一条消息", len(api.sent) == 1, repr(api.sent))
+    sent = api.sent[0]
+    check("★ msg_type=7（富媒体）", sent.get("msg_type") == 7, repr(sent))
+    check("★ 带 media.file_info", (sent.get("media") or {}).get("file_info") == "FI", repr(sent))
+    check("被动回复：带 msg_id", sent.get("msg_id") == "M1", repr(sent))
+    check("被动回复：msg_seq=1", sent.get("msg_seq") == 1, repr(sent))
+    body = sent.get("content") or ""
+    check("正文含标题", "Rick Astley" in body, repr(body))
+    check("★ 时长和播放量在同一行", "03:33 · 播放 18.3亿" in body, repr(body))
+    check("正文含原链接", "youtube.com/watch?v=dQw4w9WgXcQ" in body, repr(body))
+    check("富媒体消息不带 keyboard", "keyboard" not in sent, repr(list(sent)))
+
+    # --- X：有配图 → 富媒体；且配图要换成 name=small ---
+    api = _MediaApi()
+    http = _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw")
+    bot = _MediaBotStub(cfg, http, api)
+    check("X 返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    fetched = [u for kind, u in http.calls if kind == "get" and "twimg.com" in u]
+    check("★ 下载的是原图 name=orig", fetched and "name=orig" in fetched[0], repr(fetched))
+    sent = api.sent[0]
+    check("X 也走 msg_type=7", sent.get("msg_type") == 7, repr(sent))
+    body = sent.get("content") or ""
+    check("正文含作者", "Barack Obama (@BarackObama)" in body, repr(body))
+    check("★ 互动数每行最多两项", "点赞 340.1万 · 转发 121.6万" in body, repr(body))
+
+    # --- ★ 多图：一条推文配 3 张图 ---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+    check("多图推文返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 3 张图各上传一次", len(api.uploaded) == 3, repr(len(api.uploaded)))
+    check("★ 3 张图发 3 条消息", len(api.sent) == 3, repr(len(api.sent)))
+    check("★ 每条都是 msg_type=7",
+          all(m.get("msg_type") == 7 for m in api.sent),
+          repr([m.get("msg_type") for m in api.sent]))
+    check("★ msg_seq 递增（同一个 msg_id 下撞号会被静默丢弃）",
+          [m.get("msg_seq") for m in api.sent] == [1, 2, 3],
+          repr([m.get("msg_seq") for m in api.sent]))
+    check("第一条带完整正文",
+          "Barack Obama" in (api.sent[0].get("content") or ""),
+          repr(api.sent[0].get("content")))
+    check("★ 后续条只带占位文案",
+          api.sent[1].get("content") == "（图 2/3）", repr(api.sent[1].get("content")))
+    check("★ 每条各带一个 file_info",
+          all((m.get("media") or {}).get("file_info") for m in api.sent), repr(api.sent))
+
+    # --- 开关关掉 → 回到单图（旧行为，必须一模一样）---
+    api = _MediaApi()
+    bot = _MediaBotStub(dataclasses.replace(cfg, preview_multi_image=False),
+                        _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+    await bot._preview_media(_FakeMsg(_X_TEXT))
+    check("★ PREVIEW_MULTI_IMAGE=false 时只发 1 条", len(api.sent) == 1, repr(len(api.sent)))
+    check("★ 关掉时只上传 1 次（不多下多传）", len(api.uploaded) == 1, repr(len(api.uploaded)))
+
+    # --- 中间某张传不上去 → 少那一张，其余照发 ---
+    api = _MediaApi(fail_after=1)
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+    check("第 2、3 张上传失败仍返回「回了」",
+          await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 传不上去的那几张不发，成功的照发", len(api.sent) == 1, repr(len(api.sent)))
+
+    # --- 第 2 条发送失败 → 不能把整条拖回去 ---
+    api = _MediaApi(msg_fail_after=1)
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+    check("★ 后续条发送失败时仍算「回了」（不误报成预览失败）",
+          await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 第 2 条挂了以后第 3 条照样尝试发",
+          any("图 3/3" in (m.get("content") or "") for m in api.sent),
+          repr([m.get("content") for m in api.sent]))
+    check("★ 后续条失败时**不**退回 markdown（否则正文会重复刷屏）",
+          all(m.get("msg_type") == 7 for m in api.sent),
+          repr([m.get("msg_type") for m in api.sent]))
+
+    # 第一条（带正文那条）挂了 → 退回 markdown 卡片，不能让分享变成「什么都没回」
+    api = _MediaApi(msg_fail_after=0)
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+    check("★ 第一条发不出去时退回 markdown 卡片",
+          await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 退回的那条是 msg_type=2（markdown）",
+          api.sent and api.sent[-1].get("msg_type") == 2,
+          repr([m.get("msg_type") for m in api.sent]))
+
+    # --- ★ 成功日志必须带封面尺寸和档位 ---
+    # 这条钉的是**可观测性**，不是功能：推文的图分 orig/large/medium/small
+    # 四档（实测 943KB / 434KB / 180KB / 70KB），而「已回图文卡片」四种情况
+    # 长得一模一样。日志里不写尺寸的话，「发出去的到底是不是原图」在事后
+    # 无法回答 —— 这个已经真发生过一次，只能靠让用户重发来补证据。
+    import logging  # noqa: PLC0415 —— 这个文件按节就近 import
+
+    class _Grab(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.INFO)
+            self.lines: list[str] = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    grab = _Grab()
+    blog = logging.getLogger("qq_rss_bot.bot")
+    old_level = blog.level
+    blog.addHandler(grab)
+    blog.setLevel(logging.INFO)
+    try:
+        api = _MediaApi()
+        bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw"), api)
+        await bot._preview_media(_FakeMsg(_X_TEXT))
+    finally:
+        blog.removeHandler(grab)
+        blog.setLevel(old_level)
+
+    done = [ln for ln in grab.lines if "已回" in ln]
+    check("★ 成功日志带配图张数和字节数",
+          bool(done) and "配图 1 张" in done[-1] and "KB" in done[-1], repr(done[-1:]))
+    check("★ 成功日志带配图 URL（档位写在 ?name= 里）",
+          bool(done) and "name=orig" in done[-1], repr(done[-1:]))
+
+    # --- X：没配图 → 退回 markdown 卡片（不传 media）---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_PHOTO), api)
+    check("无图推文也返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 无图时不上传", api.uploaded == [], repr(api.uploaded))
+    sent = api.sent[0]
+    check("★ 无图时 msg_type=2（markdown）", sent.get("msg_type") == 2, repr(sent))
+    check("markdown 是外层 content 包裹", "content" in (sent.get("markdown") or {}), repr(sent))
+    check("markdown 里没有 media", "media" not in sent, repr(list(sent)))
+
+    # --- QQ 的 5M 直传上限 ---
+    # 官方对 `file_data` 的原话是「直接上传二进制有大小限制，需要在 5M 以内」，
+    # 而**这个 5M 限的是 base64 之后那一串**，不是原始字节。所以
+    # 「原始图能有多大」= 5MiB × 3/4，这条关系必须钉死：它一旦被违反，日常
+    # 撞到的是平台拒绝，而日志里看着像「上传失败」，排查方向就全错了。
+    b64_len = len(_b64.b64encode(b"\x00" * _pv.MAX_IMAGE_BYTES))
+    check(
+        "★ MAX_IMAGE_BYTES 的图 base64 后不超 5M 直传上限",
+        b64_len <= _pv.MAX_FILE_DATA_BYTES,
+        f"{_pv.MAX_IMAGE_BYTES} 字节 → base64 {b64_len}，上限 {_pv.MAX_FILE_DATA_BYTES}",
+    )
+
+    # 闸门本身：直接喂超限字节，必须在上传**之前**就放弃
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
+    oversize = b"\xff\xd8" + b"\x00" * (4 * 1024 * 1024)  # base64 后 ~5.6MB
+    check("★ base64 超 5M 时 _upload_image 返回 None",
+          await bot._upload_image("G1", oversize) is None)
+    check("★ 超限时根本没发上传请求", api.uploaded == [], repr(api.uploaded))
+
+    # 边界内侧必须能过：3MiB → base64 4MiB
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
+    check("3MiB 的图能过闸",
+          await bot._upload_image("G1", b"\xff\xd8" + b"\x00" * (3 * 1024 * 1024)) == "FI")
+    check("过闸时确实发了上传请求", len(api.uploaded) == 1, repr(api.uploaded))
+
+    # --- 上传失败 / 上传抛异常 → 都要降级，但**文字必须照发** ---
+    for label, api in (("上传没拿到 file_info", _MediaApi(upload_ok=False)),
+                       ("上传抛异常", _MediaApi(upload_raises=True))):
+        bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK), api)
+        check(f"{label} 时仍返回「回了」",
+              await bot._preview_media(_FakeMsg(_YT_TEXT)) is True)
+        check(f"★ {label} 时降级成 markdown", api.sent and api.sent[0].get("msg_type") == 2,
+              repr(api.sent))
+
+    # --- 图片下载失败（404）→ 同样降级，不发裂图 ---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK, image_status=404), api)
+    check("封面 404 时仍返回「回了」", await bot._preview_media(_FakeMsg(_YT_TEXT)) is True)
+    check("★ 封面下载失败时不上传", api.uploaded == [], repr(api.uploaded))
+    check("★ 封面下载失败时降级成 markdown", api.sent[0].get("msg_type") == 2, repr(api.sent))
+
+    # --- 解析失败 → 一条都不发 ---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti={}, oembed=None), api)
+    check("YouTube 解析失败返回「没回」",
+          await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
+    check("★ 解析失败时一条都没发", api.sent == [] and api.uploaded == [], repr(api.sent))
+
+    # --- ★ 异常要被吃掉：不能冒到 botpy 的 _run_event ---
+    class _BoomApi:
+        async def post_group_message(self, **kw):
+            raise RuntimeError("boom")
+
+        async def post_group_file(self, **kw):
+            return {"file_info": "FI"}
+
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK), _BoomApi())
+    check("★ 发送异常被吞掉并返回「没回」",
+          await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
+
+
+asyncio.run(_check_media_preview())
+
+
+print("[4.58] 配图失败的私聊告警")
+
+
+async def _check_image_failure_notify() -> None:
+    """配图没发出去 → 私聊报给管理员。
+
+    **为什么要报**：配图失败在群里是**看不见**的。读者只会觉得「这条怎么
+    少了两张图」，很容易当成「本来就没图」—— 用户就是这么发现第 3 张一直
+    没发出去的（翻了 NAS 日志才知道）。
+    """
+    import qq_rss_bot.scheduler as sched
+    from qq_rss_bot.rss import Entry as E
+    from qq_rss_bot.scheduler import IMAGE_FAILURE_KEY_PREFIX, FeedPoller
+
+    saved_gap = sched.IMAGE_RETRY_GAP
+    sched.IMAGE_RETRY_GAP = 0.0
+    try:
+        class Fake:
+            """按 URL 注入失败 —— 按调用次数注入会被重试绕过，测不出真实语义。"""
+
+            def __init__(self, bad: "set[str] | None" = None) -> None:
+                self.text: list[str] = []
+                self.rich: list[tuple[str, str]] = []
+                self._bad = bad or set()
+
+            async def send_text(self, group_openid: str, content: str) -> None:
+                self.text.append(content)
+
+            async def send_rich(self, group_openid: str, content: str, url: str) -> None:
+                if url in self._bad:
+                    raise RuntimeError("这张图坏了")
+                self.rich.append((content, url))
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "t.db")
+            sid, _ = db.add_subscription("G", "https://a.com/f", "源名", 60)
+            db.mark_polled(sid, title="源名", mark_initialized=True)
+            sub = db.list_subscriptions("G")[0]
+
+            multi = E("k1", "标题1", "https://a.com/1", None, "",
+                      ("https://a.com/1a.jpg", "https://a.com/1b.jpg",
+                       "https://a.com/1c.jpg"))
+
+            # --- 全成功：一条私聊都不该有 ---
+            spy = _SpyNotifier()
+            await FeedPoller(cfg_stub(), db, None, Fake(), notifier=spy)._push_entries(
+                sub, "源名", [multi]
+            )
+            check("★ 配图全成功时不私聊", spy.calls == [], repr(spy.calls))
+
+            # --- 中间那张挂：正文和另两张照发，但要报 ---
+            spy = _SpyNotifier()
+            await FeedPoller(
+                cfg_stub(), db, None, Fake(bad={"https://a.com/1b.jpg"}), notifier=spy
+            )._push_entries(sub, "源名", [multi])
+            check("★ 有图没发出去时私聊一次", len(spy.calls) == 1, repr(spy.calls))
+            if spy.calls:
+                group, text, key = spy.calls[0]
+                check("发给的是出问题的那个群", group == "G", group)
+                check("★ 冷却键按群走，不带条目（防 DM 风暴）",
+                      key == f"{IMAGE_FAILURE_KEY_PREFIX}G", key)
+                check("文案说了几张没出去", "1/3" in text, text)
+                check("文案带上了失败的图片 URL", "1b.jpg" in text, text)
+                check("文案带上了源和条目", "源名" in text and "标题1" in text, text)
+                check("★ 部分失败时说的是「几张」不是「整条」",
+                      "1/3 张没发出去" in text, text)
+
+            # --- 第一条挂：整条退回纯文字，图**一张都没发出去** ---
+            spy = _SpyNotifier()
+            fake = Fake(bad={"https://a.com/1a.jpg"})
+            await FeedPoller(cfg_stub(), db, None, fake, notifier=spy)._push_entries(
+                sub, "源名", [multi]
+            )
+            check("第一条挂 → 退回纯文字", len(fake.text) == 1 and not fake.rich,
+                  f"{fake.text} / {fake.rich}")
+            check("★ 第一条挂时一条都不发（退回纯文字，不重复刷屏）",
+                  fake.rich == [], repr(fake.rich))
+            check("★ 退回纯文字时也要报（首图就挂 = 这类图一张都发不出去）",
+                  len(spy.calls) == 1, repr(spy.calls))
+            if spy.calls:
+                _g, _t, _k = spy.calls[0]
+                check("★ 退回纯文字时的冷却键和部分失败共用", _k == f"{IMAGE_FAILURE_KEY_PREFIX}G", _k)
+                check("★ 说清楚是「整条退回纯文字」而不是「少了一张」",
+                      "退回纯文字" in _t and "1/3" not in _t, _t)
+                check("★ 只报首图（后面几张根本没试过，算进去就是编数字）",
+                      _t.count("·") == 1, _t)
+            db.close()
+
+        # --- /new 那条路也要报 ---
+        from qq_rss_bot.commands import CommandHandler
+
+        handler = CommandHandler(
+            cfg_stub(), None, None, None, notifier=_SpyNotifier()
+        )
+        check("★ CommandHandler 拿得到 notifier", handler.notifier is not None)
+    finally:
+        sched.IMAGE_RETRY_GAP = saved_gap
+
+
+asyncio.run(_check_image_failure_notify())
+
+
+print("[4.59] 推送文案的摘要行")
+
+
+def _check_format_entry_summary() -> None:
+    """`format_entry` 必须把 `Entry.summary` 发出去。
+
+    回归钉子：这个字段从 2026-08 抓到 2026-10 一直**没人用** —— 抓下来、
+    洗了标签、存进对象，然后一行都没发。群里看到的是光秃秃的三行，
+    用户直接问「是不是 RSS 省略了」。不是省略，是漏了。
+    """
+    from qq_rss_bot.rss import Entry as E
+    from qq_rss_bot.scheduler import MAX_SUMMARY_CHARS, format_entry
+
+    e = E("k", "标题", "https://a.com/1", None, "这是摘要正文", ())
+    text = format_entry("源名", "https://a.com/f", e)
+    check("★ 摘要出现在推送文案里", "这是摘要正文" in text, repr(text))
+    check("源名 / 标题 / 链接都还在",
+          "📰 源名" in text and "· 标题" in text and "https://a.com/1" in text, repr(text))
+    check("★ 顺序是 源名 → 标题 → 摘要 → 链接",
+          text.index("标题") < text.index("这是摘要正文") < text.index("https://a.com/1"),
+          repr(text))
+
+    # 关掉开关 → 回到三行
+    off = format_entry("源名", "https://a.com/f", e, with_summary=False)
+    check("★ PUSH_SUMMARY=false 时摘要不出现", "这是摘要正文" not in off, repr(off))
+    check("关掉时行数回到 3", len(off.splitlines()) == 3, repr(off))
+
+    # 没有摘要 → 不能多出一个空行
+    empty = format_entry("源名", "https://a.com/f", E("k", "标题", "https://a.com/1", None, "", ()))
+    check("★ 没有摘要时不产生空行", len(empty.splitlines()) == 3, repr(empty))
+
+    # summary 就是标题（很多源的 <description> 直接是标题）→ 不要重复一遍
+    dup = format_entry(
+        "源名", "https://a.com/f",
+        E("k", "标题", "https://a.com/1", None, "标题", ()),
+    )
+    check("★ summary 等于标题时不重复", dup.count("标题") == 1, repr(dup))
+
+    # summary = 标题 + 正文（同样常见）→ 剥掉开头那次，留正文
+    dup2 = format_entry(
+        "源名", "https://a.com/f",
+        E("k", "标题", "https://a.com/1", None, "标题 - 正文在这里", ()),
+    )
+    check("★ summary 以标题开头时剥掉那一段", "正文在这里" in dup2, repr(dup2))
+    check("★ 剥完标题只剩一次", dup2.count("标题") == 1, repr(dup2))
+
+    # 超长摘要要截断。用 `MAX_SUMMARY_CHARS` 的 3 倍，**别写死数字** ——
+    # 上限本身调过一次（150 → 400），写死的用例会在调参时假失败。
+    long_text = format_entry(
+        "源名", "https://a.com/f",
+        E("k", "标题", "https://a.com/1", None, "啊" * (MAX_SUMMARY_CHARS * 3), ()),
+    )
+    check("★ 超长摘要被截断", long_text.count("啊") <= MAX_SUMMARY_CHARS,
+          str(long_text.count("啊")))
+    check("★ 截断后带省略号", "…" in long_text, repr(long_text[:60]))
+
+    # `SUMMARY_CHARS` 要真的能调 —— 不然它就是个摆设
+    short = format_entry(
+        "源名", "https://a.com/f",
+        E("k", "标题", "https://a.com/1", None, "啊" * 900, ()),
+        summary_chars=80,
+    )
+    check("★ summary_chars 能收窄", short.count("啊") <= 80, str(short.count("啊")))
+
+    # 摘要很长时文案会长，但**这不再是平台问题** —— 实测 40000 字符 QQ 也收
+    # （scripts/probe_textlen.py）。这里只保证它别失控。
+    check("★ 超长摘要下文案仍有限", len(long_text) < 2000, str(len(long_text)))
+
+
+_check_format_entry_summary()
+
+
+print("[4.95.1] 链接识别与渲染（纯函数）")
+
+
+def _check_pv_pure() -> None:
+    cases = [
+        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", ("youtube", "dQw4w9WgXcQ")),
+        ("https://youtu.be/dQw4w9WgXcQ", ("youtube", "dQw4w9WgXcQ")),
+        ("https://www.youtube.com/shorts/abc123XYZ_-", ("youtube", "abc123XYZ_-")),
+        ("https://www.youtube.com/embed/dQw4w9WgXcQ", ("youtube", "dQw4w9WgXcQ")),
+        # ★ 带 list 参数时也得认出 v= 那个
+        ("https://www.youtube.com/watch?list=PLx&v=dQw4w9WgXcQ&t=30", ("youtube", "dQw4w9WgXcQ")),
+        ("https://x.com/BarackObama/status/896523232098078720", ("twitter", "896523232098078720")),
+        ("https://twitter.com/jack/status/20", ("twitter", "20")),
+        # 反例：这三个都不该被认领
+        ("https://www.bilibili.com/video/BV15eJt6pEam", None),
+        ("https://github.com/foo/bar", None),
+        ("测试123", None),
+    ]
+    for text, want in cases:
+        t = _pv.find_target(text)
+        got = (t.site, t.vid) if t else None
+        check(f"识别 {text[:46]}", got == want, f"得到 {got}，期望 {want}")
+
+    # 正文按**显示宽度**截断：汉字算 2，所以 180 宽度只能放 ~91 个汉字
+    check("★ 中文按显示宽度截断（不是字符数）", len(_pv._trim("汉" * 300)) < 100,
+          str(len(_pv._trim("汉" * 300))))
+    check("截断后有省略号", _pv._trim("汉" * 300).endswith("…"))
+    check("短文本不截断", _pv._trim("短") == "短")
+    check("正文里的换行被压掉", "\n" not in _pv._trim("a\nb\nc"))
+
+    # ★ 推文**要原图**（无损是明确要求），所以任何档位都强制改写成 orig
+    check("★ 推文配图强制 name=orig（无损）",
+          _pv._twitter_covers({"photos": [{"url": "https://p.twimg.com/x.jpg?name=small"}]})
+          == ("https://p.twimg.com/x.jpg?name=orig",))
+    check("★ 原本没有 name 参数时补上 orig",
+          _pv._twitter_covers({"photos": [{"url": "https://p.twimg.com/x.jpg"}]})
+          == ("https://p.twimg.com/x.jpg?name=orig",))
+    check("没有 media 时返回空元组", _pv._twitter_covers(None) == ())
+    check("media 没有 photos 时返回空元组", _pv._twitter_covers({"photos": []}) == ())
+
+    # 多图：按推文里的顺序，截到 MAX_IMAGES
+    many = {"photos": [{"url": f"https://p.twimg.com/{i}.jpg"} for i in range(8)]}
+    got = _pv._twitter_covers(many)
+    check("★ 多图截到 MAX_IMAGES 张", len(got) == _pv.MAX_IMAGES, str(len(got)))
+    check("多图保持推文里的顺序", got[0].startswith("https://p.twimg.com/0.jpg"), got[0])
+    check("★ 多图每张都强制 orig", all("name=orig" in u for u in got), str(got))
+    check("photos 里有脏数据时跳过、不整条放弃",
+          _pv._twitter_covers(
+              {"photos": [None, {"url": ""}, {"url": "https://p.twimg.com/ok.jpg"}]})
+          == ("https://p.twimg.com/ok.jpg?name=orig",))
+    check("★ Card.cover 取第一张（旧调用点靠它）",
+          _pv.Card(site="x", url="u", title="t", author="a",
+                   covers=("https://a/1.jpg", "https://a/2.jpg")).cover == "https://a/1.jpg")
+    check("Card 没有配图时 cover 为 None",
+          _pv.Card(site="x", url="u", title="t", author="a").cover is None)
+
+    # oEmbed 的正文藏在 html 的 <p> 里，尾巴（作者/日期/script）必须甩掉
+    frag = ('<blockquote class="twitter-tweet"><p lang="en" dir="ltr">just setting up '
+            'my twttr</p>&mdash; jack (@jack) <a href="https://x.com/jack/status/20">'
+            'March 21, 2006</a></blockquote><script async src="x.js"></script>')
+    check("★ 从 oEmbed html 里抠出正文", _pv._text_from_oembed(frag) == "just setting up my twttr",
+          repr(_pv._text_from_oembed(frag)))
+
+    check("计数行：值拿不准就整行不要", _pv._count_line("播放", None) == "")
+    check("计数行：0 照常显示", _pv._count_line("播放", 0) == "播放 0")
+    check("计数行：负数不要", _pv._count_line("播放", -1) == "")
+
+    card = _pv.Card(site="youtube", url="https://y/u", title="标题 | 带 [方括号] *星号*",
+                    author="频道", covers=("https://i/c.jpg",), extra=("03:33",))
+    text = _pv.render_text(card)
+    check("render_text 含全部四行", text.count("\n") == 3, repr(text))
+    md = _pv.render_markdown(card)
+    check("★ markdown 剥掉会破坏结构的字符", "*星号*" not in md and "**标题" in md, repr(md))
+    check("render_markdown 默认**不出图**（图片得 QQ 够得到才有意义）",
+          "![" not in md, repr(md))
+
+
+_check_pv_pure()
+
+
+print("[4.95.2] compat 的文件上传补丁（file_data）")
+
+
+def _check_file_data_patch() -> None:
+    import inspect
+
+    from botpy.api import BotAPI
+
+    for name in ("post_group_file", "post_c2c_file"):
+        sig = inspect.signature(getattr(BotAPI, name))
+        check(f"★ {name} 收 file_data", "file_data" in sig.parameters, repr(list(sig.parameters)))
+        check(f"{name} 的 file_data 是 keyword-only",
+              sig.parameters["file_data"].kind is inspect.Parameter.KEYWORD_ONLY)
+        check(f"{name} 的 url 变成可选（原版是必填）",
+              sig.parameters["url"].default is None)
+
+    check("补丁是幂等的（重复安装不改动）",
+          install_new_protocol_support() == [], repr(install_new_protocol_support()))
+
+
+_check_file_data_patch()
+
+
+print("[4.60] AI 摘要（抓正文 + 翻译/精简）")
+
+
+def _check_ai_parse() -> None:
+    """模型回复的解析。**这是全链路最容易烂的一环** —— 它会裹代码块、
+    会在 JSON 前后多说话、会偶尔返回半截。这些都不该让推送挂掉。"""
+    from qq_rss_bot.ai import parse_digest
+
+    ok = parse_digest('{"title":"译标题","summary":"摘要","translated":true}')
+    check("干净 JSON 能解析", ok is not None and ok.title == "译标题", repr(ok))
+    check("translated 透传", ok is not None and ok.translated is True, repr(ok))
+
+    fenced = parse_digest('```json\n{"title":"T","summary":"S","translated":false}\n```')
+    check("★ 裹了代码块也能解析", fenced is not None and fenced.title == "T", repr(fenced))
+
+    chatty = parse_digest('好的，结果如下：{"title":"T2","summary":"S2","translated":false} 希望有帮助')
+    check("★ JSON 前后多说话也能解析", chatty is not None and chatty.title == "T2", repr(chatty))
+
+    check("★ 完全不是 JSON → None（不抛）", parse_digest("我不知道") is None)
+    check("★ 空回复 → None", parse_digest("") is None and parse_digest(None) is None)
+    check("★ 缺标题 → None（宁可不要也不能发一条没标题的）",
+          parse_digest('{"summary":"只有摘要"}') is None)
+    check("★ 顶层不是对象 → None", parse_digest('[1,2,3]') is None)
+    # summary 允许为空：正文残缺时提示词就是这么要求的
+    empty_sum = parse_digest('{"title":"T","summary":"","translated":false}')
+    check("summary 为空是合法的", empty_sum is not None and empty_sum.summary == "", repr(empty_sum))
+
+
+def _check_ai_extract() -> None:
+    """正文提取要把导航、脚本、页脚剥掉。"""
+    from qq_rss_bot.ai import extract_text, extractor_name
+
+    html = (
+        "<html><head><title>站点标题</title><script>var x=1;</script></head>"
+        "<body><nav>首页 关于 联系</nav>"
+        "<article><p>" + "这是正文第一段，讲了很重要的事情。" * 6 + "</p>"
+        "<p>" + "这是正文第二段，继续展开。" * 6 + "</p></article>"
+        "<footer>版权所有 2026</footer></body></html>"
+    )
+    got = extract_text(html)
+    check("★ 正文能提出内容", len(got) > 100, f"{extractor_name()} -> {len(got)} 字")
+    check("★ 导航被剥掉", "首页 关于" not in got, got[:80])
+    check("★ 脚本被剥掉", "var x=1" not in got, got[:80])
+    check("★ 页脚被剥掉", "版权所有" not in got, got[:80])
+    check("空输入返回空串", extract_text("") == "")
+    check("纯文本 HTML 也不炸", isinstance(extract_text("你好"), str))
+
+
+def _check_ai_format() -> None:
+    """有 digest 时文案要用 digest 的标题和摘要，并附上原标题。"""
+    from qq_rss_bot.ai import Digest
+    from qq_rss_bot.rss import Entry as E
+    from qq_rss_bot.scheduler import format_entry
+
+    e = E("k", "OpenAI ships GPT-7", "https://a.com/1", None, "英文导语一段", ())
+    d = Digest(title="OpenAI 发布 GPT-7", summary="中文摘要正文", translated=True)
+    text = format_entry("TechCrunch", "https://a.com/f", e, digest=d)
+    check("★ 用译文标题", "OpenAI 发布 GPT-7" in text, repr(text))
+    check("★ 用 AI 摘要", "中文摘要正文" in text, repr(text))
+    check("★ 不再混进 RSS 原文案", "英文导语一段" not in text, repr(text))
+    check("链接还在", "https://a.com/1" in text, repr(text))
+
+    # **不附原标题。** 附过一版（`原题：…`），发出来一条四段太长，
+    # 群里一屏放不下，而原题信息量最低。`translated` 现在只写日志。
+    check("★ 不再附原标题（内容太长，实测砍掉）", "原题：" not in text, repr(text))
+    check("★ 译文时文案只有 4 行", len(text.splitlines()) == 4, repr(text))
+
+    zh = Digest(title="OpenAI ships GPT-7", summary="中文摘要", translated=False)
+    t2 = format_entry("TechCrunch", "https://a.com/f", e, digest=zh)
+    check("未翻译时也不附原标题", "原题：" not in t2, repr(t2))
+
+    same = Digest(title="OpenAI ships GPT-7", summary="S", translated=True)
+    t3 = format_entry("TechCrunch", "https://a.com/f", e, digest=same)
+    check("译文等于原标题时也不重复", "原题：" not in t3, repr(t3))
+
+    # summary 为空 → 不留空行
+    bare = Digest(title="T", summary="", translated=False)
+    t4 = format_entry("源", "u", e, digest=bare)
+    check("★ summary 为空时不留空行", len(t4.splitlines()) == 3, repr(t4))
+
+    # digest=None → 完全退回原行为
+    t5 = format_entry("TechCrunch", "https://a.com/f", e, digest=None)
+    check("★ 没有 digest 时退回 RSS 导语", "英文导语一段" in t5, repr(t5))
+
+
+async def _check_ai_pipeline() -> None:
+    """缓存 / 日上限 / 失败静默 —— 三件都必须对，否则就是烧钱或者丢推送。"""
+    import json  # noqa: PLC0415 —— 这个文件按节就近 import
+
+    from qq_rss_bot.rss import Entry as E
+    from qq_rss_bot.scheduler import prepare_digests
+
+    class FakeHttp:
+        """一个客户端同时伺候 GET（抓正文）和 POST（调模型）。"""
+
+        def __init__(self, article="", reply="", get_raises=False, post_raises=False):
+            self.article, self.reply = article, reply
+            self.gets: list[str] = []
+            self.posts: list[dict] = []
+            self._get_raises, self._post_raises = get_raises, post_raises
+
+        async def get(self, url, **kw):
+            self.gets.append(url)
+            if self._get_raises:
+                raise httpx.ConnectError("boom")
+            return httpx.Response(
+                200, text=f"<html><body><p>{self.article}</p></body></html>",
+                request=httpx.Request("GET", url),
+            )
+
+        async def post(self, url, **kw):
+            self.posts.append(kw.get("json") or {})
+            if self._post_raises:
+                raise httpx.ReadTimeout("slow")
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": self.reply}}]},
+                request=httpx.Request("POST", url),
+            )
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        sid, _ = db.add_subscription("G", "https://a.com/f", "源名", 60)
+        db.set_subscription_ai(sid, True)
+        db.mark_polled(sid, title="源名", mark_initialized=True)
+        sub = db.list_subscriptions("G")[0]
+
+        cfg = dataclasses.replace(
+            cfg_stub(), ai_api_key="k", summary_chars=400,
+        )
+        entry = E("k1", "英文标题", "https://a.com/1", None, "导语", ())
+
+        # --- 正常路径（默认 **不抓文章页**）---
+        http = FakeHttp(article="正文" * 200, reply='{"title":"中文标题","summary":"摘要","translated":true}')
+        got = await prepare_digests(db, cfg, http, None, sub, [entry])
+        check("★ 正常路径拿到摘要", "k1" in got and got["k1"].title == "中文标题", repr(got))
+        check("★ 默认不抓文章页（AI_FETCH_ARTICLE 默认 false）", http.gets == [], repr(http.gets))
+        check("调了一次模型", len(http.posts) == 1, repr(http.posts))
+        check("★ 缓存已落库", db.get_ai_cache("k1") is not None, repr(db.get_ai_cache("k1")))
+
+        # --- 默认关掉 thinking ---
+        payload = http.posts[0]
+        check("★ 默认关掉 thinking（DeepSeek 默认开着且档位 high）",
+              payload.get("thinking") == {"type": "disabled"}, repr(payload.get("thinking")))
+        check("temperature 仍带着（thinking 关掉之后它才生效）",
+              payload.get("temperature") == 0.3, repr(payload.get("temperature")))
+        check("response_format 是 json_object",
+              payload.get("response_format") == {"type": "json_object"}, repr(payload))
+
+        # --- 打开抓正文 ---
+        e_fetch = E("kfetch", "标题", "https://a.com/fetch", None, "导语", ())
+        http_f = FakeHttp(article="文章正文" * 100,
+                          reply='{"title":"T","summary":"S","translated":false}')
+        await prepare_digests(
+            db, dataclasses.replace(cfg, ai_fetch_article=True), http_f, None, sub, [e_fetch]
+        )
+        check("★ AI_FETCH_ARTICLE=true 时才抓文章页",
+              http_f.gets == ["https://a.com/fetch"], repr(http_f.gets))
+        check("★ 抓到的正文被喂给模型",
+              "文章正文" in http_f.posts[0]["messages"][1]["content"],
+              http_f.posts[0]["messages"][1]["content"][:120])
+
+        # --- 缓存命中：**一次调用都不该有** ---
+        http2 = FakeHttp(article="x", reply="{}")
+        got2 = await prepare_digests(db, cfg, http2, None, sub, [entry])
+        check("★ 缓存命中不重复调用", http2.posts == [] and http2.gets == [],
+              f"gets={http2.gets} posts={http2.posts}")
+        check("★ 缓存命中仍返回摘要", got2.get("k1") is not None, repr(got2))
+
+        # --- 日上限 ---
+        e2 = E("k2", "另一条", "https://a.com/2", None, "导语", ())
+        db.bump_ai_count(__import__("qq_rss_bot.quota", fromlist=["today"]).today(),
+                         cfg.ai_daily_limit)
+        http3 = FakeHttp(article="正文" * 200, reply='{"title":"T","summary":"S"}')
+        got3 = await prepare_digests(db, cfg, http3, None, sub, [e2])
+        check("★ 撞上日上限就不再调用", http3.posts == [], repr(http3.posts))
+        check("★ 撞上限时静默返回（不抛、不丢推送）", got3 == {}, repr(got3))
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        sid, _ = db.add_subscription("G", "https://a.com/f", "源名", 60)
+        db.set_subscription_ai(sid, True)
+        sub = db.list_subscriptions("G")[0]
+        cfg = dataclasses.replace(cfg_stub(), ai_api_key="k")
+
+        # --- 抓正文失败 → 退回 RSS 导语，仍然调模型（翻译标题还有用）---
+        e = E("k9", "English title", "https://a.com/9", None, "RSS 导语内容", ())
+        http = FakeHttp(reply='{"title":"中文","summary":"S","translated":true}', get_raises=True)
+        got = await prepare_digests(db, cfg, http, None, sub, [e])
+        check("★ 抓不到正文时仍能翻译标题", got.get("k9") is not None, repr(got))
+        check("★ 抓不到正文时把 RSS 导语喂给模型",
+              "RSS 导语内容" in json.dumps(http.posts, ensure_ascii=False), repr(http.posts)[:200])
+
+        # --- AI_DISABLE_THINKING=false 时不能带 thinking 字段 ---
+        # （非 DeepSeek 的 OpenAI 兼容端点不认它，OpenAI 会直接 400）
+        e_th = E("kth", "T", "https://a.com/th", None, "导语", ())
+        http_th = FakeHttp(reply='{"title":"T","summary":"S","translated":false}')
+        await prepare_digests(
+            db, dataclasses.replace(cfg, ai_disable_thinking=False), http_th, None, sub, [e_th]
+        )
+        check("★ AI_DISABLE_THINKING=false 时不发 thinking 字段",
+              "thinking" not in http_th.posts[0], repr(http_th.posts[0].keys()))
+
+        # --- 模型挂了 → 静默 ---
+        e2 = E("k10", "T", "https://a.com/10", None, "导语", ())
+        http2 = FakeHttp(article="正文" * 100, reply="", post_raises=True)
+        got2 = await prepare_digests(db, cfg, http2, None, sub, [e2])
+        check("★ 模型超时 → 静默返回，不抛", got2 == {}, repr(got2))
+
+        # --- 没配 key → 一次请求都不发 ---
+        e3 = E("k11", "T", "https://a.com/11", None, "导语", ())
+        http3 = FakeHttp(article="x", reply="{}")
+        got3 = await prepare_digests(
+            db, dataclasses.replace(cfg, ai_api_key=""), http3, None, sub, [e3]
+        )
+        check("★ 没配 key 时一次请求都不发",
+              got3 == {} and http3.gets == [] and http3.posts == [],
+              f"{http3.gets} {http3.posts}")
+
+        # --- 源没开 AI → 一次请求都不发 ---
+        db.set_subscription_ai(sid, False)
+        sub_off = db.list_subscriptions("G")[0]
+        http4 = FakeHttp(article="x", reply="{}")
+        got4 = await prepare_digests(db, cfg, http4, None, sub_off, [e3])
+        check("★ 源没开 AI 时一次请求都不发",
+              got4 == {} and http4.gets == [] and http4.posts == [],
+              f"{http4.gets} {http4.posts}")
+        db.close()
+
+
+async def _check_ai_command() -> None:
+    """`/ai` 和 `/sub --ai` 的接线。"""
+    import inspect
+
+    from qq_rss_bot import commands as cmds
+    from qq_rss_bot.commands import COMMAND_ALIASES, COMMAND_METHODS, CommandHandler
+
+    check("★ /ai 已注册", COMMAND_ALIASES.get("ai") == "ai", repr(COMMAND_ALIASES.get("ai")))
+    check("★ /ai 挂到了方法上",
+          COMMAND_METHODS.get("ai") == "_ai"
+          and hasattr(CommandHandler, "_ai"), repr(COMMAND_METHODS.get("ai")))
+    check("★ /ai 是管理员指令", "ai" in cmds.RESTRICTED_CANONICAL, repr(cmds.RESTRICTED_CANONICAL))
+    from qq_rss_bot.ai import DEFAULT_MODEL
+
+    # `deepseek-chat` 已经退役（2026-10-18 查官方定价页）。写错模型名是
+    # **静默降级** —— 症状是「开了 AI 却什么都没变」，所以钉住这一条。
+    check("★ 默认模型是 deepseek-flash（deepseek-chat 已退役）",
+          DEFAULT_MODEL == "deepseek-flash", DEFAULT_MODEL)
+
+    # 启动自检那句话**不能自带 `AI 摘要：` 前缀** —— 调用方会加，
+    # 两边都写就成了 `AI 摘要：AI 摘要：已配置…`（实测在日志里看到过）。
+    from qq_rss_bot.ai import probe as ai_probe
+
+    line = ai_probe("k", configured=True, model=DEFAULT_MODEL)
+    check("★ 自检句不带重复前缀（日志里出现过 AI 摘要：AI 摘要：）",
+          not line.startswith("AI 摘要"), line)
+    check("自检句报出模型名（模型名写错是静默降级）",
+          DEFAULT_MODEL in line, line)
+    check("没配 key 时也说得清楚",
+          "没配" in ai_probe("", configured=False) or "未配置" in ai_probe("", configured=False),
+          ai_probe("", configured=False))
+    check("★ 别名表里每个方法都真的存在（加了别名忘挂方法就是死路）",
+          all(hasattr(CommandHandler, m) for m in COMMAND_METHODS.values()),
+          repr([m for m in COMMAND_METHODS.values() if not hasattr(CommandHandler, m)]))
+
+    src = inspect.getsource(cmds.CommandHandler._sub)
+    check("★ /sub 认 --ai", '"--ai"' in src, "源码里没有 --ai")
+    check("★ --ai 会被摘出位置参数（不能当成 URL 或间隔）",
+          'a.lower() != "--ai"' in src, src[:200])
+
+
+_check_ai_parse()
+_check_ai_extract()
+_check_ai_format()
+asyncio.run(_check_ai_pipeline())
+asyncio.run(_check_ai_command())
+
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

@@ -91,7 +91,7 @@ uv run python scripts/integration.py  # 15 项：端到端（真抓源，假推�
 **为什么地址要改**：容器里的 `127.0.0.1` 是容器自己，不是宿主机。两个服务都进容器后，
 bot 必须用 Docker 服务名访问 RSSHub。忘了改的症状是抓取全部超时。
 
-**代理只给 RSSHub，绝不能给 bot**：部分上游（实测 `www.v2ex.com`、`github.com`）
+**代理默认只给 RSSHub**：部分上游（实测 `www.v2ex.com`、`github.com`）
 国内直连不通——v2ex 的 DNS 被污染，解析到 Facebook 的 IP 段——需要走代理。
 但只有 RSSHub 需要；国内站走代理实测没有延迟代价，所以可以全局走。
 
@@ -107,10 +107,15 @@ bot 必须用 Docker 服务名访问 RSSHub。忘了改的症状是抓取全部�
       - HTTP_PROXY=          # 显式清空，防止容器级代理被继承进来
       - HTTPS_PROXY=
       - NO_PROXY=localhost,127.0.0.1,rsshub,api.sgroup.qq.com,bots.qq.com
+      - MEDIA_PROXY=http://<你的代理地址>:6152   # 只给 YouTube / X 用
 ```
 
-**bot 一旦走代理，`http://rsshub:1200` 就会失败**——那是容器内部的服务名，代理解析不了。
-而且 bot 的命脉 `api.sgroup.qq.com` 是国内站，直连更快更稳，没必要多一层依赖。
+**bot 的默认出口不能整体走代理**：`http://rsshub:1200` 是容器内部的服务名，
+代理解析不了；而 bot 的命脉 `api.sgroup.qq.com` 是国内站，直连更快更稳。
+
+唯一的例外是 **`MEDIA_PROXY`**——它只作用于 YouTube / X 那**一个**客户端
+（`preview.make_client` 建的 `media_http`），因为那两个站点直连完全不通。
+两个客户端是分开的，配了它不影响 RSSHub 和 QQ。
 
 详细评估（目标机实机规格、内存账、容器网络实测、四个迁移坑）见
 [`docs/synology-migration.md`](docs/synology-migration.md)。
@@ -120,7 +125,7 @@ bot 必须用 Docker 服务名访问 RSSHub。忘了改的症状是抓取全部�
 | 指令 | 权限 | 说明 |
 |---|---|---|
 | `/rss` | 所有人 | **按钮菜单**：订阅/退订/列表/搜索都能点 |
-| `/sub <路由或URL> [间隔分钟]` | 群主/管理员 | 订阅，默认 15 分钟。RSSHub 路由可省略域名，如 `/36kr/newsflashes` |
+| `/sub <路由或URL> [间隔分钟] [--ai]` | 群主/管理员 | 订阅，默认 15 分钟。RSSHub 路由可省略域名，如 `/36kr/newsflashes`。加 `--ai` 同时打开 AI 摘要 |
 | `/unsub <编号>` | 群主/管理员 | 取消订阅 |
 | `/list` | 所有人 | 本群订阅列表 |
 | `/find <关键词>` | 所有人 | 搜 RSSHub 路由，不用记路径 |
@@ -129,6 +134,7 @@ bot 必须用 Docker 服务名访问 RSSHub。忘了改的症状是抓取全部�
 | `/pause <编号>` | 群主/管理员 | 暂停订阅，暂停期间不抓取也不推送 |
 | `/resume <编号>` | 群主/管理员 | 恢复暂停的订阅（失败计数一并清零） |
 | `/interval <编号> <分钟>` | 群主/管理员 | 改抓取间隔，**不用退订重订**（重订会重建 baseline 丢增量） |
+| `/ai <编号> on\|off` | 群主/管理员 | 给某个源开/关 AI 摘要（抓正文 + 翻译/精简）。不带参数列状态 |
 | `/ping` | 所有人 | 存活检测 + 统计 |
 | `/help` | 所有人 | 帮助 |
 
@@ -305,8 +311,9 @@ BILIBILI_PREVIEW=true     # false 关掉
 根本没法查。启动时还会自检一次并写进日志：
 
 ```
-bilibili 预览已启用；出站代理环境变量 {'HTTP_PROXY': '', 'HTTPS_PROXY': ''}
 bilibili 预览连通性自检：✅ 正常（BV15eJt6pEam 【中字熟肉】气象厅の狠活！…）
+YouTube / X 预览走代理 http://192.168.0.63:6152
+YouTube / X 预览连通性自检：YouTube ✅ Rick Astley - Never ；X ✅ "No one is born hati
 ```
 
 看到 ❌ 就是容器出网有问题（DNS / 代理 / 证书），不用再往下查了。
@@ -320,6 +327,109 @@ bilibili 预览连通性自检：✅ 正常（BV15eJt6pEam 【中字熟肉】气
 - 封面走 bilibili 图床的缩略图（原图 214KB → 33KB），由 QQ 平台自己下载转存。
 - 想先看看渲染效果再决定发不发，用 `scripts/probe_bilibili.py`（默认只打印，
   加 `--send <group_openid>` 才真发）。
+
+### 群里分享 YouTube / X(Twitter) 链接
+
+同样的机制：群里任何人发一条 YouTube 或 X 链接，机器人自动回一条
+（带封面的那种）。
+
+```
+Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)
+Rick Astley
+03:33 · 播放 18.3亿
+https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+```bash
+YOUTUBE_PREVIEW=true
+TWITTER_PREVIEW=true
+PREVIEW_MULTI_IMAGE=true   # 推文多图 → 连发多条（不占主动配额）
+RSS_MULTI_IMAGE=true       # 一条资讯多图 → 连发多条（每张各占一条配额）
+PUSH_SUMMARY=true          # 推送文案带 RSS 摘要（关掉退回三行）
+MEDIA_PROXY=http://192.168.0.63:6152   # 必填，见下
+```
+
+#### 为什么非得自己下载图片
+
+**这两个站点的图，QQ 的服务器拉不到。** 实测（同一时刻、同一个群、同一个接口）：
+
+| 图床 | 交给 QQ 去下载 | 结果 |
+|---|---|---|
+| `i1.hdslb.com` | ✅ | 拿到 `file_info` |
+| `i.ytimg.com` | ❌ | `850027 富媒体文件上传超时`（err_code 40034003）|
+
+`40034003` 是**超时**，不是 404 也不是 DNS 失败——QQ 的机房够得到域名、拉不下
+内容。所以「能不能给 QQ 一个 URL 让它自己下」取决于 **QQ 机房到那个图床的
+连通性，我们控制不了**。这两个站点因此换了一条路：
+
+    我们自己下载（走代理）→ base64 → 交给 QQ 的 /files 接口
+
+这条路同样实测过（32771 字节的图 → 43696 字节 base64 → 上传成功拿到
+`file_info`）。代价是**我们这边必须能出网**，所以 `MEDIA_PROXY` 是必填项——
+容器直连这两个站点全部超时。
+
+#### 为什么发的是「富媒体消息」而不是 bilibili 那种卡片
+
+QQ 的 markdown 语法里的 `![](url)`，图片**同样是 QQ 的服务器自己去下载的**，
+所以它带不了这两个站点的图。富媒体消息（`msg_type=7`）的图是我们上传的字节，
+不经过 QQ 的下载环节。所以：**有封面走富媒体，没封面才退回 markdown 卡片**。
+
+#### 一条消息只能带一张图
+
+网上流传「一条消息可以有 5 个以内的富文本」——**官方文档里没有这条**。
+`MediaInfo` 只有一个 `file_info` 字段，所以 `msg_type=7` 一条消息 = 一个媒体文件。
+真要一次发多张，只能递增 `msg_seq` 连发多条被动回复（文档明确支持，代价是刷屏），
+或者退回 markdown 的多个 `![](url)`（图片又得 QQ 自己去下载，不可靠）。
+
+#### 多图：连发多条，不是一个开关管全部
+
+一条消息塞不下两张（`MediaInfo` 只有一个 `file_info`），所以多图是**连发多条**：
+第一条带正文和首图，后面每条一张图。推文的多张配图和 RSS 一条资讯的多张配图
+都走这条路，最多 4 张。
+
+两个开关**分开控制**，因为代价差一个量级：
+
+| 开关 | 默认 | 管哪条路 | 代价 |
+|---|---|---|---|
+| `PREVIEW_MULTI_IMAGE` | `true` | 群里分享的 YouTube / X | 被动回复，**不占主动配额** |
+| `RSS_MULTI_IMAGE` | `true` | 定时推送 + `/new` | 主动消息，**每张图各占一条配额** |
+
+后面几条图的文案是「（图 2/4）」这种占位 —— 一条 `msg_type=7` 只能带一个媒体，
+正文和首图已经用掉了那一条，所以多出来的图只能各带一句短文案。
+
+RSS 那条一条带 4 张图的资讯就是 4 条配额（群维度 20 条/分钟 + 每日上限）。
+觉得刷屏就关掉对应的那个 —— **只关 RSS 那条**是常见的选择，预览那条不占配额。
+
+连发中间某张被 QQ 用 `500 消息发送异常，请稍后重试` 拒掉时（实测遇到过），
+会自动隔 1 秒重试一次；重试仍失败就跳过那一张，**不会把整条拖回去重发**。
+第一条（带正文那条）实在发不出去才会退回纯文字卡片。
+
+#### 大图的上限是 3.5MB，不是 5MB
+
+`file_data` 官方限 5M，而**限的是 base64 之后那一串**，不是原始字节。base64
+膨胀 4/3，所以原始图最多约 3.75MiB，代码里取 3.5MB（`preview.MAX_IMAGE_BYTES`）。
+超过这个尺寸会**只发文字不发图** —— 推文的图我们坚持要原图，但图大到传不上去时，
+卡片本身不会跟着丢。
+
+取数也分了两条路（详见 `src/qq_rss_bot/preview.py` 顶部）：
+
+| | 主 | 兜底 |
+|---|---|---|
+| YouTube | `youtubei/player`——有时长和播放量 | oEmbed——**没有这两项** |
+| X | fxtwitter——正文/互动数/配图一次给全 | 官方 oEmbed——**没有图，也没有互动数** |
+
+X 之所以用第三方 fxtwitter：官方 oEmbed 只给作者名和正文（正文还藏在 html 的
+blockquote 里），官方 syndication 实测本机直接连不上。
+
+几个已知行为：
+
+- **不做去重**：同一条链接发两遍就回两遍；一条消息里含多个链接只回第一个。
+- 封面**下载失败或上传失败都会降级成不带图的卡片**，文字一条不少。
+- 推文配图取 `name=small`（原图动辄 2MB，base64 之后更大）。
+- 想单独验证这条链路（不碰 QQ、不发消息）：
+  ```bash
+  sudo docker compose exec bot python scripts/probe_meta.py --proxy http://<代理>:6152
+  ```
 
 ### 主动消息的限流与配额
 
@@ -357,6 +467,7 @@ bilibili 预览连通性自检：✅ 正常（BV15eJt6pEam 【中字熟肉】气
 | 订阅连续失败被暂停 | 连续 5 次抓取失败（`MAX_FAIL_BEFORE_PAUSE`） |
 | 全部源同时失败 | 一整轮里**所有**订阅都抓取失败 → 多半是 RSSHub 或网络挂了 |
 | 每日配额用尽 | 当天主动消息发满 |
+| **配图发送失败** | 图没发出去（已重试一次）或首图就挂、整条退回纯文字 |
 
 #### 收件人：默认自动登记，推荐改成白名单
 
@@ -391,6 +502,8 @@ NOTIFY_OPENIDS=<你的openid>
   也不把错误刷进群。
 - **同类消息按 key 冷却 30 分钟**。RSSHub 一挂是所有源一起挂，
   不冷却就是 DM 风暴（实测 5 个源会连发 5 条一模一样的通知，冷却后只发 1 条）。
+  配图失败用的是 `imgfail:<群>` 这一个 key，**不带条目** —— 一条资讯 4 张图
+  全挂只会报 1 次。代价是 30 分钟内的后续失败只进日志。
 - **撤了管理员就摘掉**。自动登记模式下，某人若在登记表里但下次说话时
   角色已不是 owner/admin，会把他删掉 —— 否则被撤权的人会一直收到私聊。
 
@@ -502,9 +615,76 @@ QQ 官方机器人有**两个容易混淆的东西**：
 3. **配图失败自动退回纯文字**。图片抠不到、或 QQ 拉不到那张图（源站挂了、防盗链、太大），
    都不会让这条新闻丢失，会降级成纯文字再发一次。
 
+## 推送文案
+
+每条推送是「源名 / 标题 / 摘要 / 链接」四行，摘要来自 RSS 的
+`<description>`（Atom 是 `<summary>`）：
+
+```
+📰 少数派
+· 某篇文章的标题
+  这里是摘要正文，HTML 标签会被剥掉，超长截到 150 字
+  https://sspai.com/post/12345
+```
+
+- **摘要常常就是标题本身**（很多源的 `<description>` 直接放标题），这种会被
+  自动去掉，不会出现标题下面又一行一样的字；拿不出内容的源就不加这一行。
+- 关掉摘要：`.env` 里 `PUSH_SUMMARY=false`，退回「源名 / 标题 / 链接」三行。
+
+## AI 摘要（可选，按源开关）
+
+RSS 的 `<description>` 只是一段导语，**长度由源决定**。实测同一时刻 10 个路由：
+
+| 少数派 | Solidot | 36氪快讯 | V2EX | Hacker News |
+|---|---|---|---|---|
+| 3914 字 | 368 | 162 | 93 | **32** |
+
+V2EX / Hacker News 只给了标题，光靠 feed 永远拼不出正文。打开 AI 摘要后，
+推送会变成：
+
+```
+📰 TechCrunch
+· OpenAI 发布 GPT-7
+  模型会写 3~5 句中文摘要，说清楚发生了什么、为什么值得看。
+  https://techcrunch.com/...
+```
+
+**不附原标题** —— 曾经附过一行 `原题：…`，实测一条消息里标题/原题/摘要/链接
+四段，群里一屏放不下，而原题的信息量最低。
+
+开启方式（**默认全关**，因为会按次计费）：
+
+```bash
+DEEPSEEK_API_KEY=sk-...
+DEEPSEEK_MODEL=deepseek-flash      # 默认值，可省
+```
+
+```text
+/sub /hackernews/best 60 --ai     订阅并打开
+/ai 2 on                          给已有的第 2 个源打开
+/ai                               列出现在哪些源开着
+```
+
+- **默认只用 RSS 的 `<description>`，不去抓文章页**（`AI_FETCH_ARTICLE=false`）。
+  很多源的导语本身就是全文（少数派 3914 字），再抓一遍是白花一次请求和几秒延迟。
+  只有 V2EX / Hacker News 这种「导语只有标题」的源才值得设 `AI_FETCH_ARTICLE=true`。
+  开了之后抓不到正文（付费墙 / JS 渲染 / 反爬）也会静默退回导语，照样翻译标题。
+- **默认关掉模型的 thinking**（`AI_DISABLE_THINKING=true`）。DeepSeek 的 thinking
+  默认开着且档位是 high，摘要这种抽取式任务不需要推理链 —— 开着多花 output token
+  还每次多等 2~5 秒。顺带：**thinking 模式下 `temperature` 是无效的**。
+- **模型名要对着官方文档核**：`deepseek-chat` 已退役，现在是 `deepseek-flash`
+  （默认）和 `deepseek-v4-pro`。写错不会报错，只会静默退回 RSS 文案。
+- **同一篇文章只付一次钱**：结果落库缓存，`/new` 重读、别的群订到同一篇都命中缓存。
+- **日上限 `AI_DAILY_LIMIT`（默认 200，全局计）**，超了自动退回 RSS 文案。
+- 模型走 `DEEPSEEK_BASE_URL`，任何 **OpenAI 协议兼容**的端点都行；
+  **不要让它走 `MEDIA_PROXY`**（国内直连 0.2 秒，走代理反而更慢）。
+
+想先确认某个源能不能抓正文：`uv run python scripts/probe_ai.py <文章URL>`，
+加 `--call` 才真的调模型。
+
 ## 推送配图
 
-条目正文里的第一张图会被抠出来当配图（`rss.first_image()`），支持 RSS 的
+条目正文里的图会被抠出来当配图（`rss.all_images()`，最多 4 张），支持 RSS 的
 `description` 和 Atom 的 `content[]`，也能处理扩展名藏在 query 里的 URL。
 
 - 发图是**两步**：先 `post_group_file(url=图片地址)` 拿 `file_info`，再
@@ -648,9 +828,12 @@ src/qq_rss_bot/
   menu.py        消息按钮（keyboard）菜单的构造与校验
   autosub.py     进群自动订阅
   bilibili.py    群里分享的 bilibili 链接 → 卡片（含四种分享形态的说明）
+  preview.py     群里分享的 YouTube / X 链接 → 卡片（含为什么图要 base64 上传）
   bot.py         botpy 客户端，事件 → 指令/轮询
 scripts/
   smoke.py            离线逻辑 + 真实抓取
   integration.py      端到端（假推送，不碰 QQ）
   probe_bilibili.py   看 bilibili 链接会被渲染成什么（默认不发消息）
+  probe_meta.py       探 YouTube / X 的接口在容器里通不通（不碰 QQ）
+  probe_media.py      探 QQ 的服务器拉不拉得到某个图片 URL
 ```

@@ -61,6 +61,25 @@ CREATE TABLE IF NOT EXISTS notify_targets (
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (group_openid, member_openid)
 );
+
+-- AI 摘要的缓存。键是 `Entry.key`（guid > link > 标题+时间），
+-- **跨订阅共用**：同一篇文章被两个群订到只付一次钱。
+-- 落库而不是放内存：`/new` 手动拉取会把同一批文章再走一遍，
+-- 进程一重启缓存就没了的话那笔钱等于白花。
+CREATE TABLE IF NOT EXISTS ai_cache (
+    entry_key  TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    summary    TEXT NOT NULL,
+    translated INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+-- AI 调用的**全局**每日计数（不是每群 —— 花的是我们自己的钱）。
+-- 缓存命中不计数。
+CREATE TABLE IF NOT EXISTS ai_counters (
+    day   TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # 老库缺的列。本项目没有成套迁移框架，但「加一列」这类向前兼容的改动
@@ -68,6 +87,8 @@ CREATE TABLE IF NOT EXISTS notify_targets (
 # no such column。改类型 / 删列仍然要手工处理。
 _MIGRATIONS: list[tuple[str, str, str]] = [
     ("subscriptions", "fail_count", "INTEGER NOT NULL DEFAULT 0"),
+    # AI 摘要按源开关。**默认 0** —— 这个功能会花钱，必须是显式打开的。
+    ("subscriptions", "ai_enabled", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -91,6 +112,9 @@ class Subscription:
     # 暂停的订阅不参与轮询（due_subscriptions 里已经有 WHERE enabled = 1，
     # 但在此之前项目里没有任何代码能把它设成 0）
     enabled: bool = True
+    # 这个源要不要走「抓正文 + AI 翻译/摘要」。**默认关**：会花钱，
+    # 而且对 36氪快讯这种「162 字就是全文」的源纯属浪费。
+    ai_enabled: bool = False
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> "Subscription":
@@ -105,6 +129,9 @@ class Subscription:
             last_error=row["last_error"],
             fail_count=row["fail_count"] if "fail_count" in row.keys() else 0,
             enabled=bool(row["enabled"]),
+            ai_enabled=(
+                bool(row["ai_enabled"]) if "ai_enabled" in row.keys() else False
+            ),
         )
 
 
@@ -316,6 +343,73 @@ class Database:
     def prune_send_counters(self, keep_days: int = 7) -> None:
         self._conn.execute(
             "DELETE FROM send_counters WHERE day < date('now', ?)",
+            (f"-{int(keep_days)} day",),
+        )
+        self._conn.commit()
+
+    # ---------- AI 摘要 ----------
+
+    def set_subscription_ai(self, sub_id: int, enabled: bool) -> None:
+        self._conn.execute(
+            "UPDATE subscriptions SET ai_enabled = ? WHERE id = ?",
+            (1 if enabled else 0, sub_id),
+        )
+        self._conn.commit()
+
+    def get_ai_cache(self, entry_key: str):
+        """缓存命中返回 `(title, summary, translated)`，没有返回 None。"""
+        row = self._conn.execute(
+            "SELECT title, summary, translated FROM ai_cache WHERE entry_key = ?",
+            (entry_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row["title"], row["summary"], bool(row["translated"]))
+
+    def put_ai_cache(
+        self, entry_key: str, title: str, summary: str, translated: bool
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO ai_cache (entry_key, title, summary, translated, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (entry_key) DO UPDATE SET
+                title = excluded.title,
+                summary = excluded.summary,
+                translated = excluded.translated
+            """,
+            (entry_key, title, summary, 1 if translated else 0, utcnow()),
+        )
+        self._conn.commit()
+
+    def prune_ai_cache(self, keep_days: int = 30) -> None:
+        """缓存会一直长。30 天足够覆盖「同一篇文章被两个群先后订到」。"""
+        self._conn.execute(
+            "DELETE FROM ai_cache WHERE created_at < datetime('now', ?)",
+            (f"-{int(keep_days)} day",),
+        )
+        self._conn.commit()
+
+    def ai_count(self, day: str) -> int:
+        row = self._conn.execute(
+            "SELECT count FROM ai_counters WHERE day = ?", (day,)
+        ).fetchone()
+        return int(row["count"]) if row else 0
+
+    def bump_ai_count(self, day: str, n: int = 1) -> int:
+        self._conn.execute(
+            """
+            INSERT INTO ai_counters (day, count) VALUES (?, ?)
+            ON CONFLICT (day) DO UPDATE SET count = count + excluded.count
+            """,
+            (day, n),
+        )
+        self._conn.commit()
+        return self.ai_count(day)
+
+    def prune_ai_counters(self, keep_days: int = 7) -> None:
+        self._conn.execute(
+            "DELETE FROM ai_counters WHERE day < date('now', ?)",
             (f"-{int(keep_days)} day",),
         )
         self._conn.commit()

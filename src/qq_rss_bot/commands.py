@@ -14,6 +14,7 @@ from typing import Protocol
 
 import httpx
 
+from . import ai
 from .config import Config
 from .db import Database, Subscription
 from .menu import (
@@ -27,8 +28,15 @@ from .menu import (
 )
 from .rss import Entry, FeedResult, fetch_feed, resolve_url
 from .routes import format_hits, load_index
+from .notify import Notifier, NullNotifier
 from .quota import QuotaExceeded
-from .scheduler import Pusher, format_entry
+from .scheduler import (
+    IMAGE_FAILURE_KEY_PREFIX,
+    format_entry,
+    image_failure_message,
+    prepare_digests,
+    send_entry_images,
+)
 
 _log = logging.getLogger("qq_rss_bot.commands")
 
@@ -117,13 +125,15 @@ HELP_TEXT = """RSS 订阅机器人
 /pause <编号>                      暂停某个订阅
 /resume <编号>                     恢复暂停的订阅
 /interval <编号> <分钟>            改抓取间隔，不用退订重订
+/ai <编号> on|off                  给某个源开/关 AI 摘要（抓正文 + 翻译/精简）
 /ping                              存活检测
 /help                              本说明
 
 订阅是按群共享的：群里任何人订阅，全群都会收到推送。
-/sub /unsub /pause /resume /interval 仅群主和管理员可用。
+/sub /unsub /pause /resume /interval /ai 仅群主和管理员可用。
 
 例：/sub /36kr/newsflashes 30
+    /sub /hackernews/best 60 --ai    订阅并打开 AI 摘要
 
 新群会被自动订上默认源（AUTO_SUBSCRIBE_FEED），不用手动配。"""
 
@@ -154,6 +164,8 @@ COMMAND_ALIASES = {
     "恢复": "resume",
     "interval": "interval",
     "间隔": "interval",
+    "ai": "ai",
+    "摘要": "ai",
     "ping": "ping",
     "rss": "rss",
     "菜单": "rss",
@@ -174,13 +186,16 @@ COMMAND_METHODS = {
     "pause": "_pause",
     "resume": "_resume",
     "interval": "_interval",
+    "ai": "_ai",
     "ping": "_ping",
     "rss": "_rss",
 }
 
 # 只有群主/管理员能用的指令。**从别名表派生**，加别名不会漏 ——
 # 曾经是手工列 {"sub","subscribe","订阅",...}，漏一个中文别名就等于没限制。
-RESTRICTED_CANONICAL = frozenset({"sub", "unsub", "pause", "resume", "interval"})
+RESTRICTED_CANONICAL = frozenset(
+    {"sub", "unsub", "pause", "resume", "interval", "ai"}
+)
 RESTRICTED_TOKENS = frozenset(
     token
     for token, canonical in COMMAND_ALIASES.items()
@@ -258,6 +273,8 @@ class CommandHandler:
         db: Database,
         http: httpx.AsyncClient,
         pusher: Pusher | None = None,
+        notifier: Notifier | None = None,
+        ai_http: httpx.AsyncClient | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db
@@ -266,6 +283,12 @@ class CommandHandler:
         # 所以把推送出口也接进来，而不是在指令层另写一套发消息的代码。
         # 测试里传 None 也能跑，_new 会回一句「不支持」。
         self.pusher = pusher
+        # 配图没发出去时私聊告警。`/new` 是**有人正盯着群**的场景，看起来不像
+        # 需要私聊 —— 但配图失败在群里只表现为「少了一张」，很容易被当成
+        # 「这条本来就没图」，和定时推送是同一个盲区。
+        self.notifier: Notifier = notifier or NullNotifier()
+        # 抓正文时直连失败才会用到的备用客户端（走代理）。
+        self.ai_http = ai_http
         self._routes = None  # 路由表懒加载，进程内常驻
         self._last_new: dict[str, float] = {}  # /new 的每群冷却
 
@@ -365,8 +388,11 @@ class CommandHandler:
         await ctx.reply(build_rss_text(subs))
 
     async def _sub(self, ctx: CommandContext, args: list[str]) -> None:
+        # `--ai` 可以在任意位置，先摘出去 —— 剩下的才是位置参数
+        want_ai = any(a.lower() == "--ai" for a in args)
+        args = [a for a in args if a.lower() != "--ai"]
         if not args:
-            await ctx.reply("用法：/sub <RSSHub路由或URL> [间隔分钟]")
+            await ctx.reply("用法：/sub <RSSHub路由或URL> [间隔分钟] [--ai]")
             return
 
         url = resolve_url(args[0], self.cfg.rsshub_base)
@@ -418,6 +444,9 @@ class CommandHandler:
             await ctx.reply(f"本群已经订阅过了：{result.title or url}")
             return
 
+        if want_ai:
+            self.db.set_subscription_ai(sub_id, True)
+
         # 把当前已有条目全部登记为已见，之后只推增量
         self.db.filter_new_entries(sub_id, [e.key for e in result.entries])
         self.db.mark_polled(sub_id, title=result.title, mark_initialized=True)
@@ -426,10 +455,20 @@ class CommandHandler:
         # 所以位置就是当前条数。直接用 sub_id 会泄漏全局自增主键：
         # 一个从没订阅过的新群，第一条会显示成「5.」。
         pos = self.db.count_subscriptions(ctx.group_openid)
+        tail = "，只推新内容。"
+        if want_ai:
+            if self.cfg.ai_api_key:
+                tail = "，只推新内容。\n已打开 AI 摘要：推送会带上译文标题和精简摘要。"
+            else:
+                # 开了但没配 key 是最容易困惑的状态 —— 明明打开了却什么都没变。
+                tail = (
+                    "，只推新内容。\n⚠️ AI 摘要已记为开启，但 **DEEPSEEK_API_KEY "
+                    "没配**，实际不会生效。"
+                )
         await ctx.reply(
             f"订阅成功，编号 {pos}\n"
             f"{result.title or url}\n"
-            f"当前 {len(result.entries)} 条，每 {interval // 60} 分钟检查一次，只推新内容。"
+            f"当前 {len(result.entries)} 条，每 {interval // 60} 分钟检查一次{tail}"
         )
 
     async def _unsub(self, ctx: CommandContext, args: list[str]) -> None:
@@ -624,6 +663,59 @@ class CommandHandler:
             f"{pos}. {sub.title or sub.url} 的间隔已改为 {minutes} 分钟，立刻生效。"
         )
 
+    async def _ai(self, ctx: CommandContext, args: list[str]) -> None:
+        """给单个源开关 AI 摘要。
+
+        **不带参数就是列状态** —— 「哪些源开了」这个问题不该逼用户去翻 .env。
+        """
+        if not args:
+            subs = self.db.list_subscriptions(ctx.group_openid)
+            if not subs:
+                await ctx.reply("本群还没有订阅，先用 /sub 订一个。")
+                return
+            lines = ["AI 摘要状态（用 /ai <编号> on|off 改）："]
+            for i, sub in enumerate(subs, start=1):
+                mark = "✅ 开" if sub.ai_enabled else "⬜ 关"
+                lines.append(f"{mark}  {i}. {(sub.title or sub.url)[:30]}")
+            if not self.cfg.ai_api_key:
+                lines.append("\n⚠️ DEEPSEEK_API_KEY 没配，开了也不会生效。")
+            lines.append("\n开了之后推送会抓正文并翻译/精简，按次计费（有日上限）。")
+            await ctx.reply("\n".join(lines))
+            return
+
+        if len(args) < 2:
+            await ctx.reply("用法：/ai <编号> on|off\n例：/ai 2 on   （编号用 /list 查）")
+            return
+        picked = self._pick(ctx.group_openid, args[0])
+        if picked is None:
+            await ctx.reply("编号不对，先用 /list 看本群订阅的编号。")
+            return
+        raw = args[1].strip().lower()
+        if raw in ("on", "开", "1", "true", "yes"):
+            enabled = True
+        elif raw in ("off", "关", "0", "false", "no"):
+            enabled = False
+        else:
+            await ctx.reply("第二个参数只能是 on 或 off。")
+            return
+
+        pos, sub = picked
+        self.db.set_subscription_ai(sub.id, enabled)
+        if not enabled:
+            await ctx.reply(f"{pos}. {sub.title or sub.url} 的 AI 摘要已关闭。")
+            return
+        if not self.cfg.ai_api_key:
+            await ctx.reply(
+                f"{pos}. {sub.title or sub.url} 已记为开启，"
+                f"但 **DEEPSEEK_API_KEY 没配**，实际不会生效。"
+            )
+            return
+        await ctx.reply(
+            f"{pos}. {sub.title or sub.url} 的 AI 摘要已开启。\n"
+            f"下次推送会先抓正文，再交给 {self.cfg.ai_model} 翻译/精简。\n"
+            f"抓不到正文（付费墙 / JS 渲染）就退回 RSS 原本的文案。"
+        )
+
     def _parse_new_args(
         self, subs: list[Subscription], args: list[str]
     ) -> tuple[list[Subscription], int] | str:
@@ -750,19 +842,44 @@ class CommandHandler:
             lines.append(f"（{failed} 个源抓取失败）")
         await ctx.reply("\n".join(lines))
 
+        # AI 摘要**先整批备好**再开始发 —— 逐条现算的话，第 2 条要等前一条
+        # 抓完正文调完模型（3~8 秒），用户会觉得机器人卡死了。
+        digests: dict[int, dict[str, ai.Digest]] = {}
+        for sub, _result, entries in shown:
+            if entries:
+                digests[sub.id] = await prepare_digests(
+                    self.db, self.cfg, self.http, self.ai_http, sub, entries
+                )
+
         seen: dict[int, list[str]] = {}
         sent = 0
         quota_hit = False
+        # 整轮攒着、收尾报一次 —— 每条报一次虽然会被冷却压掉，但日志里
+        # 会多出一串「没发出去」的噪音。
+        img_failed: list[str] = []
+        img_total = 0
         for sub, result, entries in shown:
             for entry in entries:
                 if sent:
                     await asyncio.sleep(_NEW_GAP_SEC)
                 sent += 1
-                text = format_entry(result.title, sub.url, entry)
+                text = format_entry(
+                    result.title,
+                    sub.url,
+                    entry,
+                    with_summary=self.cfg.push_summary,
+                    summary_chars=self.cfg.summary_chars,
+                    digest=digests.get(sub.id, {}).get(entry.key),
+                )
                 ok = False
-                if self.cfg.attach_images and entry.image:
+                images = entry.images if self.cfg.rss_multi_image else entry.images[:1]
+                if self.cfg.attach_images and images:
                     try:
-                        await self.pusher.send_rich(ctx.group_openid, text, entry.image)
+                        failed_urls = await send_entry_images(
+                            self.pusher, ctx.group_openid, text, images
+                        )
+                        img_total += len(images)
+                        img_failed.extend(failed_urls)
                         ok = True
                     except QuotaExceeded as exc:
                         # 配额是整批级别的状态，不能当成「这张图坏了」退回纯文字 ——
@@ -778,7 +895,11 @@ class CommandHandler:
                         quota_hit = True
                         break
                     except Exception as exc:  # noqa: BLE001 —— QQ 拉不到图/图太大都可能
-                        _log.warning("配图失败，退回纯文字 (%s): %s", entry.image, exc)
+                        _log.warning("配图失败，退回纯文字 (%s): %s", images[0], exc)
+                        # 首图就挂 → 这类图一张都发不出去，退回纯文字后
+                        # 群里看起来和「这条本来没图」一模一样，必须报。
+                        img_total += len(images)
+                        img_failed.append(images[0])
                 if quota_hit:
                     break
                 if not ok:
@@ -810,6 +931,17 @@ class CommandHandler:
                     break
             if quota_hit:
                 break
+
+        if img_failed:
+            await self.notifier.notify(
+                ctx.group_openid,
+                image_failure_message(
+                    f"{len(img_failed)}/{img_total} 张没发出去（每张已重试一次）",
+                    "来源：/new 手动拉取",
+                    img_failed,
+                ),
+                key=f"{IMAGE_FAILURE_KEY_PREFIX}{ctx.group_openid}",
+            )
 
         for sub_id, keys in seen.items():
             self.db.mark_seen(sub_id, keys)

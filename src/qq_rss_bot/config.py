@@ -9,6 +9,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# 默认值只在 ai.py 里写一份，免得两边漂
+from . import ai as ai_module
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -23,6 +26,15 @@ def _env_list(name: str) -> tuple[str, ...]:
     """逗号或空白分隔的列表。空值 → 空元组（= 不启用该功能）。"""
     raw = os.environ.get(name) or ""
     return tuple(part for part in re.split(r"[,\s]+", raw.strip()) if part)
+
+
+def _env_str(name: str, default: str) -> str:
+    """字符串环境变量。空串按「没配」处理 —— `.env.example` 里留空的那些
+    复制过来就是空串，不该被当成一个有效的值。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -76,6 +88,63 @@ class Config:
     # 走**被动回复**（不占主动消息配额）；关掉它不影响 RSS 推送。
     # 四种分享形态和实现见 bilibili.py 的模块说明。
     bilibili_preview: bool = True
+    # 群里有人分享 YouTube / X(Twitter) 链接时，同样自动回卡片。
+    # 这两个站点**容器直连不通**，必须配 media_proxy —— 没配或代理不通时
+    # 解析必然失败，调用方静默不发，不会连累 bilibili 和 RSS 推送。
+    youtube_preview: bool = True
+    twitter_preview: bool = True
+    # 一条分享带**多张图**。关掉就只发第一张，回到之前的行为。
+    # 两个场景的代价**完全不同，所以分成两个开关**：
+    #   · preview 那条走被动回复 —— 多图只多占几次回复额度，**不占主动配额**；
+    #   · RSS 那条是主动消息 —— **每张图各占一条配额**（20 条/分钟 + 每日上限），
+    #     一条带 4 张图的资讯就是 4 条。
+    # 觉得刷屏就关掉对应的那个，另一个不受影响。
+    preview_multi_image: bool = True
+    rss_multi_image: bool = True
+    # 推送文案里带不带 RSS 摘要。关掉就退回「源名 / 标题 / 链接」三行。
+    push_summary: bool = True
+    # 摘要显示多少字。**不是平台限制**（实测 40000 字符 QQ 照样收），
+    # 纯粹是可读性。
+    summary_chars: int = 400
+
+    # ===== AI 摘要（抓正文 + DeepSeek 翻译/精简）=====
+    # 按源开关，默认所有源都是关的（`subscriptions.ai_enabled`）。
+    # key 留空 = 整个功能关掉，不报错。
+    ai_api_key: str = ""
+    ai_base_url: str = ai_module.DEFAULT_BASE_URL
+    ai_model: str = ai_module.DEFAULT_MODEL
+    # **全局**日调用上限，不是每群。花的是我们自己的钱，所以要有个总数兜底。
+    # 缓存命中不计数（同一篇文章只付一次）。
+    ai_daily_limit: int = 200
+    # **默认不抓文章页。** 很多源的 `<description>` 本身就是全文
+    # （实测少数派 3914 字），再抓一遍纯属浪费一次请求和几秒延迟。
+    # 只有当源的导语明显短于正文（V2EX / Hacker News 那种只给标题的）才值得开。
+    ai_fetch_article: bool = False
+    # DeepSeek 的 thinking 默认开着且档位是 high。翻译+摘要不需要推理链，
+    # 开着白白多花 output token 和多等几秒。非 DeepSeek 端点若不认这个字段
+    # （OpenAI 会 400），设成 false。
+    ai_disable_thinking: bool = True
+    # 抓正文的超时。付费墙 / JS 渲染的站点会拖满这个时间，所以别设太长 ——
+    # 它在推送主循环里，等的是所有人的消息。
+    ai_fetch_timeout_sec: int = 15
+    # 调模型的超时。
+    ai_timeout_sec: int = 30
+    # 访问被墙站点（YouTube / X）用的出站代理，如 http://192.168.0.63:6152。
+    # **留空 = 直连**（那两个功能自然失效，其余一切照常）。
+    # 只给 media_http 用 —— rss_http 保持直连：RSSHub 是容器内部服务名
+    # （http://rsshub:1200），代理解析不了；QQ 的接口在国内直连更快。
+    media_proxy: str = ""
+    # ⚠️ Surge 这类**会做 MITM 的代理**必须配下面两个之一，否则 YouTube 全线
+    # `CERTIFICATE_VERIFY_FAILED: self-signed certificate`（实测：`www.youtube.com`
+    # 被 Surge 重签了，而 `i.ytimg.com` / `api.fxtwitter.com` 没有 —— 所以症状是
+    # 「图能下、接口全挂」，很有迷惑性）。
+    #
+    # `MEDIA_CA_BUNDLE` = 把代理的根证书导出成 PEM 放进来（**推荐**）。
+    # 容器里路径要写挂载后的（如 /app/data/surge-ca.pem）。
+    media_ca_bundle: str = ""
+    # `MEDIA_INSECURE_TLS=true` = 干脆不校验证书。**逃生舱，不是首选** ——
+    # 它让这两个站点的流量完全裸奔。只在拿不到代理根证书时用。
+    media_insecure_tls: bool = False
 
 
 def load_config() -> Config:
@@ -118,4 +187,21 @@ def load_config() -> Config:
         auto_subscribe_feed=(os.environ.get("AUTO_SUBSCRIBE_FEED") or "").strip(),
         log_file=(os.environ.get("LOG_FILE") or "").strip(),
         bilibili_preview=_env_bool("BILIBILI_PREVIEW", True),
+        youtube_preview=_env_bool("YOUTUBE_PREVIEW", True),
+        twitter_preview=_env_bool("TWITTER_PREVIEW", True),
+        preview_multi_image=_env_bool("PREVIEW_MULTI_IMAGE", True),
+        rss_multi_image=_env_bool("RSS_MULTI_IMAGE", True),
+        push_summary=_env_bool("PUSH_SUMMARY", True),
+        summary_chars=_env_int("SUMMARY_CHARS", 400),
+        ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),
+        ai_base_url=_env_str("DEEPSEEK_BASE_URL", ai_module.DEFAULT_BASE_URL),
+        ai_model=_env_str("DEEPSEEK_MODEL", ai_module.DEFAULT_MODEL),
+        ai_daily_limit=_env_int("AI_DAILY_LIMIT", 200),
+        ai_fetch_article=_env_bool("AI_FETCH_ARTICLE", False),
+        ai_disable_thinking=_env_bool("AI_DISABLE_THINKING", True),
+        ai_fetch_timeout_sec=_env_int("AI_FETCH_TIMEOUT_SEC", 15),
+        ai_timeout_sec=_env_int("AI_TIMEOUT_SEC", 30),
+        media_proxy=(os.environ.get("MEDIA_PROXY") or "").strip(),
+        media_ca_bundle=(os.environ.get("MEDIA_CA_BUNDLE") or "").strip(),
+        media_insecure_tls=_env_bool("MEDIA_INSECURE_TLS", False),
     )

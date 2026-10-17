@@ -12,17 +12,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 from typing import Awaitable, Protocol
 
 import httpx
 
+from . import ai
 from .config import Config
 from .db import Database, Subscription, utcnow
 from .notify import Notifier, NullNotifier
-from .quota import Pusher, QuotaExceeded
+from .quota import Pusher, QuotaExceeded, today
 from .rss import Entry, fetch_feed
 
-__all__ = ["Pusher", "QuotaExceeded", "FeedPoller", "format_entry"]
+__all__ = [
+    "Pusher",
+    "QuotaExceeded",
+    "FeedPoller",
+    "format_entry",
+    "prepare_digests",
+]
 
 _log = logging.getLogger("qq_rss_bot.scheduler")
 
@@ -32,17 +40,261 @@ _MAX_CONTENT = 1500
 # 二是让客户端收到的顺序稳定（并发发出时到达顺序不保证）
 _PUSH_GAP_SEC = 0.4
 
+# AI 摘要的并发数。抓正文 ~2s + 调模型 ~3s，3 条并发大概 5 秒能备好一批；
+# 再高意义不大（DeepSeek 那边也会限流），而且会把 RSSHub 那条链路挤到。
+_AI_CONCURRENCY = 3
+
 
 def _truncate(text: str) -> str:
     return text if len(text) <= _MAX_CONTENT else text[: _MAX_CONTENT - 1] + "…"
 
 
-def format_entry(feed_title: str | None, url: str, entry: Entry) -> str:
-    """单条新闻的推送文案：源名 + 标题 + 链接。"""
-    lines = [f"📰 {feed_title or url}", f"· {entry.title}"]
+# 摘要进推送文案的长度上限，可用 `SUMMARY_CHARS` 覆盖。
+#
+# **这个数不是平台限制。** 2026-10-18 实测 `scripts/probe_textlen.py`：
+# 中文文本 40000 字符 QQ 照样收（HTTP 200）。真正的约束是**可读性** ——
+# 群里一条消息超过一屏就没人看了，那还发它干什么。
+#
+# 400 是「一段完整的导语」的典型长度（36氪/少数派这类源的 `<description>`
+# 大致在这个量级），再长就该上「抓正文 + 摘要」那条路了。
+MAX_SUMMARY_CHARS = 400
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _summary_line(entry: Entry, limit: int = MAX_SUMMARY_CHARS) -> str:
+    """摘要那一行。拿不出有信息量的内容就返回空串（宁可不加这一行）。"""
+    text = (entry.summary or "").strip()
+    if not text:
+        return ""
+    # 很多源把标题原样塞进 `<description>`，照抄会变成标题下面又一行同样的字。
+    # 剥掉开头那次再判断。
+    if text.startswith(entry.title):
+        text = text[len(entry.title) :].lstrip(" -—–·:：|")
+    if not text or text == entry.title:
+        return ""
+    return _clip(text, limit)
+
+
+def format_entry(
+    feed_title: str | None,
+    url: str,
+    entry: Entry,
+    *,
+    with_summary: bool = True,
+    summary_chars: int = MAX_SUMMARY_CHARS,
+    digest: "ai.Digest | None" = None,
+) -> str:
+    """单条新闻的推送文案：源名 + 标题 +（摘要）+ 链接。
+
+    **摘要这一行是 2026-10-18 补的。** 在此之前 `Entry.summary` 从 RSS 里
+    抓出来、洗完标签、存进对象，然后**一行都没用过** —— 群里看到的永远是
+    光秃秃的「源名 / 标题 / 链接」，用户直接问「是不是 RSS 省略了」。
+    不是省略，是我们没发。
+
+    `with_summary=False` 是给 `PUSH_SUMMARY` 开关用的，不是给调用方随手传的。
+
+    给了 `digest`（AI 处理过的）就用它的标题和摘要，**完全盖掉** RSS 那份。
+
+    **不附原标题。** 曾经附过一行 `原题：…`（理由是翻译会丢人名和产品名），
+    实测发出来太长 —— 一条消息里标题、原题、摘要、链接四段，群里一屏放不下，
+    而原题的信息量最低。`Digest.translated` 现在只用来写日志。
+    """
+    lines = [f"📰 {feed_title or url}"]
+    if digest is not None:
+        lines.append(f"· {digest.title}")
+        if digest.summary:
+            lines.append(f"  {_clip(digest.summary, summary_chars)}")
+    else:
+        lines.append(f"· {entry.title}")
+        if with_summary:
+            summary = _summary_line(entry, summary_chars)
+            if summary:
+                lines.append(f"  {summary}")
     if entry.link:
         lines.append(f"  {entry.link}")
     return _truncate("\n".join(lines))
+
+
+# 单条发送失败后的重试间隔。QQ 会用 `500` + `50035006 消息发送异常，请稍后重试`
+# 拒掉连发里的某一条（实测多图时**第 3 张**撞上过）。它自己说可重试，那就隔
+# 一下再试一次 —— **只重试一次**是有意的，再多就是把偶发失败换成刷屏。
+IMAGE_RETRY_GAP = 1.0
+
+
+async def send_with_retry(send, content: str, url: str) -> None:
+    """发一条图文，失败就隔 `IMAGE_RETRY_GAP` 秒重试**一次**。
+
+    `send` 是「已经绑好目标」的可调用对象：RSS 侧传
+    `functools.partial(pusher.send_rich, group_openid)`，预览侧直接传
+    `reply_rich` —— 两边签名不同，绑定交给调用方。
+
+    `QuotaExceeded` 直接抛：配额用完是整批级别的状态，重试没有意义。
+    """
+    for attempt in (1, 2):
+        try:
+            await send(content, url)
+            return
+        except QuotaExceeded:
+            raise
+        except Exception:
+            if attempt == 2:
+                raise
+            _log.info("发送失败，%.1f 秒后重试一次: %s", IMAGE_RETRY_GAP, url)
+            await asyncio.sleep(IMAGE_RETRY_GAP)
+
+
+# 配图失败私聊的冷却键前缀。**只带群号、不带条目** —— `C2CNotifier` 对同一个
+# key 有 30 分钟冷却，所以一条资讯 4 张全挂不会变成 4 条私聊，RSSHub 抽风
+# 批量失败也不会变成 DM 风暴。代价是冷却窗口内的后续失败只进日志。
+# 定时推送和链接预览**共用同一个 key**：两个入口同时出问题时报一次就够了。
+IMAGE_FAILURE_KEY_PREFIX = "imgfail:"
+
+
+def image_failure_message(reason: str, headline: str, failed: list[str]) -> str:
+    """配图失败私聊的正文。三个调用点（定时推送 / 链接预览 / `/new`）共用这一份 ——
+    各写一份的话，「已重试一次」这种细节迟早只在一边更新。
+
+    `reason` 由调用方给：**失败的形状不止一种**（部分图掉了 / 首图就挂导致整条
+    退回纯文字），统一措辞会把两种情况说成一样。
+    """
+    sample = "\n".join(f"· {u}" for u in failed[:3])
+    more = f"\n…还有 {len(failed) - 3} 张" if len(failed) > 3 else ""
+    return f"⚠️ 配图发送失败：{reason}\n{headline}\n{sample}{more}"
+
+
+async def send_entry_images(
+    pusher: Pusher, group_openid: str, text: str, images: "tuple[str, ...] | list[str]"
+) -> None:
+    """把一条资讯连同它的**全部配图**发出去。
+
+    第一条带正文和首图，其余每条一张图、正文用 `（图 2/4）` 占位 ——
+    QQ 一条富媒体消息只能带一个媒体（`MediaInfo` 只有单个 `file_info`），
+    多图只能靠连发。
+
+    **失败语义是分开的，这点很重要**：
+
+    * **第一条**失败会抛出去 —— 调用方据此退回纯文字（原有行为）；
+    * **后续**某张失败只记日志、跳过。正文那时候已经发出去了，再抛一次
+      会让调用方以为整条没发成，退回纯文字等于**重复刷屏**；
+    * `QuotaExceeded` 一律穿透 —— 配额是整批级别的状态，不该被当成
+      「这张图坏了」（这条踩过，见 CLAUDE.md 的限流那节）。
+
+    返回**没发出去**的图片 URL（空列表 = 全成功）。调用方拿它去私聊告警 ——
+    配图失败在群里是**看不见**的，读者只会觉得「这条怎么少了两张图」。
+    """
+    failed: list[str] = []
+    total = len(images)
+    send = partial(pusher.send_rich, group_openid)
+    await send_with_retry(send, text, images[0])
+    for index, url in enumerate(images[1:], start=2):
+        try:
+            await send_with_retry(send, f"（图 {index}/{total}）", url)
+        except QuotaExceeded:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 单张图掉了不该拖垮整条
+            _log.warning("第 %d/%d 张配图失败，跳过 (%s): %s", index, total, url, exc)
+            failed.append(url)
+    return failed
+
+
+async def prepare_digests(
+    db: Database,
+    cfg: Config,
+    http: httpx.AsyncClient,
+    ai_http: httpx.AsyncClient | None,
+    sub: Subscription,
+    entries: list[Entry],
+) -> "dict[str, ai.Digest]":
+    """给这一批条目并发备好 AI 摘要。返回 `{entry.key: Digest}`。
+
+    **为什么必须预取**：抓正文 ~2 秒 + 调模型 ~3 秒，逐条现算的话 5 条
+    就是半分钟，而这半分钟里群里的其他推送全在排队。并发备好之后，
+    推送循环本身的节奏一点没变。
+
+    **为什么失败是静默的**：这条路任何一环挂掉（没配 key、抓不到正文、
+    模型超时、JSON 烂掉）都只是「这条没有 AI 摘要」，退回 RSS 原本的文案。
+    绝不能让一条推送因为摘要失败而消失。
+    """
+    if not (sub.ai_enabled and cfg.ai_api_key):
+        return {}
+    out: dict[str, ai.Digest] = {}
+    sem = asyncio.Semaphore(_AI_CONCURRENCY)
+
+    async def one(entry: Entry) -> None:
+        async with sem:
+            got = await digest_for(db, cfg, http, ai_http, entry)
+        if got is not None:
+            out[entry.key] = got
+
+    await asyncio.gather(*(one(e) for e in entries))
+    return out
+
+async def digest_for(
+    db: Database,
+    cfg: Config,
+    http: httpx.AsyncClient,
+    ai_http: httpx.AsyncClient | None,
+    entry: Entry,
+) -> "ai.Digest | None":
+    """单条：查缓存 → 抓正文 → 调模型。任何一步失败都返回 None。"""
+    cached = db.get_ai_cache(entry.key)
+    if cached is not None:
+        title, summary, translated = cached
+        return ai.Digest(title=title, summary=summary, translated=translated)
+
+    day = today()
+    if db.ai_count(day) >= cfg.ai_daily_limit:
+        _log.warning(
+            "ai：今日调用已达上限 %d，这条退回 RSS 原文案（改 AI_DAILY_LIMIT 可放宽）",
+            cfg.ai_daily_limit,
+        )
+        return None
+
+    text = ""
+    # **默认不抓文章页**（`AI_FETCH_ARTICLE=false`）。很多源的 `<description>`
+    # 本身就是全文 —— 实测少数派 3914 字、Solidot 368 —— 再抓一遍纯属浪费
+    # 一次请求和几秒延迟。只有 V2EX / Hacker News 那种「只给标题」的源才值得开。
+    if cfg.ai_fetch_article and entry.link:
+        text = await ai.fetch_article(
+            http,
+            entry.link,
+            timeout=cfg.ai_fetch_timeout_sec,
+            proxy_http=ai_http,
+        )
+    # 抓不到正文不算失败 —— RSS 的导语照样能让它翻译标题、写出摘要，
+    # 只是信息量少一些。真要一句都没有才放弃。
+    if not text:
+        text = entry.summary or ""
+    if not text and not entry.title:
+        return None
+
+    # **先计数再调用**：失败也要计。模型那边已经收到请求了，
+    # 而且失败通常意味着我们的代码有问题，不计数的话会一直重试烧钱。
+    db.bump_ai_count(day)
+
+    got = await ai.digest(
+        http,
+        api_key=cfg.ai_api_key,
+        title=entry.title,
+        text=text,
+        base_url=cfg.ai_base_url,
+        model=cfg.ai_model,
+        timeout=cfg.ai_timeout_sec,
+        disable_thinking=cfg.ai_disable_thinking,
+    )
+    if got is not None:
+        db.put_ai_cache(entry.key, got.title, got.summary, got.translated)
+        _log.info(
+            "ai：%s → %s（输入 %d 字，%s）",
+            entry.title[:30],
+            "已翻译" if got.translated else "原文",
+            len(text),
+            "文章页" if cfg.ai_fetch_article else "RSS 导语",
+        )
+    return got
 
 
 class FeedPoller:
@@ -54,11 +306,15 @@ class FeedPoller:
         pusher: Pusher,
         notifier: Notifier | None = None,
         quota=None,
+        ai_http: httpx.AsyncClient | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db
         self.http = http
         self.pusher = pusher
+        # 抓文章正文用的**备用**客户端（走代理）。直连失败才会用到 ——
+        # 国内的源走代理又慢又可能撞 MITM 证书问题，不能一上来就代理。
+        self.ai_http = ai_http
         # 出错时私聊管理员。默认空实现，测试里不用管。
         self.notifier: Notifier = notifier or NullNotifier()
         # 有 .exhausted(group) 的对象（GroupSender）。可空 —— 不传就没有提前检查，
@@ -236,6 +492,30 @@ class FeedPoller:
             )
             return True
 
+    async def _report_image_failures(
+        self,
+        group_openid: str,
+        reason: str,
+        feed_title: str | None,
+        entry: Entry,
+        failed: list[str],
+    ) -> None:
+        """配图没发出去 → 私聊告警。
+
+        为什么要报：**群里看不出来**。读者只会觉得「这条怎么少了两张图」，
+        而我们会一直以为发成功了 —— 第 3 张一直发不出去这件事就是这么发现的
+        （翻 NAS 日志才看见）。
+
+        冷却键见 `IMAGE_FAILURE_KEY_PREFIX`。
+        """
+        await self.notifier.notify(
+            group_openid,
+            image_failure_message(
+                reason, f"源：{feed_title or '-'}\n条目：{entry.title}", failed
+            ),
+            key=f"{IMAGE_FAILURE_KEY_PREFIX}{group_openid}",
+        )
+
     async def _push_entries(
         self, sub: Subscription, feed_title: str | None, entries: list[Entry]
     ) -> list[Entry]:
@@ -250,22 +530,54 @@ class FeedPoller:
         配额是整批级别的状态，交给 `_poll_one` 统一处理。
         """
         pushed: list[Entry] = []
+        digests = await prepare_digests(
+            self.db, self.cfg, self.http, self.ai_http, sub, entries
+        )
         for index, entry in enumerate(entries):
             if index:
                 await asyncio.sleep(_PUSH_GAP_SEC)
-            text = format_entry(feed_title, sub.url, entry)
+            text = format_entry(
+                feed_title,
+                sub.url,
+                entry,
+                with_summary=self.cfg.push_summary,
+                summary_chars=self.cfg.summary_chars,
+                digest=digests.get(entry.key),
+            )
 
-            if self.cfg.attach_images and entry.image:
+            images = entry.images if self.cfg.rss_multi_image else entry.images[:1]
+            if self.cfg.attach_images and images:
                 try:
-                    await self.pusher.send_rich(sub.group_openid, text, entry.image)
+                    failed = await send_entry_images(
+                        self.pusher, sub.group_openid, text, images
+                    )
                     pushed.append(entry)
+                    if failed:
+                        await self._report_image_failures(
+                            sub.group_openid,
+                            f"{len(failed)}/{len(images)} 张没发出去（每张已重试一次）",
+                            feed_title,
+                            entry,
+                            failed,
+                        )
                     continue
                 except QuotaExceeded:
                     raise
                 except Exception as exc:
                     # 配图失败（QQ 拉不到图 / 图太大 / 格式不支持）不该让整条新闻丢失，
                     # 退回纯文字再发一次
-                    _log.warning("配图推送失败，退回纯文字 (%s): %s", entry.image, exc)
+                    _log.warning("配图推送失败，退回纯文字 (%s): %s", images[0], exc)
+                    # **这条路更要报。** 部分图掉了只是「少一张」，而首图就挂
+                    # 意味着这个源/这类图**一张都发不出去** —— 症状是全文字，
+                    # 看起来和「这条本来没图」一模一样。
+                    # 只报首图：后面几张根本没试过，算进去就是编数字。
+                    await self._report_image_failures(
+                        sub.group_openid,
+                        f"首图就发不出去，整条已退回纯文字（共 {len(images)} 张）",
+                        feed_title,
+                        entry,
+                        [images[0]],
+                    )
 
             try:
                 await self.pusher.send_text(sub.group_openid, text)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import itertools
 import logging
 import os
@@ -11,7 +13,7 @@ import botpy
 import httpx
 from botpy.message import GroupMessage
 
-from . import bilibili
+from . import ai, bilibili, preview
 from .autosub import AutoSubscriber
 from .commands import (
     ADMIN_ROLES,
@@ -24,7 +26,12 @@ from .config import Config
 from .db import Database
 from .notify import C2CNotifier
 from .quota import GroupSender
-from .scheduler import FeedPoller
+from .scheduler import (
+    IMAGE_FAILURE_KEY_PREFIX,
+    FeedPoller,
+    image_failure_message,
+    send_with_retry,
+)
 
 _log = logging.getLogger("qq_rss_bot.bot")
 
@@ -47,6 +54,16 @@ class RssBot(botpy.Client):
             headers={"User-Agent": _USER_AGENT},
             follow_redirects=True,
         )
+        # YouTube / X 专用的出站客户端 —— **只有它走代理**。
+        # 别把两个合并：rss_http 必须直连（RSSHub 是容器内部服务名
+        # `http://rsshub:1200`，代理解析不了；QQ 的接口直连也更快），
+        # 而这两个站点**必须**走代理（容器直连全部超时）。
+        # 为什么非走代理不可、为什么图要 base64 上传，见 preview.py 的模块说明。
+        self.media_http = preview.make_client(
+            cfg.media_proxy,
+            ca_bundle=cfg.media_ca_bundle,
+            insecure=cfg.media_insecure_tls,
+        )
         # 主动消息的节流与配额。scheduler 用信号量**并发**跑多个源的推送循环，
         # 靠每个循环内部逐条 sleep 的间隔根本挡不住（实测 5 个源同时有内容时
         # 25 条全落在 1.6 秒内，而群维度频控是 20 条/分钟）。
@@ -59,7 +76,14 @@ class RssBot(botpy.Client):
         )
         # 出错走私聊，不在群里报错。配了 NOTIFY_OPENIDS 就只发给名单上的人。
         self.notifier = C2CNotifier(self, self.db, allowlist=cfg.notify_openids)
-        self.commands = CommandHandler(cfg, self.db, self.rss_http, self.sender)
+        self.commands = CommandHandler(
+            cfg,
+            self.db,
+            self.rss_http,
+            self.sender,
+            notifier=self.notifier,
+            ai_http=self.media_http,
+        )
         # 进群自动订阅。cfg.auto_subscribe_feed 留空时 enabled 为假，整个功能关掉。
         self.autosub = AutoSubscriber(cfg, self.db, self.sender)
         self.poller = FeedPoller(
@@ -69,6 +93,9 @@ class RssBot(botpy.Client):
             self.sender,
             notifier=self.notifier,
             quota=self.sender,
+            # 抓文章正文时直连失败才会用到它。**和 media_http 是同一个对象**：
+            # 它本来就是「给被墙站点用的客户端」，语义一致，不必再建一个。
+            ai_http=self.media_http,
         )
         self._poller_task: Any = None
 
@@ -76,7 +103,7 @@ class RssBot(botpy.Client):
 
     async def on_ready(self) -> None:
         _log.info("机器人「%s」已上线", self.robot.name)
-        await self._announce_bilibili()
+        await self._announce_previews()
         # 轮询器和 botpy 共用一个事件循环，在 on_ready 里挂上去最省事
         if self._poller_task is None:
             self._poller_task = self.loop.create_task(
@@ -106,34 +133,74 @@ class RssBot(botpy.Client):
                         "在群里 @ 一次机器人让平台把群号报过来，之后重启就会自动订上。）"
                     )
 
-    async def _announce_bilibili(self) -> None:
-        """启动时把「bilibili 预览到底能不能用」写进日志。
+    async def _announce_previews(self) -> None:
+        """启动时把「分享预览到底能不能用」写进日志。
 
         加这个是因为线上真的踩到了：群里发了链接**毫无反应**，而日志里
         也**毫无痕迹** —— 失败路径当时全是 DEBUG，INFO 下什么都看不到，
         排查只能靠猜。启动先探一次，把结论钉在日志里。
 
-        顺带把出站代理环境变量打出来。容器的网络和宿主机不是一回事，
-        实测宿主机上那个 Python 的 urllib 会莫名走 Surge，而容器不会 ——
-        所以别拿宿主机的结果推断容器，看这里的实测输出。
+        bilibili 走直连的 `rss_http`，YouTube / X 走带代理的 `media_http` ——
+        两条路的连通性完全独立，所以分开报，别把结论互相套用。
         """
-        if not self.cfg.bilibili_preview:
+        if self.cfg.bilibili_preview:
+            # 探测最多 6 秒，放在 on_ready 里等它 —— 启动慢几秒没关系，
+            # 换来的是一条能直接判读的结论。
+            _log.info("bilibili 预览连通性自检：%s", await bilibili.probe(self.rss_http))
+        else:
             _log.info("bilibili 预览已关闭（BILIBILI_PREVIEW=false）")
-            return
-        proxied = sorted(k for k in os.environ if k.lower().endswith("_proxy"))
+
+        # AI 摘要：**不在这里发请求**，每次启动花一次调用太浪费。
+        # 只报「配没配、提取器是哪个」—— 「为什么这个源没有摘要」的答案
+        # 基本就在这两句里。
         _log.info(
-            "bilibili 预览已启用；出站代理环境变量 %s",
-            {k: os.environ[k] for k in proxied} or "（无）",
+            "AI 摘要：%s",
+            ai.probe(
+                self.cfg.ai_api_key,
+                configured=bool(self.cfg.ai_api_key),
+                fetch_article=self.cfg.ai_fetch_article,
+                model=self.cfg.ai_model,
+            ),
         )
-        # 探测最多 6 秒，放在 on_ready 里等它 —— 启动慢几秒没关系，
-        # 换来的是一条能直接判读的结论。
-        _log.info("bilibili 预览连通性自检：%s", await bilibili.probe(self.rss_http))
+        if self.cfg.ai_api_key:
+            _log.info(
+                "AI 摘要用 %s（%s），日上限 %d 次",
+                self.cfg.ai_model,
+                self.cfg.ai_base_url,
+                self.cfg.ai_daily_limit,
+            )
+
+        if not (self.cfg.youtube_preview or self.cfg.twitter_preview):
+            _log.info("YouTube / X 预览已关闭")
+            return
+        # 代理没配 = **必然全挂**，而且挂得很安静（静默不回消息）。直接说破，
+        # 省得又去猜「为什么群里发了 YouTube 链接没反应」。
+        if not self.cfg.media_proxy:
+            _log.warning(
+                "YouTube / X 预览已启用，但 **MEDIA_PROXY 没配** —— "
+                "容器直连这两个站点全部超时，必然全部解析失败。"
+                "在 .env 里配上（如 MEDIA_PROXY=http://192.168.0.63:6152）再重启。"
+            )
+        else:
+            _log.info("YouTube / X 预览走代理 %s", self.cfg.media_proxy)
+        result = await preview.probe(self.media_http)
+        _log.info("YouTube / X 预览连通性自检：%s", result)
+        if "❌" in result:
+            # 排查顺序写在这里，省得每次都要重新推一遍。
+            _log.warning(
+                "自检没过。排查顺序：① 代理本身通不通；"
+                "② **代理若做 MITM**（Surge 就是），要用 MEDIA_CA_BUNDLE 指到它的"
+                "根证书（或 MEDIA_INSECURE_TLS=true 兜底）—— 那个症状很有迷惑性："
+                "**图片能下、接口全挂**，因为 MITM 通常只重签 API 域名，"
+                "图床域名没碰。原始报错见上面 preview: 开头的 INFO 行。"
+            )
 
     async def close(self) -> None:
         self.poller.stop()
         if self._poller_task is not None:
             self._poller_task.cancel()
         await self.rss_http.aclose()
+        await self.media_http.aclose()
         self.db.close()
         await super().close()
 
@@ -185,7 +252,12 @@ class RssBot(botpy.Client):
         if not is_bot_mentioned(message.content, message.mentions, bot_name):
             # 只有真的没做任何事才记「忽略」——这行日志是当初发现
             # 「平台在推全量群消息」的线索，语义别改。
-            if not await self._preview_bilibili(message):
+            # 依次问两个预览。bilibili 在前 —— 它有四种分享形态（含没有链接
+            # 的小程序卡片），而 YouTube/X 只认纯文本里的链接，顺序不影响结果。
+            if not (
+                await self._preview_bilibili(message)
+                or await self._preview_media(message)
+            ):
                 _log.debug("忽略非 @ 消息: %r", message.content)
             return
         await self._handle_group_message(message)
@@ -217,7 +289,7 @@ class RssBot(botpy.Client):
                 # 配了 NOTIFY_OPENIDS 时登记表本来就不参与投递，这段是给默认路径兜底的。
                 _log.info("群 %s 摘掉已非管理员的通知对象 %s", message.group_openid, member_openid[:8])
                 self.db.remove_notify_target(message.group_openid, member_openid)
-        reply, reply_card = self._make_repliers(message)
+        reply, reply_card, _ = self._make_repliers(message)
         ctx = CommandContext(
             group_openid=message.group_openid,
             reply=reply,
@@ -268,7 +340,7 @@ class RssBot(botpy.Client):
                 )
                 return False
             # 非 @ 的消息不会有别人回，所以这条必定消耗 msg_seq=1，没有撞号风险
-            _reply, reply_card = self._make_repliers(message)
+            _reply, reply_card, _ = self._make_repliers(message)
             await reply_card(bilibili.render(data))
         except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
             # 对**群里**静默，但日志要留痕：没有这个栈，线上出问题只能靠猜
@@ -278,6 +350,171 @@ class RssBot(botpy.Client):
             "群 %s 分享了 bilibili %s，已回卡片", message.group_openid, data.get("bvid")
         )
         return True
+
+    async def _preview_media(self, message: GroupMessage) -> bool:
+        """非 @ 的群消息里有 YouTube / X 链接 → 回一条带封面的卡片。
+
+        返回是否**真的回了**（调用方据此决定要不要记「忽略非 @ 消息」）。
+
+        和 bilibili 那条路的关键区别在**发什么形态**：bilibili 走 markdown
+        卡片、图由 QQ 自己去 i1.hdslb.com 下载；这两个站点的图 QQ 拉不到
+        （实测 `850027 富媒体文件上传超时`），所以封面走「我们自己下载 →
+        base64 上传」，发**富媒体消息**。拿不到封面就退回 markdown 卡片
+        （没有图，但文字内容一样全）。
+
+        同样**全程静默**：解析不出来就什么都不发，异常全在这里吃掉 ——
+        冒到 botpy 的 `_run_event` 会打成 on_error，而这条路上的失败不值得报警。
+        """
+        try:
+            target = preview.find_target(message.content or "")
+            if target is None:
+                return False
+            if target.site == "youtube" and not self.cfg.youtube_preview:
+                return False
+            if target.site == "twitter" and not self.cfg.twitter_preview:
+                return False
+
+            _log.info("群 %s：认出 %s 分享 %s", message.group_openid, target.site, target.vid)
+            card = await preview.lookup(self.media_http, target)
+            if card is None:
+                # **这条必须看得见。** 具体原因由 preview.lookup 内部按 INFO 记。
+                _log.warning(
+                    "群 %s：认出了 %s 分享但没解析出来，不会回消息"
+                    "（多半是代理没配或不通，对照启动日志的自检结论）",
+                    message.group_openid,
+                    target.site,
+                )
+                return False
+
+            _reply, reply_card, reply_rich = self._make_repliers(message)
+            infos: list[str] = []
+            # 和 `infos` 一一对应：上传成功的那些 URL。少了它就没法说清
+            # 「失败的是哪一张」—— `infos[k]` 是第 k 个**成功**的，不是 `urls[k]`。
+            ok_urls: list[str] = []
+            failed: list[str] = []
+            cover_bytes = 0
+            if card.covers:
+                urls = card.covers if self.cfg.preview_multi_image else card.covers[:1]
+                # **并发下载、串行上传。** 下载走代理，4 张 1MB 的原图串行要
+                # 十几秒；上传是打 QQ 的接口，并发既没必要也可能触发频控。
+                # `fetch_image` 自己吞异常返回 None，所以 gather 不会炸。
+                raws = await asyncio.gather(
+                    *(preview.fetch_image(self.media_http, u) for u in urls)
+                )
+                for url, raw in zip(urls, raws):
+                    if not raw:
+                        failed.append(url)  # 下载失败 / 超 MAX_IMAGE_BYTES
+                        continue
+                    cover_bytes += len(raw)
+                    info = await self._upload_image(message.group_openid, raw)
+                    if info:
+                        infos.append(info)
+                        ok_urls.append(url)
+                    else:
+                        failed.append(url)  # base64 超 5M 或 /files 被拒
+
+            if infos:
+                # 第一条带正文，其余每条一张图。`reply_rich` 共用同一个 msg_seq
+                # 计数器（见 `_make_repliers`），所以这里顺序发就行。
+                # 每条都走 `send_with_retry`：QQ 会用 500 +「请稍后重试」拒掉
+                # 连发里的某一条（多图时实测撞上过）。
+                try:
+                    await send_with_retry(reply_rich, preview.render_text(card), infos[0])
+                except Exception:  # noqa: BLE001
+                    # 正文这条重试过还是发不出去 → 退回 markdown 卡片。
+                    # **别让这次分享变成「什么都没回」** —— 图丢了，文字还在。
+                    _log.warning("图文回复失败，退回 markdown 卡片", exc_info=True)
+                    await reply_card(preview.render_markdown(card))
+                    failed.extend(ok_urls)  # 一张都没送出去
+                else:
+                    for index, (info, url) in enumerate(
+                        zip(infos[1:], ok_urls[1:]), start=2
+                    ):
+                        try:
+                            await send_with_retry(
+                                reply_rich, f"（图 {index}/{len(infos)}）", info
+                            )
+                        except Exception:  # noqa: BLE001
+                            # **正文已经发出去了**，这里再抛会把整条拖去走
+                            # `except` 的「没回」分支，日志也跟着变成误导性的
+                            # 「预览失败」。后续某张图掉了就只丢那一张。
+                            _log.warning("第 %d 张配图回复失败，跳过", index, exc_info=True)
+                            failed.append(url)
+            else:
+                # 没有封面（推文本来就没图 / 下载失败 / 上传失败）→ markdown
+                # 卡片。这条路**不能带图**：markdown 的图片要 QQ 自己去下载，
+                # 而它够不到这两个站点的图床。
+                await reply_card(preview.render_markdown(card))
+        except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
+            _log.warning("YouTube/X 预览失败", exc_info=True)
+            return False
+
+        if failed:
+            # 和定时推送共用冷却键：两个入口同时出问题时报一次就够。
+            await self.notifier.notify(
+                message.group_openid,
+                image_failure_message(
+                    f"{len(failed)} 张没发出去（上传或发送失败）",
+                    f"来源：{card.site} 分享\n条目：{card.title}",
+                    failed,
+                ),
+                key=f"{IMAGE_FAILURE_KEY_PREFIX}{message.group_openid}",
+            )
+
+        # **封面字节数必须记。** 推文的图分 orig / large / medium / small 四档，
+        # 943KB 和 70KB 差 13 倍，而「已回图文卡片」四种情况长得一模一样 ——
+        # 只报结果不报尺寸的话，「发出去的到底是不是原图」这个问题在日志里
+        # **无法回答**（这个已经发生过一次，只能靠重发来补证据）。
+        # URL 也带上：档位就写在 `?name=` 里，扫一眼就能确认。
+        detail = (
+            f"，配图 {len(infos)} 张 {cover_bytes // 1024}KB {card.covers[0]}"
+            if infos
+            else ""
+        )
+        _log.info(
+            "群 %s 分享了 %s %s，已回%s%s",
+            message.group_openid,
+            target.site,
+            target.vid,
+            "图文卡片" if infos else "纯文字卡片",
+            detail,
+        )
+        return True
+
+    async def _upload_image(self, group_openid: str, raw: bytes) -> str | None:
+        """把图片字节交给 QQ，拿回 `file_info`。失败返回 None（调用方降级）。
+
+        **走 base64 而不是 URL**，原因见 preview.py 的模块说明：QQ 的服务器
+        拉不到 i.ytimg.com / pbs.twimg.com。`post_group_file` 能收 `file_data`
+        是靠 compat.py 的补丁三 —— botpy 原版签名里没有这个形参。
+
+        `file_data` 官方限 5M，**限的是 base64 之后那一串**，不是原始字节。
+        正常路径上 `preview.MAX_IMAGE_BYTES` 已经卡过一道，这里再挡一次是为了
+        让超限在日志里读作「图太大」而不是「上传失败」—— 两者的排查方向不同。
+        """
+        payload = base64.b64encode(raw).decode()
+        if len(payload) > preview.MAX_FILE_DATA_BYTES:
+            _log.warning(
+                "preview：原图 %d 字节 base64 后 %d 字节，超 QQ 的 5M 直传上限，这张不发图",
+                len(raw),
+                len(payload),
+            )
+            return None
+        try:
+            resp = await self.api.post_group_file(
+                group_openid=group_openid,
+                file_type=1,  # 1=图片
+                file_data=payload,
+                srv_send_msg=False,  # 只上传拿 file_info，不单独发一条
+            )
+        except Exception:  # noqa: BLE001 —— 上传失败只该让这张卡片没图
+            _log.warning("preview：上传封面失败", exc_info=True)
+            return None
+        file_info = resp.get("file_info") if isinstance(resp, dict) else None
+        if not file_info:
+            _log.warning("preview：上传封面没拿到 file_info: %r", resp)
+            return None
+        return str(file_info)
 
     def _make_repliers(self, message: GroupMessage):
         """被动回复的两个出口：纯文本 / 带按钮的 markdown。
@@ -324,7 +561,30 @@ class RssBot(botpy.Client):
             if code:
                 raise RuntimeError(f"发送按钮卡片失败 code={code}: {resp}")
 
-        return reply, reply_card
+        async def reply_rich(content: str, file_info: str) -> None:
+            """富媒体（图文）被动回复。
+
+            **必须和上面两个共用同一个 seq 计数器** —— 同一个 msg_id 下重复的
+            msg_seq 会被平台静默丢弃，症状是「偶尔不回复」，日志里什么都看不到。
+
+            走这条路而不是 markdown 卡片，是因为 **markdown 的 `![](url)` 要求
+            QQ 的服务器自己去下载那张图**，而它拉不到 i.ytimg.com /
+            pbs.twimg.com（见 preview.py 的模块说明）。富媒体的图是我们上传的
+            字节，不经过 QQ 的下载环节。
+            """
+            resp = await self.api.post_group_message(
+                group_openid=message.group_openid,
+                msg_type=7,  # 7=富媒体（图文）
+                msg_id=message.id,
+                msg_seq=next(seq),
+                content=content,
+                media={"file_info": file_info},
+            )
+            code = resp.get("code") if isinstance(resp, dict) else None
+            if code:
+                raise RuntimeError(f"发送富媒体消息失败 code={code}: {resp}")
+
+        return reply, reply_card, reply_rich
 
     async def on_c2c_message_create(self, message) -> None:
         """私聊。

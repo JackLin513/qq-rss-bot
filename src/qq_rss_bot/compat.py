@@ -14,7 +14,21 @@ botpy 的 ``GroupMessage._User`` 只取了 ``member_openid``，把报文里的
 ``author.member_role``（owner / admin / …）丢弃了。``/sub``、``/unsub``
 要做管理员限制就必须知道发起人角色，所以这里换成带角色的子类。
 
-两个补丁都利用同一个机制：``ConnectionState.__init__`` 用
+**补丁三：上传图片字节（``file_data``）。**
+botpy 的 ``post_group_file`` / ``post_c2c_file`` 只收 ``url``，由 **QQ 的服务器
+自己去下载**。但实测：QQ 的服务器**拉不到 ``i.ytimg.com``**（``850027 富媒体
+文件上传超时``，err_code 40034003），而同一时刻 ``i1.hdslb.com`` 是 ✅ ——
+也就是说「能不能用 URL 形态」完全取决于 QQ 机房到那个图床的连通性，
+**我们控制不了**。
+
+而 QQ 的接口**本来就收 base64 的 ``file_data``**（实测：32771 字节的图 →
+43696 字节 base64，上传成功并拿到 ``file_info``）—— 只是 botpy 的签名里没有
+这个形参，``payload = locals()`` 又只打包声明过的形参，所以传不进去。
+
+补上它之后，YouTube / X 的封面走「我们自己下载 → base64 上传」，
+不再依赖 QQ 够不够得到那个域名。
+
+三个补丁都利用同一个机制：``ConnectionState.__init__`` 用
 ``inspect.getmembers`` 收集所有 ``parse_*`` 方法建解析表，
 所以在 Client 建立连接之前替换类方法就会被自动注册。
 """
@@ -23,7 +37,9 @@ from __future__ import annotations
 
 import logging
 
+from botpy.api import BotAPI
 from botpy.connection import ConnectionState
+from botpy.http import Route
 from botpy.message import GroupMessage
 
 _log = logging.getLogger("qq_rss_bot.compat")
@@ -115,8 +131,8 @@ _PARSERS = (
 )
 
 
-def install_new_protocol_support() -> list[str]:
-    """安装两个补丁，返回本次实际替换了哪些解析器（幂等，重复调用返回空列表）。"""
+def _install_parsers() -> list[str]:
+    """补丁一 / 二：新协议事件名 + 群内角色。"""
     changed: list[str] = []
     for event, method in _PARSERS:
         current = getattr(ConnectionState, method, None)
@@ -124,9 +140,89 @@ def install_new_protocol_support() -> list[str]:
             continue
         setattr(ConnectionState, method, _make_parser(event))
         changed.append(method)
-
-    if changed:
-        _log.info("已替换 botpy 解析器：%s", "、".join(changed))
-    else:
-        _log.debug("botpy 解析器已是补丁版，跳过")
     return changed
+
+
+def _file_payload(
+    file_type: int,
+    url: str | None,
+    srv_send_msg: bool,
+    file_data: str | None,
+) -> dict:
+    """构造 ``/files`` 的请求体。
+
+    **显式构造，不用原版那个 ``locals()``。** 原版把 ``url=None`` 也打包进去，
+    而同时带 ``url: null`` 和 ``file_data`` 有被平台拒的风险 —— 二选一。
+    """
+    payload: dict = {"file_type": file_type, "srv_send_msg": srv_send_msg}
+    if file_data is not None:
+        payload["file_data"] = file_data
+    else:
+        payload["url"] = url
+    return payload
+
+
+async def _post_group_file(
+    self,
+    group_openid: str,
+    file_type: int,
+    url: str | None = None,
+    srv_send_msg: bool = False,
+    *,
+    file_data: str | None = None,
+) -> dict:
+    """群聊图片上传，额外支持 base64 的 ``file_data``。见模块 docstring 补丁三。"""
+    route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=group_openid)
+    return await self._http.request(
+        route, json=_file_payload(file_type, url, srv_send_msg, file_data)
+    )
+
+
+async def _post_c2c_file(
+    self,
+    openid: str,
+    file_type: int,
+    url: str | None = None,
+    srv_send_msg: bool = False,
+    *,
+    file_data: str | None = None,
+) -> dict:
+    """私聊图片上传，额外支持 base64 的 ``file_data``。"""
+    route = Route("POST", "/v2/users/{openid}/files", openid=openid)
+    return await self._http.request(
+        route, json=_file_payload(file_type, url, srv_send_msg, file_data)
+    )
+
+
+def _install_file_upload() -> list[str]:
+    """补丁三：把两个上传方法的签名换成支持 ``file_data`` 的版本。"""
+    changed: list[str] = []
+    for name, impl in (
+        ("post_group_file", _post_group_file),
+        ("post_c2c_file", _post_c2c_file),
+    ):
+        current = getattr(BotAPI, name, None)
+        if current is None or getattr(current, _PATCH_FLAG, False):
+            continue
+        setattr(impl, _PATCH_FLAG, True)
+        setattr(BotAPI, name, impl)
+        changed.append(name)
+    return changed
+
+
+def install_botpy_patches() -> list[str]:
+    """安装全部 botpy 补丁，返回本次实际改动的项（幂等，重复调用返回空列表）。
+
+    必须在 ``RssBot(...)`` 构造**之前**调用：解析表是 ``ConnectionState``
+    实例化时一次性建好的，事后再换就来不及了。
+    """
+    changed = _install_parsers() + _install_file_upload()
+    if changed:
+        _log.info("已替换 botpy 实现：%s", "、".join(changed))
+    else:
+        _log.debug("botpy 补丁已是最新，跳过")
+    return changed
+
+
+# 旧名保留：smoke.py 和早期文档里用的是这个。
+install_new_protocol_support = install_botpy_patches

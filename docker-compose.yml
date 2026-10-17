@@ -66,3 +66,7 @@ services:
       # 那个时间是**你刚保存的时间**才说明生效了；是镜像构建时间就说明没生效。
       # —— 那条日志是挂载的前提，别删。
       - ./src:/app/src:ro
+      # scripts/ 同理 —— 不加这条，新写的探测脚本在容器里根本不存在
+      # （`docker compose exec bot python scripts/xxx.py` 会报 No such file）。
+      # `docker cp` 可以临时塞进去，但重建容器就没了。
+      - ./scripts:/app/scripts:ro
