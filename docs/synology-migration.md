@@ -211,7 +211,7 @@ Docker 自身数据在 `/volume1/@docker`，由 Container Manager 管理，无�
 所以**拉镜像不需要代理**，compose 里只有 rsshub 配了代理是为了抓被污染的上游。
 `/volume1` 余量 8.3T，绰绰有余。
 
-### 唯一剩下的阻塞：docker 权限
+### docker 权限（已绕过）
 
 `JackLin` 跑不了 docker：
 
@@ -231,3 +231,34 @@ PATH 是 `/usr/bin:/bin:/usr/sbin:/sbin`，所以连绝对路径都要显式写�
 1. **Container Manager UI 建项目**（推荐，原生工作流、以 root 运行）
 2. 用户自己跑 `sudo docker compose -f /volume1/docker/qq-rss-bot/docker-compose.yml up -d --build`
 3. 给 root 配 NOPASSWD sudo，或把 `JackLin` 加进 docker 组（DSM 上非标准，不推荐）
+
+## 部署完成（2026-10-17 11:07）
+
+机器人在 NAS 上稳定运行，迁移结束。实测确认：
+
+| 项 | 结果 |
+|---|---|
+| 网关连接 | `[botpy] 机器人「炸猪排爱好者」启动成功！` + 心跳维持启动 |
+| 双容器互通 | 订阅标题抓到真实值 `NEWS ｜ アイドルマスター`，`fail_count=0` |
+| 订阅 URL | `http://rsshub:1200/idolmaster/news`（**不是** `127.0.0.1`） |
+| 自动补订阅 | 日志 `本次给 2 个群补上了` —— 新逻辑生效 |
+| baseline | 两个订阅各 12 条、`initialized=1`，**没有倒灌旧文** |
+| 主动推送链路 | `send_counters` 有记录（`/new` 实测真发出去了） |
+| 错误 | 日志里 ERROR / WARNING / Traceback **均为 0** |
+
+**踩到的坑：同一套 compose 被两条路管过。** 在 Container Manager 里建了项目，
+又在命令行跑了 `docker compose up`，于是 Compose 重建容器时把旧容器改名成
+`<十六进制>_<原名>` 再删，中途失败就留下孤儿 —— Container Manager 列表里
+能看到它、点进去说「不存在」，项目也关不掉。**一个项目只用一条路管。**
+（容器管理那步只能用户本人做：DSM 上 `administrators` 组不给 docker 权限，
+`sudo` 要密码，SSH 会话里干不了。）
+
+### 迁移到新机器时注意
+
+`subscriptions.url` 存的是**解析后的全量地址**。老机器上是
+`http://127.0.0.1:1200/...`，直接搬到容器里会指向容器自己、抓取全挂，
+必须改写成 `http://rsshub:1200/...`。本次是让机器人在群里重新订阅来规避的
+（`group_openid` 同 AppID 下可以直接搬，URL 不行）。
+
+新部署的空库 `groups` 表是空的，**启动补订阅会空转**（日志写「补了 0 个群」）。
+群必须先被事件看见一次（有人 @ 机器人），此后重启才会自动补上。
