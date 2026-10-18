@@ -76,6 +76,23 @@ uv run python scripts/setup_panel.py --create  # 指令面板：创建
   ```
   **改 `docker-compose.yml` 本身**（比如加这个挂载）才需要 `up -d` 一次。
   改 `src/` 下的代码**永远不用重建**。
+- ⚠️ **改 `.env`（尤其是加新变量）时 `restart` 不够，必须 `up -d` 重建容器。**
+  compose 里是 `env_file: - .env`，环境变量在**容器创建时**烘进去，
+  `docker compose restart` 只是把**现有容器**重启，**不会再读一遍 `.env`**。
+  症状是**完全静默**：代码是新的（启动日志的 `最新改动 <时间>` 也对）、
+  日志正常、新变量**全是代码里的默认值**。
+  2026-10-18 实测踩到：15:37 往 `.env` 加了 `WARMUP_GROUP` / `PREVIEW_GROUP`，
+  15:44 `restart` 之后这两个值在容器里仍然是空的 —— 预热三阶段**一次都没触发**，
+  而日志里一条报错都没有。判据有两条，都是实测过的：
+  ```bash
+  # ① 容器里的环境变量：空的就是没读进去
+  sudo docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' qq-rss-bot-bot-1 \
+    | grep -E '^(WARMUP_GROUP|PREVIEW_GROUP)='
+  # ② 行为判据：三个订阅的 last_polled_at 间隔。预热生效时是 45s/30s（串行三段），
+  #    没生效时是各自独立轮询的任意间隔（实测 30s/91s）
+  ```
+  修法：`sudo docker compose up -d bot`（**重建**，不是 `restart`）。
+  **热更新那套只对 `src/` 成立；`.env` 一律要重建。**
 - **配套的判据：启动日志里的 `运行代码 …（最新改动 <时间>）`**
   （`__main__.code_identity`）。它报的是包内 .py 的**最新** mtime：
   - 那个时间 = **你刚保存的时间** → 代码生效了
