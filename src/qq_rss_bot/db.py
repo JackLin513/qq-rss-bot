@@ -80,6 +80,20 @@ CREATE TABLE IF NOT EXISTS ai_counters (
     day   TEXT PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0
 );
+
+-- ASOBI TICKET 抽票提醒：哪条受付的哪种提醒**已经发过了**。
+-- 主键带 group_openid —— 提醒是逐群记的，将来加群不会因为别的群发过就漏推。
+-- 落库而不是放内存：进程一重启「已提醒过」就清零的话，同一条締切会重复推。
+--
+-- 这张表还有一个副作用：**「表里有没有行」= 「有没有建过 baseline」**，
+-- 见 tickets.TicketPoller.poll_once。所以别去删里面的行。
+CREATE TABLE IF NOT EXISTS ticket_alerts (
+    reception_id TEXT NOT NULL,
+    group_openid TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (reception_id, group_openid, kind)
+);
 """
 
 # 老库缺的列。本项目没有成套迁移框架，但「加一列」这类向前兼容的改动
@@ -411,6 +425,44 @@ class Database:
         self._conn.execute(
             "DELETE FROM ai_counters WHERE day < date('now', ?)",
             (f"-{int(keep_days)} day",),
+        )
+        self._conn.commit()
+
+    # ---------- 抽票提醒（ASOBI TICKET）----------
+
+    def ticket_alerts_any(self) -> bool:
+        """表里有没有任何一行 —— 也就是**有没有建过 baseline**。
+
+        `TicketPoller` 靠它判断是不是首次运行。别改成「有没有某个群的记录」：
+        加一个新群时那个群是空的，会被当成首轮而漏掉全部存量提醒。
+        """
+        row = self._conn.execute("SELECT 1 FROM ticket_alerts LIMIT 1").fetchone()
+        return row is not None
+
+    def ticket_alert_kinds(self, group_openid: str) -> dict[str, set[str]]:
+        """这个群已经收到过的提醒：`{reception_id: {kind, …}}`。
+
+        一次查完整个群，别在循环里逐条查 —— 31 条受付 × 若干 kind 会变成
+        几十次查询。
+        """
+        rows = self._conn.execute(
+            "SELECT reception_id, kind FROM ticket_alerts WHERE group_openid = ?",
+            (group_openid,),
+        ).fetchall()
+        out: dict[str, set[str]] = {}
+        for row in rows:
+            out.setdefault(row["reception_id"], set()).add(row["kind"])
+        return out
+
+    def mark_ticket_alert(self, reception_id: str, group_openid: str, kind: str) -> None:
+        """记下「这条提醒发过了」。重复调用无副作用。"""
+        self._conn.execute(
+            """
+            INSERT INTO ticket_alerts (reception_id, group_openid, kind, sent_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (reception_id, group_openid, kind) DO NOTHING
+            """,
+            (reception_id, group_openid, kind, utcnow()),
         )
         self._conn.commit()
 

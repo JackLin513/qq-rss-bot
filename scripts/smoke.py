@@ -588,6 +588,7 @@ check("帮助说明了受限指令", "仅群主和管理员可用" in HELP_TEXT)
 
 print("[4.76] 指令面板字数按显示宽度校验")
 import setup_panel  # noqa: E402
+from qq_rss_bot.commands import COMMAND_ALIASES as _aliases  # noqa: E402
 
 check("ASCII 宽 = 字符数", setup_panel._width("/sub") == 4)
 check("中文按 2 算", setup_panel._width("中文") == 4)
@@ -598,9 +599,17 @@ _problems = setup_panel.validate(setup_panel.PANEL_ITEMS)
 check("当前 PANEL_ITEMS 通过官方限制", _problems == [], str(_problems))
 
 # 面板是**平的、不能嵌套**（scripts/probe_panel.py 实测），所以它只当入口：
-# 订阅/退订/列表/搜索全在 /rss 的按钮卡片里。指令一多就往回加会立刻挤爆。
-check("面板只留三个入口", [i["name"] for i in setup_panel.PANEL_ITEMS] == ["rss", "new", "help"],
+# 订阅/退订/列表/搜索全在 /rss 的按钮卡片里，面板只放常驻的那几个。
+# 上限是 20 个元素，别把它当指令全集用。
+check("面板入口就是这几个（顺序即显示顺序）",
+      [i["name"] for i in setup_panel.PANEL_ITEMS]
+      == ["rss", "new", "抽选", "当落", "help"],
       str([i["name"] for i in setup_panel.PANEL_ITEMS]))
+# ★ 面板里的每个名字都必须是**真的能执行的指令**，否则用户点了没反应。
+check("★ 面板里的名字在 COMMAND_ALIASES 里都认",
+      all(_name in _aliases for _name in (i["name"] for i in setup_panel.PANEL_ITEMS)),
+      [i["name"] for i in setup_panel.PANEL_ITEMS
+       if i["name"] not in _aliases])
 check("面板入口都是所有人可用",
       all(i.get("only_admin") is False for i in setup_panel.PANEL_ITEMS))
 # 宽度口径必须只有一份实现（setup_panel._width 是 menu.display_width 的别名）
@@ -4086,6 +4095,1018 @@ check("★ 被「不发」挡下的条目不进正式群（一条消息都不发
 check("★ 但它要当「已推」返回，否则下一轮又捞出来，你得每轮否一次",
       [e.key for e in _pushed] == ["KEY-OF-VETOED"], str([e.key for e in _pushed]))
 
+
+print("[4.64] ASOBI TICKET 抽票提醒（全离线）")
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+from qq_rss_bot import tickets as _tk  # noqa: E402
+
+_TK_JST = _tk.JST
+# 用一条真实的截止时间当基准：2026-11-15 23:59 JST
+_TK_END = datetime(2026, 11, 15, 23, 59, tzinfo=_TK_JST)
+
+
+def _tk_rec(**kw):
+    base = dict(
+        id="r1", booth_slug="va-liv-3rdlive", booth_name="活动名",
+        name="アソビストア一般会員先行", entry_type="lottery",
+        status="within_entry_period",
+    )
+    base.update(kw)
+    return _tk.Reception(**base)
+
+
+def _tk_payload():
+    """一小段**真实结构**的 JSON:API —— 层级和字段名都照抄实测的响应。"""
+    return {
+        "data": [
+            {
+                "id": "rec-1", "type": "reception",
+                "attributes": {
+                    "name": "アソビストア一般会員先行",
+                    "entry_type": "lottery",
+                    "entry_period_status": "within_entry_period",
+                    "entry_period_starts_at": "2026-10-17T21:30:00.000+09:00",
+                    "entry_period_ends_at": "2026-11-15T23:59:59.999+09:00",
+                    "result_announcement_scheduled_at": "2026-11-28T13:00:00.000+09:00",
+                    "deposit_period_starts_at": "2026-11-28T13:00:00.000+09:00",
+                    "deposit_period_ends_at": "2026-12-02T23:59:59.999+09:00",
+                },
+                "relationships": {
+                    "tour": {"data": {"id": "t1", "type": "tour"}},
+                    "cover_image": {"data": {"id": "img-1", "type": "image"}},
+                },
+            },
+            # 缺 tour（关系是 null）—— 不能让整条炸
+            {
+                "id": "rec-2", "type": "reception",
+                "attributes": {"name": "关系缺失", "entry_period_status": "before_entry_period"},
+                "relationships": {"tour": {"data": None}},
+            },
+            "这一项根本不是 dict，也要跳过",
+        ],
+        "included": [
+            {
+                "id": "t1", "type": "tour", "attributes": {"name": "巡演名"},
+                "relationships": {"booth": {"data": {"id": "b1", "type": "booth"}}},
+            },
+            {
+                "id": "b1", "type": "booth",
+                "attributes": {"name": "PROJECT IM@S vα-liv 3rdLIVE", "slug": "va-liv-3rdlive"},
+            },
+            {
+                "id": "img-1", "type": "image",
+                "attributes": {"reading_urls": {"medium": "https://cdn/x.png.800",
+                                                "small": "https://cdn/x.png.150"}},
+            },
+        ],
+    }
+
+
+def _tk_booths_payload():
+    """booth 列表。**每场 live 的封面在这里**，结构照抄实测响应。"""
+    return {
+        "data": [
+            {"id": "b1", "type": "booth",
+             "attributes": {"slug": "va-liv-3rdlive", "name": "PROJECT IM@S vα-liv 3rdLIVE"},
+             "relationships": {"cover_image": {"data": {"id": "bc-1", "type": "image"}}}},
+            # 这场站点没配封面 —— 不能因此炸掉，只是不配图
+            {"id": "b2", "type": "booth",
+             "attributes": {"slug": "sidem-270313", "name": "SideM"},
+             "relationships": {"cover_image": {"data": None}}},
+            # 关系整个缺失，也要跳过
+            {"id": "b3", "type": "booth", "attributes": {"slug": "gkmas-1"}},
+            "不是 dict，跳过",
+        ],
+        "included": [
+            {"id": "bc-1", "type": "image",
+             "attributes": {"reading_urls": {"medium": "https://cdn/booth.png.800",
+                                             "small": "https://cdn/booth.png.150"}}},
+        ],
+    }
+
+
+def _check_tk_brand() -> None:
+    """★ 品牌判据。**这组钉子钉死「不能改成按活动名匹配」**。"""
+    imas_slugs = [
+        "va-liv-3rdlive", "cinderellagirls-261128", "cinderellagirls-270111",
+        "cinderellagirls-270213", "cinderellagirls-millionlive-20270227",
+        "gkmas-261107", "idolmaster-261212", "shinycolors-261219",
+        "shinycolors-270322", "shinycolors-270327", "sidem-261226",
+        "sidem-270313", "sidem-shinycolors-270605", "765pro-961pro-270724",
+    ]
+    for slug in imas_slugs:
+        check(f"★ 认得 {slug}", _tk.is_imas(slug), slug)
+
+    for slug in ("tales-261103", "denonbu-270220", "zerokyori-261024"):
+        check(f"★ 剔掉非 IM@S 的 {slug}", not _tk.is_imas(slug), slug)
+
+    # 三个「名字里根本没有 IDOLM@STER 但确实是 IM@S」的 —— 名字匹配会判错，
+    # slug 才是站点自己打的品牌标。
+    for slug, why in (
+        ("idolmaster-261212", "xR LIVE REVIVAL"),
+        ("cinderellagirls-270213", "ATHOME xR LIVE Apple of my アイ"),
+        ("shinycolors-261219", 'shiny, the first REFRAC7IONS " Still blue "'),
+    ):
+        check(f"★ 「{why}」名字里没有 IDOLM@STER，但要认（靠 {slug}）",
+              _tk.is_imas(slug), slug)
+
+    check("★ 空 slug 不算", not _tk.is_imas("") and not _tk.is_imas(None))
+    check("★ 前缀要凑成完整品牌段（不让 millionlive 误收 millionlivex-）",
+          not _tk.is_imas("millionlivex-1") and _tk.is_imas("millionlive-1"))
+    check("自定义品牌表能覆盖默认", _tk.is_imas("tales-1", ("tales",)))
+
+    check("filter_imas 只留该留的",
+          [r.booth_slug for r in _tk.filter_imas(
+              [_tk_rec(booth_slug="va-liv-a"), _tk_rec(booth_slug="tales-b")])
+           ] == ["va-liv-a"])
+
+
+def _check_tk_parse() -> None:
+    recs = _tk.parse(_tk_payload())
+    check("★ 解析出 2 条（非 dict 那条被跳过）", len(recs) == 2, [r.id for r in recs])
+
+    r = next(x for x in recs if x.id == "rec-1")
+    check("★ tour → booth 两跳关联出活动名和 slug",
+          r.booth_name == "PROJECT IM@S vα-liv 3rdLIVE" and r.booth_slug == "va-liv-3rdlive",
+          f"{r.booth_name!r} {r.booth_slug!r}")
+    check("★ 详情页 URL 由 slug 拼出来",
+          r.url == "https://asobiticket2.asobistore.jp/booths/va-liv-3rdlive", r.url)
+    check("★ 时间全部带上 JST 时区",
+          r.entry_end == datetime(2026, 11, 15, 23, 59, 59, 999000, tzinfo=_TK_JST),
+          repr(r.entry_end))
+    check("★ 封面档次解出来了", r.cover.get("medium") == "https://cdn/x.png.800")
+    check("★ 抽選/先着的标", r.kind_label == "抽選" and not _tk.is_imas("") and r.lottery)
+
+    bad = next(x for x in recs if x.id == "rec-2")
+    check("★ tour 关系为 null 时不炸，slug 退化成空", bad.booth_slug == "", bad.booth_slug)
+    check("★ 缺的日期字段是 None，不是抛异常",
+          bad.entry_end is None and bad.result_at is None and bad.deposit_end is None)
+
+    check("空 payload 不炸", _tk.parse({}) == [])
+
+
+def _check_tk_alerts() -> None:
+    """★ 提醒判定 —— 这个功能的核心，必须离线可测。"""
+    at = lambda h: _TK_END - timedelta(hours=h)  # noqa: E731
+    cases = [
+        ("距截止 30 小时（窗口外）", at(30), set(), ["new"]),
+        ("距截止 23 小时（刚进 24h 窗口）", at(23), set(), ["new", "entry24"]),
+        ("距截止 3 小时（在 24h 内、未进 2h）", at(3), set(), ["new", "entry24"]),
+        ("★ 首次见到就已进 2h 窗口 → 只发 entry2，不补发 entry24", at(1), set(), ["new", "entry2"]),
+        ("★ 同上但 new 已发过", at(1), {"new"}, ["entry2"]),
+        ("★ 同上但 24h 也发过了（不能因为补发而重复）", at(1), {"new", "entry24"}, ["entry2"]),
+        ("new 发过、还在 24h 窗口 → 只发 entry24", at(3), {"new"}, ["entry24"]),
+        ("★ 已过截止 → 什么都不发", at(-1), set(), []),
+        ("★ 已过截止但接口仍说受付中 → 也不发（状态和日期打架时不推）",
+         at(-1), set(), []),
+    ]
+    for label, now, seen, expect in cases:
+        got = _tk.due_alerts(_tk_rec(entry_end=_TK_END), now, seen)
+        check(label, got == expect, f"got={got} expect={expect}")
+
+    check("★ 入金日期为 null 时不发入金那两条",
+          _tk.due_alerts(_tk_rec(entry_end=_TK_END, deposit_end=None), at(1), set())
+          == ["new", "entry2"])
+
+    both = _tk_rec(entry_end=_TK_END, deposit_end=_TK_END)
+    check("★ 申込和入金各自独立计数",
+          _tk.due_alerts(both, at(1), {"new", "entry2"}) == ["deposit2"],
+          _tk.due_alerts(both, at(1), {"new", "entry2"}))
+
+    check("已结束的受付什么都不发",
+          _tk.due_alerts(_tk_rec(entry_end=_TK_END - timedelta(days=1),
+                                 status="after_entry_period"), _TK_END, set()) == [])
+
+    # ★ 时区：now 用 UTC 构造，判定必须一致。服务器 TZ 是 Asia/Shanghai，
+    #   直接拿本地时间去比 JST 会差一小时 —— 差一小时就是错过。
+    utc_now = at(1).astimezone(timezone.utc)
+    check("★ 时区：UTC 构造的 now 与 JST 结果一致",
+          _tk.due_alerts(_tk_rec(entry_end=_TK_END), utc_now, set()) == ["new", "entry2"],
+          repr(utc_now))
+    check("★ now 与 end 都换到 UTC 后比较仍然成立",
+          _tk.due_alerts(_tk_rec(entry_end=_TK_END.astimezone(timezone.utc)), utc_now, set())
+          == ["new", "entry2"])
+
+
+def _check_tk_render() -> None:
+    r = _tk_rec(entry_start=_TK_END - timedelta(days=30), entry_end=_TK_END,
+                result_at=_TK_END + timedelta(days=13),
+                deposit_end=_TK_END + timedelta(days=17))
+    text = _tk.render_new(r)
+    check("★ 新受付文案带受付期間/当落发表/入金期間三行",
+          "受付期間：" in text and "当落发表：" in text and "入金期間：" in text, text)
+    # ★ 排版照群友那个工具：`2026年11月15日(日) 22:59`，月/日不补零、时分补零。
+    #   注意这是**北京时间** —— 接口给的是 23:59+09:00，同一个时刻。
+    check("★ 日期是北京时间的长格式（月日不补零）",
+          "2026年11月15日(日) 22:59" in text, text)
+    check("★ 受付期間带星期，当落发表不带",
+          "2026年10月16日(金) 22:59 〜 2026年11月15日(日) 22:59" in text
+          and "当落发表：2026年11月28日 22:59" in text, text)
+    check("★ 带详情页链接", r.url in text and "[在 ASOBI TICKET 打开]" in text)
+    check("★ 抽選标出来了", "抽選" in text)
+
+    d = _tk.render_deadline(r, "entry2", _TK_END - timedelta(hours=1))
+    check("★ 締切文案带「申込締切」和剩余时间",
+          "申込締切" in d and "あと" in d, d)
+    check("★ 締切文案标了北京时间", "北京时间" in d, d)
+    # ★ 尾数 24 / 2 位数不同：`entry2` 必须解析成申込、`deposit2` 必须解析成入金。
+    #   写成 kind[:-2] 的话 entry2 会静默退到入金日期 —— 推出去是一条日期错的締切。
+    check("★ entry2 用的是申込日期，不是入金日期",
+          "申込締切" in d and "2026年11月15日 22:59" in d, d)
+    d24 = _tk.render_deadline(r, "entry24", _TK_END - timedelta(hours=23))
+    check("★ entry24 也用申込日期", "申込締切" in d24 and "2026年11月15日 22:59" in d24, d24)
+    dep = _tk.render_deadline(r, "deposit2", _TK_END - timedelta(hours=1))
+    check("★ deposit2 用的是入金日期", "入金締切" in dep and "2026年12月2日 22:59" in dep, dep)
+    dep24 = _tk.render_deadline(r, "deposit24", _TK_END - timedelta(hours=23))
+    check("★ deposit24 也用入金日期", "入金締切" in dep24 and "2026年12月2日 22:59" in dep24, dep24)
+
+    # 活动名里有 markdown 元字符时不能破坏结构
+    nasty = _tk_rec(booth_name="A [B] (C) | D * E _ F", name="受付【SP席】")
+    for kind in ("new", "entry24"):
+        out = _tk.render_alert(nasty, kind, _TK_END - timedelta(hours=1))
+        check(f"★ {kind} 在活动名含 []()|*_ 时不产生未闭合的 markdown",
+              out.count("[") == out.count("]") and out.count("(") == out.count(")"), out)
+
+    # ---- 列表排版 ----
+    async def run() -> None:
+        class _Http:
+            def __init__(self, ok=True):
+                self.ok = ok
+
+            async def get(self, url, **kw):
+                if not self.ok:
+                    raise RuntimeError("boom")
+
+                class _R:
+                    status_code = 200
+                    content = _png(800, 450)
+
+                return _R()
+
+        now = _TK_END - timedelta(hours=1)
+        cov = {"medium": "https://cdn/a.png.800"}
+        _T1 = "**1. 同一场**"
+        _T2 = "**2. 另一场**"
+        _L1 = "[在 ASOBI TICKET 打开](https://asobiticket2.asobistore.jp/booths/va-liv-3rdlive)"
+        two = [
+            _tk_rec(id="a1", booth_name="同一场", name="【SP席】先行", cover=cov,
+                    entry_end=_TK_END, result_at=_TK_END + timedelta(days=13)),
+            _tk_rec(id="a2", booth_name="同一场", name="【S席】先行", cover=cov,
+                    entry_end=_TK_END, result_at=_TK_END + timedelta(days=13)),
+            _tk_rec(id="b1", booth_slug="shinycolors-270322", booth_name="另一场",
+                    name="一般先行", cover={"medium": "https://cdn/b.png.800"},
+                    entry_end=_TK_END, result_at=_TK_END + timedelta(days=13)),
+        ]
+        out = await _tk.render_digest(_Http(), two, now, wanted=("open",), images=False)
+
+        check("★ 列表头是「更新于 …（北京时间）」",
+              out.startswith("🎫 更新于 ") and "（北京时间）" in out.splitlines()[0], out)
+        check("★ 节标题带场数，不是受付条数，且加粗",
+              "**抽选中（2 场）**" in out, out)
+        check("★ 场按序号排，序号重新从一开始",
+              _T1 in out and _T2 in out, out)
+        check("★ 每场下面有一行链接，指向这场的受付页", _L1 in out, out)
+        check("★ 链接行在正文之后（场名 → 受付 → 日期 → 链接）",
+              out.index(_T1) < out.index(_L1)
+              and out.index("当落发表：") < out.index(_L1), out)
+        check("★ 同一场的两个受付合成一条，用全角空格行隔开",
+              out.count("1. 同一场") == 1 and f"\n{_tk.SEP}\n" in out, out)
+        check("★ 受付中那节同时给受付期間和当落发表",
+              "受付期間：" in out and "当落发表：" in out, out)
+        check("★ 场名里的全角空格原样保留（ATHOME xR LIVE　Apple of my アイ）",
+              "同一场" in out, out)
+
+        # 图片：插在该场序号**上面**，不是消息末尾
+        with_img = await _tk.render_digest(
+            _Http(), two, now, wanted=("open",), images=True, cache={})
+        lines = with_img.splitlines()
+        idx = next(i for i, ln in enumerate(lines) if ln.startswith("**1. 同一场"))
+        check("★ 封面图在该场序号上面一行",
+              lines[idx - 1].startswith("![图1 #208px #117px]"), lines[max(0, idx - 2):idx + 1])
+        check("★ 第二场也有自己的图（不是挤在末尾）",
+              any(ln.startswith("![图2 ") for ln in lines), lines)
+
+        no_img = await _tk.render_digest(_Http(), two, now, wanted=("open",), images=False)
+        check("★ images=False 时一个 ! 都不出现", "![" not in no_img)
+
+        # ---- booth 级封面：这场受付自己没封面也要有图 ----
+        #   这正是用户报的「有些图片根本没写到文本里去」：va-liv 那场 3 条受付
+        #   一条都没带 cover_image，于是整场没图 —— 而站点明明配了主视觉。
+        booth_cov = {
+            "va-liv-3rdlive": {"medium": "https://cdn/live-a.png.800"},
+            "shinycolors-270322": {"medium": "https://cdn/live-b.png.800"},
+        }
+        bare = [
+            _tk_rec(id="n1", booth_name="没受付封面的一场", entry_end=_TK_END,
+                    result_at=_TK_END + timedelta(days=13)),
+        ]
+        got = await _tk.render_digest(_Http(), bare, now, wanted=("open",), booths=booth_cov)
+        check("★ 受付自己没有封面，但这场 live 有 → 照样配图",
+              "![图1 #208px #117px](https://cdn/live-a.png.800)" in got, got)
+
+        # ★ 同一场的图**不能取决于哪条受付排在最前面**。
+        #   两条受付各带一张不同的受付级封面 —— 图必须还是这场 live 那张，
+        #   而且只有一张。
+        mixed_covers = [
+            _tk_rec(id="m1", booth_name="同一场", name="【A】", cover={"medium": "https://cdn/r1.png.800"},
+                    entry_end=_TK_END, result_at=_TK_END + timedelta(days=13)),
+            _tk_rec(id="m2", booth_name="同一场", name="【B】", cover={"medium": "https://cdn/r2.png.800"},
+                    entry_end=_TK_END, result_at=_TK_END + timedelta(days=13)),
+        ]
+        stable = await _tk.render_digest(_Http(), mixed_covers, now, wanted=("open",), booths=booth_cov)
+        check("★ 同一场只配一张图，且是这场 live 的（与受付排序无关）",
+              stable.count("![图") == 1 and "live-a.png.800" in stable
+              and "r1.png.800" not in stable and "r2.png.800" not in stable, stable)
+
+        # ★ 场数超过 `multiimage.MAX_IMAGES`（6）时**不能从第 7 场开始没图**。
+        #   列表的图是「每场一张」，和「一篇资讯最多 6 张图」不是一回事；
+        #   用错那个数卡出来的症状正是用户报的「有些图片根本没写进文本里」。
+        many = [
+            _tk_rec(id=f"x{i}", booth_slug=f"va-liv-{i}", booth_name=f"第{i}场",
+                    entry_end=_TK_END, result_at=_TK_END + timedelta(days=13))
+            for i in range(1, 9)
+        ]
+        many_cov = {f"va-liv-{i}": {"medium": f"https://cdn/live{i}.png.800"} for i in range(1, 9)}
+        eight = await _tk.render_digest(_Http(), many, now, wanted=("open",), booths=many_cov)
+        check("★ 8 场就配 8 张图（不受 multiimage.MAX_IMAGES=6 的卡）",
+              eight.count("![图") == 8, f"{eight.count('![图')} 张 / 共 {len(many)} 场")
+        check("★ 第 7、8 场也有图，不是从第 7 场开始没了",
+              "live7.png.800" in eight and "live8.png.800" in eight,
+              [ln for ln in eight.splitlines() if ln.startswith("![")][-2:])
+        check("★ 列表的图片预算就是场数上限（每场都有图）",
+              _tk.MAX_COVERS == _tk.LIST_LIMIT, _tk.MAX_COVERS)
+
+        # ---- 场名下面那行链接 ----
+        # 活动名里**真的出现过方括号**（smoke 一直用 `A [B] (C) | D * E _ F`）。
+        # 链接是**单独一行**的，所以名字里的括号不会跑进链接语法里 ——
+        # 这正是当初不把链接挂在场名上的原因之一。
+        bracketed = [_tk_rec(id="bk", booth_name="A [B] (C) | D * E _ F",
+                             entry_end=_TK_END, result_at=_TK_END + timedelta(days=13))]
+        btxt = await _tk.render_digest(
+            _Http(), bracketed, now, wanted=("open",), images=False)
+        blines = btxt.splitlines()
+        name_line = next(ln for ln in blines if ln.startswith("**1."))
+        link_line = next(ln for ln in blines if ln.startswith("["))
+        # 名字里的括号**只出现在加粗那一行**：链接行是单独一行、写死的文案，
+        # 所以名字里有多少括号都破坏不了链接语法。
+        check("★ 名字里的方括号留在加粗行里，不会跑进链接语法",
+              "[B]" in name_line and link_line.count("[") == 1
+              and link_line.count("]") == 1 and "[B]" not in link_line,
+              f"{name_line!r} / {link_line!r}")
+        check("★ 链接行是干净的 `[文字](url)`，且指向这场真正的 slug",
+              link_line == "[在 ASOBI TICKET 打开]"
+                           "(https://asobiticket2.asobistore.jp/booths/va-liv-3rdlive)",
+              link_line)
+
+        # `tour` 关系为 null 的存量数据 slug 是空的 —— 拼出来是 `…/booths/`，点了 404
+        noslug = [_tk_rec(id="ns", booth_slug="", booth_name="关系缺失的场",
+                          entry_end=_TK_END, result_at=_TK_END + timedelta(days=13))]
+        ntxt = await _tk.render_digest(
+            _Http(), noslug, now, wanted=("open",), images=False)
+        check("★ 没有 slug 时干脆不加链接行（否则点进去是 404）",
+              "**1. 关系缺失的场**" in ntxt and "](" not in ntxt, ntxt)
+
+        # 传了 booths 但这场不在表里 → 退回受付级封面，不是没图
+        fallback = await _tk.render_digest(
+            _Http(), two, now, wanted=("open",), booths={"别的场": {"medium": "https://cdn/z.png.800"}})
+        check("★ booth 表里没有这场时退回受付级封面",
+              "![图1 #208px #117px](https://cdn/a.png.800)" in fallback, fallback)
+
+        # 读不到尺寸 → 那一场不配图，但文字照出（不猜比例）
+        broken = await _tk.render_digest(_Http(ok=False), two, now, wanted=("open",))
+        check("★ 读不到尺寸就那场不配图，文字照出",
+              "![" not in broken and _T1 in broken, broken)
+
+        # 没有封面 URL 的场也不配图
+        nocover = await _tk.render_digest(
+            _Http(), [_tk_rec(id="c1", entry_end=_TK_END)], now, wanted=("open",))
+        check("★ 这场本来就没封面 → 不配图，也不报错", "![" not in nocover, nocover)
+
+        # ---- 空列表要说人话 ----
+        empty_open = await _tk.render_digest(_Http(), [], now, wanted=("open",))
+        empty_pend = await _tk.render_digest(_Http(), [], now, wanted=("pending", "deposit"))
+        check("★ 没有受付时 /抽选 回一句人话，不是空消息",
+              "没有" in empty_open and "抽选" in empty_open, empty_open)
+        check("★ 没有待当落时 /当落 回一句人话",
+              "没有" in empty_pend and "待当落" in empty_pend, empty_pend)
+
+        # ---- 两节各自取该取的 ----
+        mixed = [
+            _tk_rec(id="o1", entry_end=_TK_END, result_at=_TK_END + timedelta(days=13)),
+            _tk_rec(id="p1", booth_slug="sidem-1", booth_name="已截止",
+                    status="after_entry_period", entry_end=_TK_END - timedelta(days=2),
+                    result_at=_TK_END + timedelta(days=1)),
+            _tk_rec(id="d1", booth_slug="gkmas-1", booth_name="要付钱",
+                    status="after_entry_period", entry_end=_TK_END - timedelta(days=5),
+                    result_at=_TK_END - timedelta(days=1),
+                    deposit_start=_TK_END - timedelta(days=1),
+                    deposit_end=_TK_END + timedelta(days=1)),
+        ]
+        pend = await _tk.render_digest(_Http(), mixed, now, wanted=("pending", "deposit"),
+                                       images=False)
+        check("★ /当落 两节都出，待当落在前",
+              pend.index("待当落（1 场）") < pend.index("入金中（1 场）"), pend)
+        check("★ 待当落只列当落未到的", "已截止" in pend and "要付钱" not in pend.split("入金中")[0], pend)
+        check("★ 入金中给的是入金期間", "入金期間：" in pend, pend)
+
+        open_only = await _tk.render_digest(_Http(), mixed, now, wanted=("open",),
+                                            images=False)
+        check("★ /抽选 不带待当落/入金中那两节",
+              "抽选中" in open_only and "待当落" not in open_only
+              and "入金中" not in open_only, open_only)
+
+        # 已结束的受付不能出现在 /抽选
+        closed = await _tk.render_digest(
+            _Http(), [_tk_rec(id="x", status="after_entry_period", entry_end=_TK_END)],
+            now, wanted=("open",))
+        check("★ /抽选 不列已结束的", "没有" in closed, closed)
+
+        # 纯文本兜底：图片行要去掉
+        stripped = _tk.strip_images(with_img)
+        check("★ strip_images 去掉图片行、留下正文",
+              "![" not in stripped and _T1 in stripped, stripped)
+
+        # ---- 渲染宽度（用户反馈「图没占满气泡」）----
+        wide = await _tk.render_digest(
+            _Http(), two, now, wanted=("open",), cache={}, width=320)
+        check("★ width 透传到尺寸提示（不是恒定的 208）",
+              "![图1 #320px #180px]" in wide, wide.splitlines()[:4])
+        check("★ 不传 width 时还是老的 208（bilibili/RSS 那两条路不能受影响）",
+              "![图1 #208px #117px]" in with_img)
+
+        # ---- 尺寸读失败不能缓存住 ----
+        class _Flaky:
+            """第一次失败、第二次成功。用来钉「失败的尺寸不进缓存」。"""
+
+            def __init__(self):
+                self.calls = 0
+
+            async def get(self, url, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("临时抖动")
+
+                class _R:
+                    status_code = 200
+                    content = _png(800, 450)
+
+                return _R()
+
+        flaky, fcache = _Flaky(), {}
+        one = [_tk_rec(id="f1", cover=cov, entry_end=_TK_END)]
+        first = await _tk.render_digest(flaky, one, now, wanted=("open",), cache=fcache)
+        second = await _tk.render_digest(flaky, one, now, wanted=("open",), cache=fcache)
+        check("★ 尺寸读失败不进缓存（否则一次抖动 = 这张图永久消失）",
+              "![" not in first and "![图1 " in second, f"{first[:20]!r} / {second[:20]!r}")
+
+        # ---- 丢了图要有日志：和「接口本来就没封面」必须能区分 ----
+        import logging as _logging
+
+        class _Cap(_logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.rows: list[tuple[int, str]] = []
+
+            def emit(self, record):
+                self.rows.append((record.levelno, record.getMessage()))
+
+        cap = _Cap()
+        _tk._log.addHandler(cap)
+        _tk._log.setLevel(_logging.DEBUG)
+        try:
+            await _tk.render_digest(_Http(ok=False), two, now, wanted=("open",))
+            await _tk.render_digest(
+                _Http(), [_tk_rec(id="c1", entry_end=_TK_END)], now, wanted=("open",))
+        finally:
+            _tk._log.removeHandler(cap)
+        joined = " ".join(m for _, m in cap.rows)
+        check("★ 尺寸读失败要打 WARNING（原来这里是静默的）",
+              any(lv == _logging.WARNING and "读不到尺寸" in m for lv, m in cap.rows),
+              cap.rows)
+        check("★ 「两个来源都没封面」是另一条日志，和读不到尺寸能区分",
+              "这场两个来源都没封面" in joined, joined[:200])
+
+    asyncio.run(run())
+
+    # ★ 时区：显示用北京时间，但**判定必须还是日本时间**。
+    #   这条钉住「别把 now() 一起改成 CST」—— 那会让所有判定整体平移一小时。
+    utc_now = (_TK_END - timedelta(hours=1)).astimezone(timezone.utc)
+    cst_now = (_TK_END - timedelta(hours=1)).astimezone(_tk.CST)
+    check("★ 同一时刻，JST / CST / UTC 三种构造的判定完全一致",
+          _tk.due_alerts(_tk_rec(entry_end=_TK_END), utc_now, set())
+          == _tk.due_alerts(_tk_rec(entry_end=_TK_END), cst_now, set())
+          == ["new", "entry2"],
+          repr(utc_now))
+    check("★ 显示时区是 CST（+08:00）", _tk.CST.utcoffset(None) == timedelta(hours=8))
+    # 加粗前要剥掉会破坏 `**…**` 的字符（和 bilibili 同一套）
+    check("★ 加粗前剥掉 *_`~\\",
+          _tk._md("A*B_C`D~E\\F") == "ABCDEF", _tk._md("A*B_C`D~E\\F"))
+    check("★ 宽度参数在 multiimage 层也生效",
+          _mi.image_line(1, "https://a/b.jpg", (1000, 563), 320)
+          == "![图1 #320px #180px](https://a/b.jpg)")
+    check("★ 不传宽度时 multiimage 维持 208（老的两条路）",
+          _mi.image_line(1, "https://a/b.jpg", (1000, 563))
+          == "![图1 #208px #117px](https://a/b.jpg)")
+    check("★ 判定时区还是 JST（+09:00）", _tk.JST.utcoffset(None) == timedelta(hours=9))
+
+
+def _check_tk_cover() -> None:
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+
+    class _Http:
+        """假客户端。`payload=None` 时模拟「读不到尺寸」。"""
+
+        def __init__(self, payload: bytes | None) -> None:
+            self.payload = payload
+            self.calls = 0
+
+        async def get(self, url, **kw):
+            self.calls += 1
+            if self.payload is None:
+                raise RuntimeError("boom")
+            return _Resp(self.payload)
+
+    rec = _tk_rec(cover={"medium": "https://cdn/x.png.800", "small": "https://cdn/x.png.150"})
+
+    check("★ 按档位取 URL", _tk.cover_url(rec, "small") == "https://cdn/x.png.150")
+    check("★ 档位缺失时退到默认档",
+          _tk.cover_url(_tk_rec(cover={"medium": "m"}), "original") == "m")
+    check("没有封面返回 None", _tk.cover_url(_tk_rec(), "medium") is None)
+
+    # ---- booth 级封面（每场 live 的主视觉）----
+    booth_cov = {"va-liv-3rdlive": {"medium": "https://cdn/booth.png.800"}}
+    check("★ 受付自己没有封面时，用这场 live 的封面",
+          _tk.cover_url(_tk_rec(), "medium", booth_cov) == "https://cdn/booth.png.800",
+          _tk.cover_url(_tk_rec(), "medium", booth_cov))
+    check("★ 两个来源都有时**优先 booth 级**（它是这场的主视觉，受付级只是单条受付的横幅）",
+          _tk.cover_url(rec, "medium", booth_cov) == "https://cdn/booth.png.800",
+          _tk.cover_url(rec, "medium", booth_cov))
+    check("booth 表里没有这场时退回受付级",
+          _tk.cover_url(rec, "medium", {"别的场": {"medium": "z"}}) == "https://cdn/x.png.800")
+    check("booth 表整个拉不到（空 dict）也能退回受付级",
+          _tk.cover_url(rec, "medium", {}) == "https://cdn/x.png.800")
+    check("传 None 和不传一样",
+          _tk.cover_url(rec, "medium", None) == _tk.cover_url(rec, "medium"))
+
+    # booth 列表地址跟着 TICKET_URL 推，推不出来退回默认
+    check("★ 从 receptions 地址推出 booths 地址",
+          _tk.booths_url("https://x/api/v1/public/receptions") == "https://x/api/v1/public/booths")
+    check("★ 推不出来就用默认地址（别拼出个畸形 URL）",
+          _tk.booths_url("https://x/别的路径") == _tk.DEFAULT_BOOTHS, _tk.booths_url("https://x/别的路径"))
+    check("空字符串也不炸", _tk.booths_url("") == _tk.DEFAULT_BOOTHS)
+
+    parsed = _tk.parse_booths(_tk_booths_payload())
+    check("★ booth 列表解出 slug → 档位 URL",
+          parsed == {"va-liv-3rdlive": {"medium": "https://cdn/booth.png.800",
+                                        "small": "https://cdn/booth.png.150"}}, parsed)
+    check("★ 没配封面 / 关系缺失 / 非 dict 的 booth 都不进表，也不炸",
+          "sidem-270313" not in parsed and "gkmas-1" not in parsed, parsed)
+
+    async def run() -> None:
+        http = _Http(_png(800, 450))
+        out = await _tk.with_cover(http, rec, "正文", "medium")
+        check("★ 封面拼在最上面，且带尺寸提示（手机端缺了整条不渲染）",
+              out.startswith("![图1 #208px #117px](https://cdn/x.png.800)\n正文"), out)
+        check("★ URL 原样，没加任何 query 参数（加了 QQ 就抓不到）",
+              "?" not in out.split("](")[1].split(")")[0], out)
+
+        cache: dict = {}
+        await _tk.with_cover(http, rec, "正文", "medium", cache)
+        before = http.calls
+        await _tk.with_cover(http, rec, "正文", "medium", cache)
+        check("★ 尺寸只读一次（进程内缓存）", http.calls == before)
+
+        broken = _Http(None)
+        out2 = await _tk.with_cover(broken, rec, "正文", "medium")
+        check("★ 读不到尺寸 → 丢图发纯文字（不猜比例）", out2 == "正文", out2)
+
+        no_cover = await _tk.with_cover(_Http(_png(10, 10)), _tk_rec(), "正文", "medium")
+        check("没有封面也是纯文字", no_cover == "正文")
+
+        # 受付级没封面、booth 级有 —— 提醒那条路也要能配上图
+        with_booth = await _tk.with_cover(
+            _Http(_png(800, 450)), _tk_rec(), "正文", "medium", None,
+            _tk.DEFAULT_IMAGE_W, {"va-liv-3rdlive": {"medium": "https://cdn/booth.png.800"}})
+        check("★ 受付级没封面时，提醒也能用 booth 级封面",
+              with_booth.startswith("![图1 #320px #180px](https://cdn/booth.png.800)\n正文"),
+              with_booth)
+
+    asyncio.run(run())
+
+
+def _check_tk_feed() -> None:
+    """TicketFeed 的缓存和 304 处理。"""
+    payload = _tk_payload()
+
+    class _Resp:
+        def __init__(self, status, body=None, etag=None):
+            self.status_code = status
+            self._body = body
+            self.headers = {"etag": etag} if etag else {}
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    class _Http:
+        def __init__(self):
+            self.calls = []
+            self.urls = []
+            self.etag = '"v1"'
+
+        async def get(self, url, headers=None, **kw):
+            self.calls.append(dict(headers or {}))
+            self.urls.append(url)
+            if (headers or {}).get("If-None-Match") == self.etag:
+                return _Resp(304)
+            # 两条接口各自的载荷 —— 封面在 booths 里，不在 receptions 里
+            body = _tk_booths_payload() if url.endswith("/booths") else payload
+            return _Resp(200, body, self.etag)
+
+    async def run() -> None:
+        cfg = cfg_stub()
+        cfg = dataclasses.replace(cfg, ticket_url=_tk.DEFAULT_API)
+        http = _Http()
+        feed = _tk.TicketFeed(cfg, http)
+
+        first = await feed.receptions(max_age=0.0)
+        check("★ 首次拉到 2 条", len(first) == 2, len(first))
+        check("★ 首次不带 If-None-Match", "If-None-Match" not in http.calls[0])
+
+        again = await feed.receptions(max_age=0.0)
+        check("★ 第二次带 If-None-Match 且收到 304 后仍返回上次的缓存",
+              "If-None-Match" in http.calls[1] and len(again) == 2,
+              f"{http.calls[1]} {len(again)}")
+
+        cached = await feed.receptions(max_age=60.0)
+        check("★ 缓存期内不再发请求（群里连点不会刷爆接口）",
+              len(http.calls) == 2 and len(cached) == 2, len(http.calls))
+
+        check("★ imas_receptions 顺手过滤品牌",
+              [r.booth_slug for r in await feed.imas_receptions()] == ["va-liv-3rdlive"])
+
+        # ---- 封面表 ----
+        covers = await feed.covers(max_age=0.0)
+        check("★ covers() 按 URL 分发，拿到的是 booth 列表",
+              covers == {"va-liv-3rdlive": {"medium": "https://cdn/booth.png.800",
+                                            "small": "https://cdn/booth.png.150"}}, covers)
+        check("★ 封面表请求的是 booths 地址（不是又拉一遍 receptions）",
+              http.urls[-1].endswith("/public/booths"), http.urls[-1])
+        calls = len(http.calls)
+        await feed.covers(max_age=0.0)
+        check("★ 封面表也带 If-None-Match，304 后沿用上次结果",
+              "If-None-Match" in http.calls[-1] and len(http.calls) == calls + 1,
+              http.calls[-1])
+        await feed.covers(max_age=60.0)
+        check("★ 封面表在缓存期内不再发请求", len(http.calls) == calls + 1, len(http.calls))
+
+        # 封面表拉失败 → 不抛，退到上次结果（列表照出，只是可能没图）
+        class _Dead:
+            async def get(self, url, **kw):
+                raise RuntimeError("boom")
+
+        dead = _tk.TicketFeed(cfg, _Dead())
+        check("★ 封面表拉失败不抛，返回空表（封面只是加分项）",
+              await dead.covers(max_age=0.0) == {})
+
+    asyncio.run(run())
+
+
+def _check_tk_stage() -> None:
+    """预热群 → 预览群 → 正式群。**和 RSS 共用同一组配置**，语义必须一致。
+
+    背景：QQ 的图片缓存是服务端、跨群共享的，但**冷链接第一次必炸** ——
+    所以正式群之前得先有个群把封面抓进缓存。抽票这边按「一条提醒」组织
+    （每条自带一张封面），和 RSS 那边按「订阅」组织不同。
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from qq_rss_bot.db import Database as _DB
+
+    def payload(now):
+        end = now + timedelta(hours=5)          # 落进 24h 窗口 → 首轮就会推 entry24
+        return {
+            "data": [{
+                "id": "rec-1", "type": "reception",
+                "attributes": {
+                    "name": "先行", "entry_type": "lottery",
+                    "entry_period_status": "within_entry_period",
+                    "entry_period_ends_at": end.isoformat(),
+                },
+                "relationships": {
+                    "tour": {"data": {"id": "t1", "type": "tour"}},
+                    "cover_image": {"data": None},
+                },
+            }],
+            "included": [
+                {"id": "t1", "type": "tour", "attributes": {"name": "巡演"},
+                 "relationships": {"booth": {"data": {"id": "b1", "type": "booth"}}}},
+                {"id": "b1", "type": "booth",
+                 "attributes": {"name": "活动", "slug": "va-liv-3rdlive"}},
+            ],
+        }
+
+    class _Resp:
+        status_code = 200
+        headers: dict = {}
+        content = b""
+
+        def __init__(self, body):
+            self._body = body
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            pass
+
+    class _Http:
+        async def get(self, url, **kw):
+            return _Resp(payload(_tk.now()))
+
+    class _Pusher:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        async def send_markdown(self, group, text):
+            self.sent.append(group)
+
+    def _run(**over):
+        """跑一轮，返回 `(发过消息的群, 提醒记账)`。图片关掉 —— 这节测的是
+        分发顺序，封面那条路另有钉子（`_check_tk_poller`）。"""
+        import asyncio as _a
+
+        async def go():
+            with tempfile.TemporaryDirectory() as d:
+                db = _DB(_P(d) / "s.db")
+                try:
+                    cfg = dataclasses.replace(
+                        cfg_stub(), ticket_groups=("REAL",), ticket_images=False,
+                        preview_warmup_sec=0, preview_veto_sec=0, **over)
+                    pusher = _Pusher()
+                    poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
+                    await poller.poll_once()
+                    return pusher.sent, db.ticket_alert_kinds("REAL"), poller
+                finally:
+                    db.close()
+
+        return _a.run(go())
+
+    # 两个群都没配 → 完全退回改动前的行为
+    sent, kinds, _ = _run()
+    check("★ 没配预热/预览群时直接发正式群（行为不变）", sent == ["REAL"], sent)
+
+    # 配了预热群：先预热，再正式
+    sent, _, _ = _run(warmup_group="WARM")
+    check("★ 配了 WARMUP_GROUP → 先预热再发正式群", sent == ["WARM", "REAL"], sent)
+
+    # 只配预览群：预览那条本身就是预热
+    sent, _, _ = _run(preview_group="PREV")
+    check("★ 只配 PREVIEW_GROUP → 预览那条兼作预热", sent == ["PREV", "REAL"], sent)
+
+    # 两个群配成同一个 → **只发一次**（不是发两遍）
+    sent, _, _ = _run(warmup_group="SAME", preview_group="SAME")
+    check("★ 预热群和预览群是同一个时只发一次（预览那条就是预热）",
+          sent == ["SAME", "REAL"], sent)
+
+    # 预热群本身就是正式群 → 不能发两遍
+    sent, _, _ = _run(warmup_group="REAL")
+    check("★ 预热群同时是正式群时只发一遍", sent == ["REAL"], sent)
+    sent, _, _ = _run(preview_group="REAL")
+    check("★ 预览群同时是正式群时只发一遍", sent == ["REAL"], sent)
+
+    # 两个都配 → 三段齐全，顺序不能乱
+    sent, _, _ = _run(warmup_group="WARM", preview_group="PREV")
+    check("★ 三段顺序：预热 → 预览 → 正式", sent == ["WARM", "PREV", "REAL"], sent)
+
+    # ---- 人工喊停 ----
+    import asyncio as _a
+
+    async def veto_case():
+        with tempfile.TemporaryDirectory() as d:
+            db = _DB(_P(d) / "v.db")
+            try:
+                cfg = dataclasses.replace(
+                    cfg_stub(), ticket_groups=("REAL",), ticket_images=False,
+                    preview_group="PREV", preview_warmup_sec=0, preview_veto_sec=5)
+                pusher = _Pusher()
+                poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
+
+                async def veto_soon():
+                    await _a.sleep(0.05)
+                    return poller.veto_current()
+
+                _, hit = await _a.gather(poller.poll_once(), veto_soon())
+                return pusher.sent, hit, db.ticket_alert_kinds("REAL")
+            finally:
+                db.close()
+
+    sent, hit, kinds = _a.run(veto_case())
+    check("★ 预览窗口内喊「不发」→ 正式群一条都不发", "REAL" not in sent, sent)
+    check("★ veto_current 返回 True（真的挡下了，不是回句话而已）", hit is True, hit)
+    check("★ 被挡下的提醒照样记账（否则下一轮又捞出来，你得每轮否一次）",
+          "entry24" in kinds.get("rec-1", set()), kinds)
+
+    # 窗口没开时喊「不发」不算数
+    idle = _tk.TicketPoller(cfg_stub(), None, _Http(), _Pusher())
+    check("★ 预览窗口没开时 veto_current 返回 False（闲聊里的「不发」不能吞掉下一条）",
+          idle.veto_current() is False)
+
+    # ---- stop() 要能打断预热等待（不然停机干等 45 秒）----
+    async def stop_case():
+        with tempfile.TemporaryDirectory() as d:
+            db = _DB(_P(d) / "st.db")
+            try:
+                cfg = dataclasses.replace(
+                    cfg_stub(), ticket_groups=("REAL",), ticket_images=False,
+                    warmup_group="WARM", preview_warmup_sec=30)
+                pusher = _Pusher()
+                poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
+
+                async def stopper():
+                    await _a.sleep(0.05)
+                    poller.stop()
+
+                await _a.gather(poller.poll_once(), stopper())
+                return pusher.sent
+            finally:
+                db.close()
+
+    sent = _a.run(stop_case())
+    check("★ stop() 能打断预热等待，且不再往正式群发",
+          sent == ["WARM"], sent)
+
+
+def _check_tk_db() -> None:
+    import tempfile
+    from pathlib import Path as _P
+
+    from qq_rss_bot.db import Database as _DB
+
+    with tempfile.TemporaryDirectory() as d:
+        db = _DB(_P(d) / "t.db")
+        try:
+            check("★ 全新库：表是空的（= 还没建过 baseline）", not db.ticket_alerts_any())
+            check("空表查 kinds 得到空 dict", db.ticket_alert_kinds("G") == {})
+
+            db.mark_ticket_alert("rec-1", "G", "new")
+            check("★ 记一条之后 baseline 就算建过了", db.ticket_alerts_any())
+            check("★ kinds 按受付归组", db.ticket_alert_kinds("G") == {"rec-1": {"new"}})
+
+            db.mark_ticket_alert("rec-1", "G", "entry24")
+            db.mark_ticket_alert("rec-1", "G", "new")  # 重复
+            check("★ 重复标记幂等",
+                  db.ticket_alert_kinds("G") == {"rec-1": {"new", "entry24"}},
+                  db.ticket_alert_kinds("G"))
+
+            check("★ 提醒是逐群记的（别的群不受影响）", db.ticket_alert_kinds("H") == {})
+            db.mark_ticket_alert("rec-1", "H", "new")
+            check("★ 加新群时那个群是干净的 —— 所以 baseline 判据不能按群查",
+                  db.ticket_alert_kinds("H") == {"rec-1": {"new"}})
+        finally:
+            db.close()
+
+
+def _check_tk_poller() -> None:
+    """★ 首轮 baseline 只吞 `new`，**不能吞掉締切提醒**。
+
+    存量 31 条受付必须挡住（否则一开就跑十几条进群），但已经在 24h 窗口里的
+    締切要照推 —— 不然第一次启动群里一条消息都没有，没法判断功能通没通。
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from qq_rss_bot.db import Database as _DB
+
+    def payload(now):
+        end = now + timedelta(hours=5)          # 落在 24h 窗口里、2h 窗口外
+        dep = now + timedelta(hours=30)
+        return {
+            "data": [{
+                "id": "rec-1", "type": "reception",
+                "attributes": {
+                    "name": "アソビストア一般会員先行", "entry_type": "lottery",
+                    "entry_period_status": "within_entry_period",
+                    "entry_period_ends_at": end.isoformat(),
+                    "deposit_period_ends_at": dep.isoformat(),
+                },
+                "relationships": {
+                    "tour": {"data": {"id": "t1", "type": "tour"}},
+                    "cover_image": {"data": None},
+                },
+            }],
+            "included": [
+                {"id": "t1", "type": "tour", "attributes": {"name": "巡演"},
+                 "relationships": {"booth": {"data": {"id": "b1", "type": "booth"}}}},
+                {"id": "b1", "type": "booth",
+                 "attributes": {"name": "活动", "slug": "va-liv-3rdlive"}},
+            ],
+        }
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+            self.headers = {}
+            # 尺寸探测要读字节（`multiimage.measure`）—— 给一张真的 800×450
+            self.content = _png(800, 450)
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            pass
+
+    def booths_payload():
+        """这场 live 的主视觉。受付那条的 `cover_image` 是 null（见上），
+        所以图只能来自这里 —— 正好是用户报的那个场景。"""
+        return {
+            "data": [{"id": "b1", "type": "booth",
+                      "attributes": {"slug": "va-liv-3rdlive", "name": "活动"},
+                      "relationships": {"cover_image": {"data": {"id": "bc-1", "type": "image"}}}}],
+            "included": [{"id": "bc-1", "type": "image",
+                          "attributes": {"reading_urls": {"medium": "https://cdn/live.png.800"}}}],
+        }
+
+    class _Http:
+        async def get(self, url, **kw):
+            # 两条接口分开发 —— 封面在 booths 里，混起来这条钉子就白钉了
+            return _Resp(booths_payload() if url.endswith("/booths") else payload(_tk.now()))
+
+    class _Pusher:
+        def __init__(self):
+            self.sent: list[tuple[str, str]] = []
+
+        async def send_markdown(self, group, text):
+            self.sent.append((group, text))
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as d:
+            db = _DB(_P(d) / "t.db")
+            try:
+                cfg = dataclasses.replace(cfg_stub(), ticket_groups=("G",))
+                pusher = _Pusher()
+                poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
+
+                n1 = await poller.poll_once()
+                check("★ 首轮：只推締切，不推「新受付」",
+                      n1 == 1 and len(pusher.sent) == 1
+                      and "申込締切" in pusher.sent[0][1]
+                      and "新受付" not in pusher.sent[0][1],
+                      f"n={n1} sent={[t[:20] for _, t in pusher.sent]}")
+                # ★ 端到端：推出去的提醒真的带上了这场 live 的封面。
+                #   受付自己没有封面（cover_image=null），图只能来自 booths 那条。
+                check("★ 推送的提醒带上了 booth 级封面（受付级是 null）",
+                      pusher.sent[0][1].startswith(
+                          "![图1 #320px #180px](https://cdn/live.png.800)\n"),
+                      pusher.sent[0][1][:80])
+                check("★ 首轮已经把 new 记成已推（下次不会补发）",
+                      db.ticket_alert_kinds("G") == {"rec-1": {"new", "entry24"}},
+                      db.ticket_alert_kinds("G"))
+
+                n2 = await poller.poll_once()
+                check("★ 第二轮：同一条不重复推", n2 == 0, n2)
+
+                # 发失败不能记账，否则那条提醒永远丢了
+                class _Boom:
+                    async def send_markdown(self, group, text):
+                        raise RuntimeError("boom")
+
+                with tempfile.TemporaryDirectory() as d2:
+                    db2 = _DB(_P(d2) / "t2.db")
+                    try:
+                        p2 = _tk.TicketPoller(cfg, db2, _Http(), _Boom())
+                        check("★ 发送失败时不记账（下一轮会重试）",
+                              await p2.poll_once() == 0
+                              and "entry24" not in db2.ticket_alert_kinds("G").get("rec-1", set()),
+                              db2.ticket_alert_kinds("G"))
+                    finally:
+                        db2.close()
+            finally:
+                db.close()
+
+    asyncio.run(run())
+
+
+_check_tk_brand()
+_check_tk_poller()
+_check_tk_stage()
+_check_tk_parse()
+_check_tk_alerts()
+_check_tk_render()
+_check_tk_cover()
+_check_tk_feed()
+_check_tk_db()
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

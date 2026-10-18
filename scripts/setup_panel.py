@@ -55,20 +55,26 @@ TARGET_TYPE = "all"  # 该场景下所有群都生效（机器人在群里的 op
 NAME_LIMIT = 14
 DESC_LIMIT = 30
 
-# **只留三个入口。** 指令面板实测是**平的、不能嵌套**
-# （见 scripts/probe_panel.py），11 个元素挤在一起之后再加功能就没地方放了。
-# 所以面板只管把人领进门，订阅/退订/列表/搜索这些全收进 `/rss` 的按钮卡片里
-# —— 面板做不到的层级，消息里的 keyboard 做得到。
+# **只放常驻入口，不放全部指令。** 指令面板实测是**平的、不能嵌套**
+# （见 scripts/probe_panel.py），单面板上限 20 个元素 —— 挤满了再加功能就没地方。
+# 所以面板只管把人领进门：订阅/退订/列表/搜索（都在 `/rss` 下面）收进按钮卡片，
+# 面板做不到的层级，消息里的 keyboard 做得到。
 #
-# 三个都是 only_admin=False：`/rss` 只是打开菜单，具体指令各自的权限在
-# commands._is_admin 里判。面板上标成管理员会让普通成员连菜单都打不开。
+# 五个都是 only_admin=False：`/rss` 只是打开菜单，`/抽选` `/当落` 是只读的，
+# 具体指令各自的权限在 commands._is_admin 里判。面板上标成管理员会让普通成员
+# 连菜单都打不开。
 #
 # 名称用**裸名**（不带斜杠）：实测服务端会把开头的 `/` 剥掉存成 `sub`，
 # 客户端点击时自己补 `/`。写成 `/rss` 不会被拒，但回读时对不上，制造假差异。
+# 中文名同理 —— `抽选` 是 `COMMAND_ALIASES` 里认的别名，点一下就是 `/抽选`。
 PANEL_ITEMS = [
     {"name": "rss", "desc": "RSS 订阅设置，点开是按钮菜单", "type": "command",
      "only_admin": False},
     {"name": "new", "desc": "读最新几条新闻，可指定数量", "type": "command",
+     "only_admin": False},
+    {"name": "抽选", "desc": "看哪些抽选正在受付中", "type": "command",
+     "only_admin": False},
+    {"name": "当落", "desc": "看待当落和要入金的", "type": "command",
      "only_admin": False},
     {"name": "help", "desc": "查看完整用法说明", "type": "command", "only_admin": False},
 ]

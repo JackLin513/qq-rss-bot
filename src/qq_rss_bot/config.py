@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 # 默认值只在 ai.py 里写一份，免得两边漂
 from . import ai as ai_module
+# 同上：抽票的品牌白名单和接口地址只在 tickets.py 里写一份
+from . import tickets as tickets_module
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -146,6 +148,42 @@ class Config:
     # 任何一步失败都静默降级成不带标签，不影响推送。
     imas_tags: bool = True
 
+    # ===== ASOBI TICKET 抽票提醒（见 tickets.py 的模块说明）=====
+    #
+    # 偶像大师各场 live 的抽选什么时候开始 / 截止，以前只能自己上网站翻。
+    # 这个功能拉 ASOBI TICKET 的**公开接口**（不用登录、群晖直连 1.4 秒、
+    # **不用挂代理**），做三类提醒：新受付 / 申込締切 / 入金締切。
+    #
+    # ⚠️ **首轮只把 `new` 建成 baseline，一条 `new` 都不推** —— 存量有 31 条
+    # 受付，直接跑会当场倒灌十几条。但締切提醒故意不 baseline，该响就响。
+    ticket_alert: bool = True
+    # 推到哪些群。**空 = 整个功能关闭。**
+    # 先只填老测试群，跑几天确认没问题再往里加正式群（加一个 openid 就行）。
+    ticket_groups: tuple[str, ...] = ()
+    # 多久检查一次。接口带 ETag，没变时是 304 + 0 字节，所以可以给得很松。
+    ticket_check_sec: int = 300
+    # booth slug 的品牌前缀白名单。**认不出来的前缀一律不推**（fail-closed），
+    # 但会打一条 INFO 日志，将来出新品牌时能看见。
+    # 判据是站点自己打在 slug 上的品牌标 —— **不能改成按活动名匹配**，
+    # 有三个名字里根本没有 IDOLM@STER 的（见 tickets.py 的模块说明）。
+    ticket_brands: tuple[str, ...] = tickets_module.DEFAULT_BRANDS
+    ticket_url: str = tickets_module.DEFAULT_API
+    # 封面图开关。**2026-10-18 加**：markdown 的图片冷链接第一次渲染会炸
+    # （见 CLAUDE.md 那节），所以留个开关方便实测到底是不是也会不显示。
+    # 关掉只影响有没有图，提醒照发。
+    ticket_images: bool = True
+    # 封面图档位。接口给 4 个尺寸，实测体积：
+    #   small 12 KB / medium 144 KB（默认）/ large 271 KB / original 1.8 MB
+    # **别用 original** —— 1.8 MB 正是会把冷链接搞炸的量级；small 只有
+    # 150px 高，放大到渲染宽度 208 会糊。
+    ticket_image_size: str = tickets_module.DEFAULT_IMAGE_SIZE
+    # 封面渲染宽度（px）。**QQ 不会把小图放大** —— 定多少就渲染多少，
+    # 所以 208（bilibili 封面那个值）在手机上是「没占满气泡」的样子。
+    # 这个数对不上设备就白搭，所以做成可调的：
+    # `scripts/probe_mdfmt.py` 会把同一张图按几个宽度发到测试群，挑一个刚好
+    # 占满的填进来。
+    ticket_image_w: int = tickets_module.DEFAULT_IMAGE_W
+
     # ===== AI 摘要（抓正文 + DeepSeek 翻译/精简）=====
     # 按源开关，默认所有源都是关的（`subscriptions.ai_enabled`）。
     # key 留空 = 整个功能关掉，不报错。
@@ -238,6 +276,14 @@ def load_config() -> Config:
         push_summary=_env_bool("PUSH_SUMMARY", True),
         summary_chars=_env_int("SUMMARY_CHARS", 800),
         imas_tags=_env_bool("IMAS_TAGS", True),
+        ticket_alert=_env_bool("TICKET_ALERT", True),
+        ticket_groups=_env_list("TICKET_GROUPS"),
+        ticket_check_sec=_env_int("TICKET_CHECK_SEC", 300),
+        ticket_brands=_env_list("TICKET_BRANDS") or tickets_module.DEFAULT_BRANDS,
+        ticket_url=_env_str("TICKET_URL", tickets_module.DEFAULT_API),
+        ticket_images=_env_bool("TICKET_IMAGES", True),
+        ticket_image_size=_env_str("TICKET_IMAGE_SIZE", tickets_module.DEFAULT_IMAGE_SIZE),
+        ticket_image_w=_env_int("TICKET_IMAGE_W", tickets_module.DEFAULT_IMAGE_W),
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),
         ai_base_url=_env_str("DEEPSEEK_BASE_URL", ai_module.DEFAULT_BASE_URL),
         ai_model=_env_str("DEEPSEEK_MODEL", ai_module.DEFAULT_MODEL),

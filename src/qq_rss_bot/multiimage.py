@@ -134,15 +134,22 @@ async def measure(
     return image_size(resp.content)
 
 
-def box_for(wh: "tuple[int, int]") -> "tuple[int, int]":
-    """真实宽高 → 渲染框。宽度固定，高度按比例，夹在 [MIN_H, MAX_H]。"""
+def box_for(wh: "tuple[int, int]", width: int = COVER_W) -> "tuple[int, int]":
+    """真实宽高 → 渲染框。宽度给定，高度按比例，夹在 [MIN_H, MAX_H]。
+
+    `width` 默认还是 `COVER_W`（208）—— bilibili 封面和 RSS 多图一直在用，
+    **别动那两条路**。QQ **不会**把小于气泡宽度的图放大，定多少就渲染多少，
+    所以想让图占满就得传一个接近气泡宽度的值（抽票列表传 `TICKET_IMAGE_W`）。
+    """
     w, h = wh
-    out_h = round(COVER_W * h / w) if w > 0 else COVER_W
-    return COVER_W, max(MIN_H, min(MAX_H, out_h))
+    out_h = round(width * h / w) if w > 0 else width
+    return width, max(MIN_H, min(MAX_H, out_h))
 
 
-def image_line(index: int, url: str, wh: "tuple[int, int]") -> str:
-    w, h = box_for(wh)
+def image_line(
+    index: int, url: str, wh: "tuple[int, int]", width: int = COVER_W
+) -> str:
+    w, h = box_for(wh, width)
     return f"![图{index} #{w}px #{h}px]({url})"
 
 

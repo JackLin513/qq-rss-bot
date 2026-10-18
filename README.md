@@ -135,6 +135,8 @@ bot 必须用 Docker 服务名访问 RSSHub。忘了改的症状是抓取全部�
 | `/resume <编号>` | 群主/管理员 | 恢复暂停的订阅（失败计数一并清零） |
 | `/interval <编号> <分钟>` | 群主/管理员 | 改抓取间隔，**不用退订重订**（重订会重建 baseline 丢增量） |
 | `/ai <编号> on\|off` | 群主/管理员 | 给某个源开/关 AI 摘要（抓正文 + 翻译/精简）。不带参数列状态 |
+| `/抽选` | 所有人 | 当前**正在受付中**的偶像大师抽选，按截止临近排序 |
+| `/当落` | 所有人 | **待当落**（申込已结束、结果未出）+ **入金中**（不付款会作废）|
 | `/ping` | 所有人 | 存活检测 + 统计 |
 | `/help` | 所有人 | 帮助 |
 
@@ -552,12 +554,12 @@ uv run python scripts/test_c2c.py            # 用库里登记的管理员 openi
 uv run python scripts/test_c2c.py --listen   # 自己连网关抓 openid（需先停掉机器人）
 ```
 
-### 指令面板只留三个入口（客户端输入框打 `/` 弹出）
+### 指令面板（客户端输入框打 `/` 弹出）
 
 官方支持配置「指令面板」，用户在 QQ 里打 `/` 会看到可用指令，点击即填入输入框。
 
-**面板只有三个元素：`rss` / `new` / `help`。** 原因：面板实测是**平的、不能嵌套**
-（见下），11 个元素挤在一起之后再加功能就没地方放了。所以面板只负责把人领进门，
+**面板是五个常驻入口：`rss` / `new` / `抽选` / `当落` / `help`。** 原因：面板实测
+是**平的、不能嵌套**（单面板上限 20 元素），所以它只负责把人领进门 ——
 订阅 / 退订 / 列表 / 搜索这些全收进 `/rss` 的按钮卡片里
 —— 面板做不到的层级，消息里的按钮做得到。
 
@@ -790,6 +792,166 @@ CMS API 补的，一次请求同时拿到企划和分类。
   加 `--raw` 看 CMS 原始字段。
 - 拿不到标签时**静默降级成不带标签**，不影响推送。
 
+## ASOBI TICKET 抽票提醒
+
+偶像大师各场 live 的抽选，什么时候开、什么时候截止、什么时候要入金 ——
+不用自己上网站翻了。
+
+```
+🎫 新受付 · 抽選
+PROJECT IM@S vα-liv 3rdLIVE ＆ MEETING QONNECT AS ONE
+アソビストア一般会員先行
+
+受付期間：2026年10月17日(土) 20:30 〜 2026年11月15日(日) 22:59
+当落发表：2026年11月28日 12:00
+入金期間：2026年11月28日(土) 12:00 〜 2026年12月2日(水) 22:59
+[在 ASOBI TICKET 打开](https://asobiticket2.asobistore.jp/booths/va-liv-3rdlive)
+```
+
+```
+⏰ 申込締切まで あと 2 時間
+PROJECT IM@S vα-liv 3rdLIVE ＆ MEETING QONNECT AS ONE
+アソビストア一般会員先行（抽選）
+2026年11月15日 22:59（北京时间）
+[在 ASOBI TICKET 打开](https://asobiticket2.asobistore.jp/booths/va-liv-3rdlive)
+```
+
+两个列表指令长这样（每场一张封面，图在该场序号上面；同一场的多个受付之间用一个
+全角空格行隔开）：
+
+```
+🎫 更新于 10月18日 19:19（北京时间）
+**抽选中（8 场）**
+![图1 #320px #180px](https://media.app.t-riple.com/…/44895db6-….png.800)
+**1. ATHOME xR LIVE　Apple of my アイ**
+アソビストアプレミアム会員先行
+受付期間：2026年9月28日(月) 20:30 〜 2026年10月18日(日) 22:59
+当落发表：2026年10月31日 12:00
+[在 ASOBI TICKET 打开](https://asobiticket2.asobistore.jp/booths/cinderellagirls-270213)
+![图2 #320px #180px](https://media.app.t-riple.com/…/821e99ab-….png.800)
+**2. THE IDOLM@STER SHINY COLORS ORCHESTRA CONCERT -Radiant Chord-**
+…
+```
+
+节标题、场名都加粗（`**…**` 是唯一实测过的 markdown 语法，见下），
+每场正文之后还有一行 `[在 ASOBI TICKET 打开](…)` 直接跳受付页
+（和提醒那两条同一个写法；**没有写成 `**[场名](url)**`** —— 加粗套链接这个
+构造项目里没验过，而 markdown 渲染失败在这里是静默的），
+图片宽度是 `TICKET_IMAGE_W`（默认 320px）。
+
+**五种提醒**：新受付 / 申込締切前 24 小时 / 申込締切前 2 小时 /
+入金截止前 24 小时 / 入金截止前 2 小时。**不推「当落発表」** ——
+当落要自己上网站查，`/当落` 只能告诉你哪些在等。
+
+```bash
+TICKET_ALERT=true
+TICKET_GROUPS=<group_openid>,<group_openid>   # 留空 = 功能关闭
+TICKET_CHECK_SEC=300
+TICKET_IMAGES=true                            # 封面图开关
+TICKET_IMAGE_SIZE=medium                      # small / medium / large / original
+TICKET_IMAGE_W=320                            # 封面渲染宽度（QQ 不会放大，得对着设备调）
+```
+
+两个只读指令（谁都能用）：
+
+| 指令 | 说明 |
+|---|---|
+| `/抽选` | 当前正在受付中的，按截止临近排序 |
+| `/当落` | 待当落（申込已结束、结果还没出）+ 入金中（**不付款会作废**） |
+
+别名：`ticket` `tickets` `抽票` `受付` → `/抽选`；`result` `进度` `入金` → `/当落`。
+
+### 数据是从哪来的
+
+网站 `asobiticket2.asobistore.jp` 是个 Angular SPA，**列表页 DOM 里只有活动名和
+「受付中」三个字，一个日期都没有** —— 日期是前端拿到页面后另外调接口取的。
+那个接口完全公开、不需要登录：
+
+    GET https://asobi-ticket.api.app.t-riple.com/api/v1/public/receptions
+
+814 KB，31 条受付 + 17 场活动。群晖**直连 1.43 秒**（不用挂代理；YouTube / X 才需要）。
+带 `If-None-Match` 时返回 **304、0 字节、0.47 秒**，所以 5 分钟轮询一次几乎不花什么。
+
+抽票的字段全是结构化的，不用抠正文 HTML：`entry_period_starts_at` /
+`entry_period_ends_at`（申込期間）、`result_announcement_scheduled_at`（当落）、
+`deposit_period_starts_at` / `deposit_period_ends_at`（入金期間）、
+`entry_type`（`lottery` 抽選 / `fcfs` 先着）。
+
+### 只推偶像大师的：看 slug 前缀，不看活动名
+
+接口不支持按品牌筛（`?brand=` / `?category=` 传了也被静默忽略，永远返回 31 条），
+只能拿到全部再自己筛。判据是活动详情页 **slug 的前缀** —— 那是站点自己打的品牌标：
+
+| 偶像大师（8 个前缀） | 不是 |
+|---|---|
+| `va-liv-` `cinderellagirls-` `idolmaster-` `sidem-` `shinycolors-` `765pro-` `gkmas-` `millionlive-` | `tales-` `denonbu-` `zerokyori-` |
+
+**这条判据的价值在于光看活动名会判错。** 三个真实反例，名字里都没有 IDOLM@STER：
+
+| 活动名 | 实际品牌 |
+|---|---|
+| `xR LIVE REVIVAL` | `idolmaster-261212` → 本家 |
+| `ATHOME xR LIVE　Apple of my アイ` | `cinderellagirls-270213` → 灰姑娘 |
+| `shiny, the first REFRAC7IONS " Still blue "` | `shinycolors-261219` → 闪耀色彩 |
+
+认不出来的前缀一律不推，但会在日志里留一条 INFO —— 将来出新品牌时能看见，
+不会静默漏掉。前缀表可以用 `TICKET_BRANDS` 覆盖。
+
+### 判定用日本时间，显示用北京时间
+
+**这是两件事。** 抽选的截止时间是 **23:59 JST**，容器 TZ 是 `Asia/Shanghai`，
+**差一小时** —— 按本地时间算就是整整早一小时截止，等于漏掉最后那一小时。
+所以代码里**所有比较**都走 `tickets.now()`（JST）。
+
+但**显示**是给群里国内的人看的，统一转成北京时间：`23:59 JST` 显示成 `22:59`。
+同一个绝对时刻，两边都对 —— 你贴的那个群友工具用的也是北京时间。
+
+### 首次运行只建 baseline
+
+现在库里有 31 条存量受付（14 条是偶像大师的），直接开跑会当场倒灌十几条消息进群。
+所以**首次轮询把当前 `within_entry_period` 的受付全部记成「已推过」，一条都不发**
+（和 RSS 订阅的 `sub.initialized` 是同一个坑）。
+
+**但締切提醒不建 baseline** —— 已经进 24h / 2h 窗口的照推。所以第一次启动就会
+收到几条締切提醒，这是正常的，也正好用来验功能。
+
+### 封面图
+
+**每场 live 都有一张主视觉。** 图放在消息最上面（列表里是每场序号上面），
+和 bilibili 卡片一致。
+
+它来自另一条公开接口 `GET …/api/v1/public/booths`（16.8 KB，17 个 booth
+全带封面）—— 受付那条接口里 booth 的封面字段永远是空的，而且 `?include=`
+会被静默忽略，所以只能单独问一次。这条接口同样支持 ETag 304，没变化时
+就是 0 字节。
+
+> 早先这里写的是「只有 8 场有封面」，那是只查了受付接口得出的错误结论：
+> 受付自己也有封面字段，但那是**单条受付**的横幅（31 条里 17 条有，和
+> 活动主视觉一张都不重合）。列表按场配图必须用活动级的，否则同一场挂哪张
+> 取决于哪条受付排在前面，还会有一半的场整场没图。
+
+**冷链接第一次会裂，得先预热。** 主动推送走的是和 RSS 同一套三阶段
+（`WARMUP_GROUP` → `PREVIEW_GROUP` → 正式群，见下），共用同一组配置。
+没配这两个群就直发正式群，行为回到改动前。
+
+- 尺寸默认 `medium`（800×450，144 KB）。**别改成 `original`** —— 1.8 MB，
+  正好落在实测的「冷链接会炸」区间里（1.6 MB 不炸、3.4 MB 全炸）。
+- **渲染宽度默认 320px**（`TICKET_IMAGE_W`）。QQ **不会**把小于气泡宽度的图
+  放大 —— 写多少渲染多少，所以宽度得对着自己的设备调。跑一次：
+
+  ```bash
+  uv run python scripts/probe_mdfmt.py --group <测试群 openid> --send
+  ```
+
+  它把同一张图按 208 / 320 / 480 / 640 发到测试群，挑一个刚好贴齐气泡右边缘的
+  填进 `TICKET_IMAGE_W`。同一条消息还会附一份 **markdown 语法 A/B** ——
+  `#` 标题、`>` 引用、`-` 列表这些**都还没验证过**，只有 `**加粗**` 是确认可用的。
+- 发之前会先读一次真实宽高。**读不到就丢图发纯文字，不猜比例** ——
+  markdown 的 `#Wpx #Hpx` 尺寸提示在手机端是必填的，缺了整条都不渲染。
+- **图片 URL 原样用，绝不加 `&_cb=` 之类的 query 参数。** 实测给图 URL 加参数
+  想造冷链接，结果**带参数的一张都不渲染、不带的全好**。
+- 觉得不显示就把 `TICKET_IMAGES=false` 关掉，其余功能不受影响。
+
 ## 推送配图
 
 条目正文里的图会被抠出来当配图（`rss.all_images()`，**最多 6 张**），支持 RSS 的
@@ -937,6 +1099,7 @@ src/qq_rss_bot/
   autosub.py     进群自动订阅
   bilibili.py    群里分享的 bilibili 链接 → 卡片（含四种分享形态的说明）
   preview.py     群里分享的 YouTube / X 链接 → 卡片（含为什么图要 base64 上传）
+  tickets.py     ASOBI TICKET 抽票提醒（含 slug=品牌 的判据和三个反例）
   bot.py         botpy 客户端，事件 → 指令/轮询
 scripts/
   smoke.py            离线逻辑 + 真实抓取
@@ -944,4 +1107,5 @@ scripts/
   probe_bilibili.py   看 bilibili 链接会被渲染成什么（默认不发消息）
   probe_meta.py       探 YouTube / X 的接口在容器里通不通（不碰 QQ）
   probe_media.py      探 QQ 的服务器拉不拉得到某个图片 URL
+  probe_ticket.py     看抽票接口拉到什么、滤掉什么、会推什么（默认不发消息）
 ```

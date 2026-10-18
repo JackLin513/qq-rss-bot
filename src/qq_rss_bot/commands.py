@@ -14,7 +14,7 @@ from typing import Protocol
 
 import httpx
 
-from . import ai, idolmaster
+from . import ai, idolmaster, tickets as tickets_module
 from .config import Config
 from .db import Database, Subscription
 from .menu import (
@@ -128,6 +128,8 @@ HELP_TEXT = """RSS 订阅机器人
 /ai <编号> on|off                  给某个源开/关 AI 摘要（抓正文 + 翻译/精简）
 /ping                              存活检测
 /help                              本说明
+/抽选                              偶像大师各场 live 现在正在受付中的抽选
+/当落                              待当落 + 入金中的抽选（中了不付款会作废）
 
 订阅是按群共享的：群里任何人订阅，全群都会收到推送。
 /sub /unsub /pause /resume /interval /ai 仅群主和管理员可用。
@@ -167,6 +169,15 @@ COMMAND_ALIASES = {
     "ai": "ai",
     "摘要": "ai",
     "ping": "ping",
+    "ticket": "ticket",
+    "tickets": "ticket",
+    "抽选": "ticket",
+    "抽票": "ticket",
+    "受付": "ticket",
+    "result": "result",
+    "当落": "result",
+    "进度": "result",
+    "入金": "result",
     "rss": "rss",
     "菜单": "rss",
     "menu": "rss",
@@ -188,6 +199,8 @@ COMMAND_METHODS = {
     "interval": "_interval",
     "ai": "_ai",
     "ping": "_ping",
+    "ticket": "_ticket",
+    "result": "_result",
     "rss": "_rss",
 }
 
@@ -291,6 +304,10 @@ class CommandHandler:
         self.ai_http = ai_http
         self._routes = None  # 路由表懒加载，进程内常驻
         self._last_new: dict[str, float] = {}  # /new 的每群冷却
+        # 抽票指令的数据源。带 60 秒内存缓存，见 TicketFeed。
+        self.ticket_feed = tickets_module.TicketFeed(cfg, http)
+        # 封面图的宽高，进程内缓存 —— 群里连点两次不用再探一遍图。
+        self._ticket_cover_sizes: dict = {}
 
     async def handle(self, ctx: CommandContext, raw: str) -> None:
         text = _PLACEHOLDER_RE.sub("", raw or "").strip()
@@ -970,3 +987,70 @@ class CommandHandler:
         for sub_id, keys in seen.items():
             self.db.mark_seen(sub_id, keys)
             self.db.prune_seen(sub_id)
+
+    # ---------- 抽票（ASOBI TICKET）----------
+
+    async def _imas_receptions(self, ctx: CommandContext) -> list | None:
+        """拉一次偶像大师的受付列表。拉不到就回一句人话并返回 None。
+
+        `TicketFeed` 带 60 秒缓存 —— 群里有人连点这两条指令时不会把接口刷爆
+        （整个响应 814 KB）。
+        """
+        try:
+            return await self.ticket_feed.imas_receptions()
+        except Exception as exc:  # noqa: BLE001 —— 拉不到不该让人看见堆栈
+            _log.warning("抽票：指令拉取失败 %s: %s", type(exc).__name__, exc)
+            await ctx.reply("ASOBI TICKET 接口暂时拉不到，过一会儿再试。")
+            return None
+
+    async def _reply_markdown(self, ctx: CommandContext, text: str) -> None:
+        """优先用 markdown 回复（列表里带封面图，纯文本显示不了）。
+
+        `reply_card` 拿不到、或者平台回业务错误码（比如没有 markdown 模板
+        权限）时**退回纯文本**，并且把图片行去掉 —— 纯文本里
+        `![图1 #208px #117px](…)` 是一坨没人看得懂的东西。
+        """
+        if ctx.reply_card is not None:
+            try:
+                await ctx.reply_card(text)
+                return
+            except Exception as exc:  # noqa: BLE001 —— 退纯文本，别把指令整挂
+                _log.warning(
+                    "抽票：markdown 回复失败，退回纯文本 %s: %s", type(exc).__name__, exc
+                )
+        await ctx.reply(tickets_module.strip_images(text))
+
+    async def _digest(self, ctx: CommandContext, wanted: tuple[str, ...]) -> None:
+        recs = await self._imas_receptions(ctx)
+        if recs is None:
+            return
+        # 封面表（每场 live 的主视觉）。**拿不到不影响列表** ——
+        # `TicketFeed.covers()` 自己吞异常，退到受付级封面再退纯文字。
+        covers = (
+            await self.ticket_feed.covers()
+            if self.cfg.ticket_images
+            else {}
+        )
+        text = await tickets_module.render_digest(
+            self.http,
+            recs,
+            tickets_module.now(),
+            wanted=wanted,
+            size=self.cfg.ticket_image_size,
+            images=self.cfg.ticket_images,
+            cache=self._ticket_cover_sizes,
+            width=self.cfg.ticket_image_w,
+            booths=covers,
+        )
+        await self._reply_markdown(ctx, text)
+
+    async def _ticket(self, ctx: CommandContext, args: list[str]) -> None:
+        """`/抽选` —— 现在正在受付中的。按截止临近排序。"""
+        await self._digest(ctx, ("open",))
+
+    async def _result(self, ctx: CommandContext, args: list[str]) -> None:
+        """`/当落` —— 待当落 + 入金中。
+
+        入金那条比当落更该盯：中了不付款直接作废，而且没有任何二次提醒。
+        """
+        await self._digest(ctx, ("pending", "deposit"))

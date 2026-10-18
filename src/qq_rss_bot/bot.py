@@ -32,6 +32,7 @@ from .scheduler import (
     image_failure_message,
     send_with_retry,
 )
+from .tickets import TicketPoller
 
 _log = logging.getLogger("qq_rss_bot.bot")
 
@@ -98,6 +99,11 @@ class RssBot(botpy.Client):
             ai_http=self.media_http,
         )
         self._poller_task: Any = None
+        # 抽票提醒（ASOBI TICKET）。**单独一个 task**，不塞进 FeedPoller ——
+        # 数据源、轮询节奏、失败语义都不一样。没配 TICKET_GROUPS 时
+        # `run()` 会立刻返回，等于功能关闭。
+        self.tickets = TicketPoller(cfg, self.db, self.rss_http, self.sender)
+        self._ticket_task: Any = None
 
     # ---------- 生命周期 ----------
 
@@ -108,6 +114,10 @@ class RssBot(botpy.Client):
         if self._poller_task is None:
             self._poller_task = self.loop.create_task(
                 self.poller.run(), name="qq_rss_bot.poller"
+            )
+        if self._ticket_task is None:
+            self._ticket_task = self.loop.create_task(
+                self.tickets.run(), name="qq_rss_bot.tickets"
             )
         if self.autosub.enabled:
             # **先挂 poller 再补订阅**：补订阅万一抛异常，不能连累轮询器起不来。
@@ -199,6 +209,9 @@ class RssBot(botpy.Client):
         self.poller.stop()
         if self._poller_task is not None:
             self._poller_task.cancel()
+        self.tickets.stop()
+        if self._ticket_task is not None:
+            self._ticket_task.cancel()
         await self.rss_http.aclose()
         await self.media_http.aclose()
         self.db.close()
@@ -300,8 +313,16 @@ class RssBot(botpy.Client):
         # 窗口外喊「不发」返回 False，回一句说明 —— 不能因为你闲聊里带了这两个字，
         # 下一条正式推送就莫名其妙被吞掉。
         if (role or "").strip().lower() in ADMIN_ROLES and "不发" in text:
-            if self.poller.veto_current():
-                _log.info("群 %s 喊「不发」，本条不进正式群", message.group_openid)
+            # **两个轮询器都要问**，而且不能短路 —— RSS 和抽票各有自己的预览
+            # 窗口，只问一个的话正在预览的是抽票、你喊「不发」却回「什么都没挡到」。
+            rss_hit = self.poller.veto_current()
+            ticket_hit = self.tickets.veto_current()
+            if rss_hit or ticket_hit:
+                _log.info(
+                    "群 %s 喊「不发」，本条不进正式群（%s）",
+                    message.group_openid,
+                    "抽票" if ticket_hit else "RSS",
+                )
                 await reply("收到，这一条不发到正式群。")
             else:
                 await reply("现在没有待确认的预览，什么都没挡到。")
