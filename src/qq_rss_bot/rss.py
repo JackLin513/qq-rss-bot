@@ -34,10 +34,16 @@ _IMG_URL_RE = re.compile(
 )
 
 
-# 一条资讯最多带几张图。**不是随便定的**：这条走的是主动消息，每张图
-# **各占一条配额**（20 条/分钟、每天还有上限），4 张图就是 4 条配额。
-# 上限压在这个数，是为了让「一条资讯」不至于吃掉一天的额度。
-MAX_IMAGES = 4
+# 一条资讯最多带几张图。
+#
+# **原来定的是 4，理由是「每张图各占一条配额」—— 那个理由已经不成立了。**
+# 多图现在默认合并成一条 markdown（`MULTI_IMAGE_MARKDOWN`），不管几张都只占
+# 1 条主动消息。2026-10-18 实测偶像大师那条最新资讯实际有 6 张，被 4 砍掉了两张。
+#
+# 6 是和 `multiimage.MAX_IMAGES`（渲染侧上限）对齐的数。真正的硬约束是
+# markdown 的正文长度 —— 超了 `multiimage.build` 会从尾部丢图，不会发失败。
+# **只有退回连发那条路（关掉 `MULTI_IMAGE_MARKDOWN`）才是「几张图几条配额」。**
+MAX_IMAGES = 6
 
 
 def all_images(*html_parts: str | None, limit: int = MAX_IMAGES) -> tuple[str, ...]:

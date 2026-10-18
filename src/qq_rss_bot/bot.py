@@ -290,6 +290,23 @@ class RssBot(botpy.Client):
                 _log.info("群 %s 摘掉已非管理员的通知对象 %s", message.group_openid, member_openid[:8])
                 self.db.remove_notify_target(message.group_openid, member_openid)
         reply, reply_card, _ = self._make_repliers(message)
+
+        # 「不发」：人工否决预览，挡下这一条不进正式群。
+        #
+        # **必须在指令分发之前** —— 交给 `commands.handle` 的话会被当成未知指令，
+        # 回一句帮助文本，你根本看不出到底挡没挡住。
+        #
+        # 只认管理员，且**只在预览窗口开着时才生效**（`veto_current` 负责判断）。
+        # 窗口外喊「不发」返回 False，回一句说明 —— 不能因为你闲聊里带了这两个字，
+        # 下一条正式推送就莫名其妙被吞掉。
+        if (role or "").strip().lower() in ADMIN_ROLES and "不发" in text:
+            if self.poller.veto_current():
+                _log.info("群 %s 喊「不发」，本条不进正式群", message.group_openid)
+                await reply("收到，这一条不发到正式群。")
+            else:
+                await reply("现在没有待确认的预览，什么都没挡到。")
+            return
+
         ctx = CommandContext(
             group_openid=message.group_openid,
             reply=reply,
@@ -655,6 +672,47 @@ class RssBot(botpy.Client):
             content=content,
             media={"file_info": file_info},
         )
+
+    async def send_markdown(self, group_openid: str, content: str) -> None:
+        """主动发 markdown（`msg_type=2`）。
+
+        多图走这条：`msg_type=7` 的 `MediaInfo` 只有一个 `file_info`，一条只能
+        带一张图，多图就得连发 N 条（N 条消息、N 份配额、还刷屏）。markdown
+        正文里可以放任意多个 `![](url)`，一条搞定。
+
+        语法和坑（**尺寸提示必填、比例必须对、URL 绝不能带 `_cb`**）见
+        `multiimage.py` 的模块说明。
+        """
+        resp = await self.api.post_group_message(
+            group_openid=group_openid,
+            msg_type=2,  # 2=markdown
+            markdown={"content": content},
+        )
+        # 和 reply_card 同理：botpy 只在 **HTTP** 非 2xx 时抛异常，业务错误码是
+        # 200 带 code 回来的。不判这一下，「无 Markdown 模板权限」会被当成发送
+        # 成功，而多图那条路的兜底（退回连发）永远不会触发。
+        code = resp.get("code") if isinstance(resp, dict) else None
+        if code:
+            raise RuntimeError(f"发送 markdown 失败 code={code}: {resp}")
+
+    async def upload_image(self, group_openid: str, image_url: str) -> bool:
+        """让 QQ 去抓一张图，只拿 `file_info`、**不发消息**。返回抓没抓到。
+
+        多图那条路的**事前检查**：markdown 的图裂了是静默的（发送接口照样
+        HTTP 200，没有任何回执），事后无从发现，只能先问一次「QQ 够不够得到」。
+        顺带这张图就进了 QQ 那边的缓存。
+        """
+        try:
+            resp = await self.api.post_group_file(
+                group_openid=group_openid,
+                file_type=1,  # 1=图片
+                url=image_url,
+                srv_send_msg=False,  # 只上传，不单独发一条
+            )
+        except Exception:  # noqa: BLE001 —— 抓不到只是少一张图，不该连累推送
+            _log.info("多图：QQ 抓不到这张图 %s", image_url, exc_info=True)
+            return False
+        return bool(isinstance(resp, dict) and resp.get("file_info"))
 
     # ---------- 私聊出口（C2CNotifier 用它发出错通知）----------
 

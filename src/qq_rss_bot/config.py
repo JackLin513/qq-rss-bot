@@ -101,11 +101,50 @@ class Config:
     # 觉得刷屏就关掉对应的那个，另一个不受影响。
     preview_multi_image: bool = True
     rss_multi_image: bool = True
+    # 多图**合并成一条 markdown**（`msg_type=2`），而不是连发 N 条富媒体。
+    # 一条带 4 张图的资讯从 4 条消息变成 1 条，省 3 份主动配额，也不刷屏。
+    #
+    # 代价：markdown 的图由 **QQ 的服务器自己去下载**（富媒体那条路其实也是，
+    # `send_rich` 传的就是 url），所以图必须 QQ 够得到。发之前会先用
+    # `upload_image` 探一次，抓不到的图直接剔掉 —— markdown 的图裂了是静默的，
+    # 事后无从发现。
+    #
+    # 2026-10-18 实测有效（手机端 + 电脑端都确认过）。语法和坑见
+    # `multiimage.py` 的模块说明。**关掉它就退回连发**。
+    multi_image_markdown: bool = True
+    # ---- markdown 多图预热：正式群推送前的两道预热 + 一道人工预览 ----
+    #
+    # **为什么需要**：2026-10-18 实测，QQ 的图片缓存是**服务端、跨群共享**的，
+    # 但**冷链接第一次渲染必炸** —— 一批 3.4 MB 的图 6 张全裂。把**同一批
+    # 同样的 URL** 隔 20 秒发到**另一个群**，6 张全好。而且那次冷发一张都没
+    # 抓下来（客户端上什么都没缓存），所以只可能是服务端。
+    #
+    # 于是：正式群之前先往 `warmup_group` 发一条 → 等 `preview_warmup_sec`
+    # → 再往 `preview_group` 发一条（这条同时是**给你看的预览**）→ 等
+    # `preview_veto_sec`，你没喊「不发」才发正式群。
+    #
+    # ⚠️ **预热必须是「真的发一条 markdown」。** `upload_image`（`post_group_file`
+    # + `srv_send_msg=False`）那条路**预热不了** —— 生产里每条推送都逐张探过
+    # （探针返回成功 = QQ 确实抓到了），markdown 照样裂。这是实测出来的。
+    #
+    # 两个群都留空 = 整个机制关闭，行为完全退回改动前。
+    warmup_group: str = ""
+    preview_group: str = ""
+    # 预热①到预热②之间等多久。QQ 抓完图要时间，和**图片总体积**正相关：
+    # 实测 3.4 MB 约 20 秒够、5.7 MB 要 60 秒左右。图大就调大。
+    preview_warmup_sec: int = 45
+    # 预览发出去后等多久算「你没喊停」。这段时间正式群一条都不发。
+    preview_veto_sec: int = 30
     # 推送文案里带不带 RSS 摘要。关掉就退回「源名 / 标题 / 链接」三行。
     push_summary: bool = True
     # 摘要显示多少字。**不是平台限制**（实测 40000 字符 QQ 照样收），
     # 纯粹是可读性。
-    summary_chars: int = 400
+    summary_chars: int = 800
+    # 偶像大师官网 NEWS 的「企划 / 分类」标签（`【灰姑娘】【演出/谷子】`）。
+    # 这两个属性 RSS 里都没有 —— 企划 CMS 压根不输出、分类给的是日文原名 ——
+    # 所以开了它**每次轮询会多调一次 CMS API**（见 idolmaster.py）。
+    # 任何一步失败都静默降级成不带标签，不影响推送。
+    imas_tags: bool = True
 
     # ===== AI 摘要（抓正文 + DeepSeek 翻译/精简）=====
     # 按源开关，默认所有源都是关的（`subscriptions.ai_enabled`）。
@@ -191,8 +230,14 @@ def load_config() -> Config:
         twitter_preview=_env_bool("TWITTER_PREVIEW", True),
         preview_multi_image=_env_bool("PREVIEW_MULTI_IMAGE", True),
         rss_multi_image=_env_bool("RSS_MULTI_IMAGE", True),
+        multi_image_markdown=_env_bool("MULTI_IMAGE_MARKDOWN", True),
+        warmup_group=_env_str("WARMUP_GROUP", ""),
+        preview_group=_env_str("PREVIEW_GROUP", ""),
+        preview_warmup_sec=_env_int("PREVIEW_WARMUP_SEC", 45),
+        preview_veto_sec=_env_int("PREVIEW_VETO_SEC", 30),
         push_summary=_env_bool("PUSH_SUMMARY", True),
-        summary_chars=_env_int("SUMMARY_CHARS", 400),
+        summary_chars=_env_int("SUMMARY_CHARS", 800),
+        imas_tags=_env_bool("IMAS_TAGS", True),
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),
         ai_base_url=_env_str("DEEPSEEK_BASE_URL", ai_module.DEFAULT_BASE_URL),
         ai_model=_env_str("DEEPSEEK_MODEL", ai_module.DEFAULT_MODEL),

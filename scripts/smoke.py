@@ -3263,7 +3263,13 @@ def _check_ai_format() -> None:
     # **不附原标题。** 附过一版（`原题：…`），发出来一条四段太长，
     # 群里一屏放不下，而原题信息量最低。`translated` 现在只写日志。
     check("★ 不再附原标题（内容太长，实测砍掉）", "原题：" not in text, repr(text))
-    check("★ 译文时文案只有 4 行", len(text.splitlines()) == 4, repr(text))
+    # 标题和正文之间**有一个空行**（2026-10-18 用户要求）：推送走的是
+    # msg_type=0/7 的**纯文本**（不是 markdown），单换行读起来就是
+    # 「标题紧贴着正文」一坨。空行把它切成两段。
+    check("★ 译文时文案 5 行（标题与正文之间有空行）",
+          len(text.splitlines()) == 5, repr(text))
+    check("★ 空行确实在标题和正文之间",
+          text.splitlines()[2] == "" and "中文摘要正文" in text.splitlines()[3], repr(text))
 
     zh = Digest(title="OpenAI ships GPT-7", summary="中文摘要", translated=False)
     t2 = format_entry("TechCrunch", "https://a.com/f", e, digest=zh)
@@ -3474,6 +3480,611 @@ _check_ai_extract()
 _check_ai_format()
 asyncio.run(_check_ai_pipeline())
 asyncio.run(_check_ai_command())
+
+
+print("[4.61] 偶像大师的企划/分类标签")
+
+from qq_rss_bot import idolmaster as _imas  # noqa: E402
+
+
+class _ImasHttp:
+    """按 URL 路由的假 httpx。记录每次请求的 URL。"""
+
+    def __init__(self, articles=None, *, fail=False, token="T"):
+        self.calls: list[str] = []
+        self._articles, self._fail, self._token = articles, fail, token
+
+    async def get(self, url, **kw):
+        self.calls.append(url)
+        if self._fail:
+            raise httpx.ConnectError("boom")
+        if url.endswith("/Token/get"):
+            data = {} if self._token is None else {"token": self._token}
+            return _FakeResp(payload={"data": data})
+        return _FakeResp(payload={"data": {"article_list": self._articles or []}})
+
+
+def _check_imas_pure() -> None:
+    check("★ 认出偶像大师订阅（路由形态）", _imas.matches("/idolmaster/news"))
+    check("★ 认出偶像大师订阅（完整 URL）",
+          _imas.matches("http://rsshub:1200/idolmaster/news"))
+    check("★ 认出带 brand 参数的路由",
+          _imas.matches("http://rsshub:1200/idolmaster/news/brand=SHINYCOLORS"))
+    check("别的源返回 False", not _imas.matches("http://rsshub:1200/v2ex/topics"))
+    check("★ 不把长得像的域名误判成偶像大师",
+          not _imas.matches("https://example.com/idolmasterish/news"))
+
+    check("★ 单企划单分类",
+          _imas.tag_line(("CINDERELLAGIRLS",), ("GOODS",)) == "【灰姑娘】【谷子】",
+          _imas.tag_line(("CINDERELLAGIRLS",), ("GOODS",)))
+    check("★ 多企划用 / 连",
+          _imas.tag_line(("IDOLMASTER", "CINDERELLAGIRLS", "MILLIONLIVE"), ("OTHER",))
+          == "【本家/灰姑娘/百万】【其他】")
+    check("★ 七个企划全挂（通稿类）",
+          _imas.tag_line(tuple(_imas.BRAND_NAMES), ("OTHER",))
+          == "【本家/灰姑娘/百万/男人/闪彩/学马/其他】【其他】",
+          _imas.tag_line(tuple(_imas.BRAND_NAMES), ("OTHER",)))
+    check("★ 多分类也用 / 连（实测 65/180 篇是两个分类）",
+          _imas.tag_line(("SHINYCOLORS",), ("LIVE-EVENT", "GOODS")) == "【闪彩】【演出/谷子】")
+    check("★ 未知 code 原样显示（静默丢掉的症状是「这条怎么没标签」）",
+          _imas.tag_line(("NEWBRAND",), ("NEWTYPE",)) == "【NEWBRAND】【NEWTYPE】")
+    check("只有企划没有分类也行", _imas.tag_line(("GAKUEN",), ()) == "【学马】")
+    check("两边都空 → 空串（调用方据此不加这一行）", _imas.tag_line((), ()) == "")
+
+    check("★ 企划表 7 个", len(_imas.BRAND_NAMES) == 7, str(sorted(_imas.BRAND_NAMES)))
+    check("★ 分类表 11 个（CMS subcategory 全集）",
+          len(_imas.TYPE_NAMES) == 11, str(sorted(_imas.TYPE_NAMES)))
+    # 这两个 code 名不副实，别照着 code 直译
+    check("★ CD 译「音乐」不是「CD」（日文原名是 ミュージック）",
+          _imas.TYPE_NAMES["CD"] == "音乐")
+    check("★ LIVE-EVENT 译「演出」不是「演唱会」（含线下活动）",
+          _imas.TYPE_NAMES["LIVE-EVENT"] == "演出")
+
+
+_check_imas_pure()
+
+_IMAS_META = [
+    {"url": "https://idolmaster-official.jp/news/01_1.html",
+     "brand": [{"code": "CINDERELLAGIRLS", "name": "シンデレラガールズ"}],
+     "categories": {"code": "NEWS", "subcategory": [{"code": "GOODS", "name": "グッズ"}]}},
+    {"url": "https://idolmaster-official.jp/news/01_2.html",
+     "brand": [{"code": "IDOLMASTER"}, {"code": "OTHER"}],
+     "categories": {"subcategory": [{"code": "LIVE-EVENT"}, {"code": "GOODS"}]}},
+    # 脏数据：没有 url、brand 不是 list、元素缺 code —— 全都得滤掉而不是炸
+    {"brand": [{"code": "X"}]},
+    {"url": "https://idolmaster-official.jp/news/01_3.html",
+     "brand": "坏", "categories": None},
+    {"url": "https://idolmaster-official.jp/news/01_4.html",
+     "brand": [{"name": "没code"}, "字符串"], "categories": {"subcategory": [{"code": ""}]}},
+]
+
+
+def _check_imas_fetch() -> None:
+    async def main() -> None:
+        http = _ImasHttp(_IMAS_META)
+        got = await _imas.fetch_meta(http)
+        check("★ 两次请求（先换 token 再查列表）", len(http.calls) == 2, str(http.calls))
+        u1 = "https://idolmaster-official.jp/news/01_1.html"
+        check("★ 按文章 url 建映射", u1 in got, str(sorted(got)))
+        check("★ 企划取的是 code 元组", got[u1][0] == ("CINDERELLAGIRLS",), str(got[u1]))
+        check("★ 分类取的是 code（不是 RSS 里那个日文原名）",
+              got[u1][1] == ("GOODS",), str(got[u1]))
+        check("★ 多值保序",
+              got["https://idolmaster-official.jp/news/01_2.html"]
+              == (("IDOLMASTER", "OTHER"), ("LIVE-EVENT", "GOODS")))
+        check("★ 没有 url 的条目被丢掉（其余 4 条都在）", len(got) == 4, str(sorted(got)))
+        check("★ brand 不是 list 时不炸，当空处理",
+              got["https://idolmaster-official.jp/news/01_3.html"][0] == ())
+        check("★ 元素缺 code / 空串被滤掉",
+              got["https://idolmaster-official.jp/news/01_4.html"] == ((), ()))
+
+        e1 = Entry(key=u1, title="t1", link=u1, published=None, summary="")
+        e2 = Entry(key="k2", title="t2",
+                   link="https://idolmaster-official.jp/news/01_2.html",
+                   published=None, summary="")
+        e3 = Entry(key="k3", title="t3",
+                   link="https://idolmaster-official.jp/news/99.html",
+                   published=None, summary="")
+        tags = await _imas.tags_for(_ImasHttp(_IMAS_META), "/idolmaster/news", [e1, e2, e3])
+        check("★ key 就是 link 时对得上", tags.get(u1) == "【灰姑娘】【谷子】", str(tags))
+        check("★ key 和 link 不同也能按 link 对上",
+              tags.get("k2") == "【本家/其他】【演出/谷子】", str(tags))
+        check("★ CMS 里没有的文章不给标签（宁可不加也不瞎猜）", "k3" not in tags, str(tags))
+
+        spy = _ImasHttp(_IMAS_META)
+        check("★ 非偶像大师订阅一次请求都不发",
+              await _imas.tags_for(spy, "/v2ex/topics", [e1]) == {} and spy.calls == [],
+              str(spy.calls))
+        spy2 = _ImasHttp(_IMAS_META)
+        check("空 entries 也不发请求",
+              await _imas.tags_for(spy2, "/idolmaster/news", []) == {} and spy2.calls == [])
+
+        check("★ 网络挂了静默返回 {}，绝不抛（这条路在推送主循环里）",
+              await _imas.tags_for(_ImasHttp(fail=True), "/idolmaster/news", [e1]) == {})
+        check("★ token 响应里没有 token 时也不炸",
+              await _imas.tags_for(_ImasHttp(_IMAS_META, token=None),
+                                   "/idolmaster/news", [e1]) == {})
+        check("★ 列表是空数组时返回 {}",
+              await _imas.tags_for(_ImasHttp([]), "/idolmaster/news", [e1]) == {})
+
+    asyncio.run(main())
+
+
+_check_imas_fetch()
+
+
+def _check_imas_format() -> None:
+    e = Entry(key="k", title="【シャニマス】コラボカフェ開催決定！",
+              link="https://idolmaster-official.jp/news/01_1.html",
+              published=None, summary="プロデューサーの皆さん、こんにちは！")
+    plain = format_entry("NEWS | アイドルマスター", "u", e)
+    tagged = format_entry("NEWS | アイドルマスター", "u", e, tags="【闪彩】【联动】")
+
+    check("★ 标签紧跟源名（第 2 行）",
+          tagged.splitlines()[1] == "【闪彩】【联动】", repr(tagged))
+    check("★ 标签在标题**之上**",
+          tagged.index("【闪彩】【联动】") < tagged.index("· 【シャニマス】"), repr(tagged))
+    check("★ 标签多占一行",
+          len(tagged.splitlines()) == len(plain.splitlines()) + 1, repr(tagged))
+    check("★ 空 tags 时一行都不多", len(plain.splitlines()) == 5, repr(plain))
+    check("★ 空 tags 不留空行", "\n\n\n" not in plain, repr(plain))
+
+    # 正文和标题一样 → 正文那行**和空行**都不加（用户 2026-10-18 明确要求）
+    same = Entry(key="k2", title="标题", link="https://a.com/2",
+                 published=None, summary="标题")
+    t = format_entry("源", "u", same, tags="【本家】【其他】")
+    check("★ 正文等于标题时不重复正文", t.count("标题") == 1, repr(t))
+    check("★ 也不留空行", "\n\n" not in t, repr(t))
+    check("★ 只有 4 行：源名/标签/标题/链接", len(t.splitlines()) == 4, repr(t))
+
+    # 正文里带标题前缀 → 剥掉前缀后如果没剩东西，同样不重复
+    pref = Entry(key="k3", title="标题", link="https://a.com/3",
+                 published=None, summary="标题 - 后面还有正文")
+    t2 = format_entry("源", "u", pref)
+    check("★ 剥掉标题前缀后剩下的正文照发", "后面还有正文" in t2, repr(t2))
+    check("★ 这时才有空行", "\n\n" in t2, repr(t2))
+
+
+_check_imas_format()
+
+check("★ IMAS_TAGS 开关存在且默认开", cfg_stub().imas_tags is True)
+
+
+print("[4.62] markdown 多图（N 张图合并成一条消息）")
+
+from qq_rss_bot import multiimage as _mi  # noqa: E402
+
+
+def _png(w: int, h: int) -> bytes:
+    return (b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+            + w.to_bytes(4, "big") + h.to_bytes(4, "big") + b"\x00" * 8)
+
+
+def _gif(w: int, h: int) -> bytes:
+    return b"GIF89a" + w.to_bytes(2, "little") + h.to_bytes(2, "little") + b"\x00" * 24
+
+
+def _jpeg(w: int, h: int) -> bytes:
+    return (b"\xff\xd8" + b"\xff\xe0" + (16).to_bytes(2, "big") + b"\x00" * 14
+            + b"\xff\xc0" + (17).to_bytes(2, "big") + b"\x08"
+            + h.to_bytes(2, "big") + w.to_bytes(2, "big") + b"\x00" * 9)
+
+
+def _check_mi_size() -> None:
+    check("★ PNG 读得出宽高", _mi.image_size(_png(1200, 630)) == (1200, 630))
+    check("★ GIF 读得出宽高", _mi.image_size(_gif(300, 200)) == (300, 200))
+    check("★ JPEG 要扫到 SOFn 才读得出（不在头几个字节里）",
+          _mi.image_size(_jpeg(640, 480)) == (640, 480))
+    check("认不出来的返回 None", _mi.image_size(b"definitely not an image" * 3) is None)
+    check("只有 2 字节也不炸", _mi.image_size(b"\xff\xd8") is None)
+    check("★ 被截断的 JPEG 也不炸（Range 只取 32KB 会碰到）",
+          _mi.image_size(b"\xff\xd8\xff\xe0\x00\x10" + b"\x00" * 30) is None)
+
+
+def _check_mi_box() -> None:
+    check("★ 宽固定 208", _mi.box_for((1000, 563))[0] == 208)
+    check("★ 高度按真实比例（1000x563 → 117）", _mi.box_for((1000, 563)) == (208, 117))
+    check("★ 正方形渲染出来还是正方形（这个坑踩过：统一 16:9 会压扁）",
+          _mi.box_for((1000, 1000)) == (208, 208))
+    check("★ 竖图也是竖的", _mi.box_for((772, 1000)) == (208, 269))
+    check("★ 极宽的夹到 MIN_H", _mi.box_for((10000, 100)) == (208, 40))
+    check("★ 极高的夹到 MAX_H", _mi.box_for((100, 10000)) == (208, 400))
+    check("★ 尺寸提示必须带 #（漏了手机端**整条 markdown 不渲染**）",
+          _mi.image_line(1, "https://a/b.jpg", (1000, 563))
+          == "![图1 #208px #117px](https://a/b.jpg)",
+          _mi.image_line(1, "https://a/b.jpg", (1000, 563)))
+
+
+_check_mi_size()
+_check_mi_box()
+
+
+def _check_mi_build() -> None:
+    items = [("https://a/1.jpg", (1000, 563)), ("https://a/2.jpg", (1000, 1000))]
+    lines = _mi.build("正文", items, "https://a/page").split("\n")
+    check("★ 顺序是 正文 → 图 → 原文链接",
+          lines[0] == "正文" and lines[1].startswith("![图1 ")
+          and lines[2].startswith("![图2 ")
+          and lines[3] == "[打开原文](https://a/page)", repr(lines))
+    check("★ 每张图各算各的比例",
+          lines[1] == "![图1 #208px #117px](https://a/1.jpg)"
+          and lines[2] == "![图2 #208px #208px](https://a/2.jpg)", repr(lines))
+    check("★ 没有链接时不留一行空链接", "[打开原文]" not in _mi.build("正文", items, ""))
+
+    # 超长：从尾部丢图，**绝不截断**（截断会把图片语法砍成半截，整条不渲染）
+    many = [(f"https://example.com/{'x' * 900}/{i}.jpg", (1000, 563)) for i in range(6)]
+    long_md = _mi.build("正文", many, "https://a/page")
+    got = long_md.split("\n")
+    check("★ 超长时从尾部丢图", len(long_md) <= _mi.MAX_CHARS, str(len(long_md)))
+    check("★ 丢到最后一张也是完整的图片语法（没有半截的）",
+          all(ln.startswith("![图") and ln.endswith(")") for ln in got if ln.startswith("![")),
+          long_md[-160:])
+    check("★ 第一张永远留着", got[1] == f"![图1 #208px #117px]({many[0][0]})")
+
+    # 真实尺寸的组合：6 张偶像大师图（URL ~152 字符）+ 800 字摘要。
+    # **一张都不许丢** —— 上限拍太低就是这个症状：一条 6 图的资讯只出 3、4 张。
+    real = [(
+        "https://cmsapi-frontend.idolmaster-official.jp/sitern/api/idolmaster/Image/get"
+        f"?path=/idolmaster/jp/article/00{i}/2026/10/{'a' * 60}.jpeg", (1000, 563),
+    ) for i in range(6)]
+    real_md = _mi.build(
+        "📰 偶像大师 官方 NEWS\n【灰姑娘/百万】【谷子】\n· 某条很长的标题\n\n  " + "字" * 800,
+        real, "https://idolmaster-official.jp/news/01_20180.html",
+    )
+    check("★ 6 张真实长度的图 + 800 字摘要，一张都不许丢",
+          real_md.count("![图") == 6, str(real_md.count("![图")))
+
+
+_check_mi_build()
+
+
+class _MiHttp:
+    """假 httpx：按 URL 返回构造好的图片头；不在表里的抛异常（模拟抓不到）。"""
+
+    def __init__(self, sizes: dict):
+        self.sizes, self.calls = sizes, []
+
+    async def get(self, url, **kw):
+        self.calls.append((url, kw.get("headers")))
+        size = self.sizes.get(url)
+        if size is None:
+            raise httpx.ConnectError("boom")
+        return _FakeResp(content=_png(*size))
+
+
+async def _check_mi_measure() -> None:
+    http = _MiHttp({"u1": (1000, 563), "u2": (1000, 1000)})
+    got = await _mi.measure_all(http, ["u1", "u2", "bad"])
+    check("★ 读不到尺寸的那张被丢掉（不猜比例，猜错就是图被拉伸）",
+          got == [("u1", (1000, 563)), ("u2", (1000, 1000))], str(got))
+    check("★ 每张都请求了（含失败那张）", len(http.calls) == 3)
+    check("★ 只取前 32KB —— 这是头部读取不是整张下载",
+          all(h and h.get("Range") == f"bytes=0-{_mi._PROBE_BYTES - 1}"
+              for _, h in http.calls), str(http.calls))
+
+    http2 = _MiHttp({"u1": (1000, 563)})
+    check("★ MAX_IMAGES 封顶，超出的根本不请求",
+          len(await _mi.measure_all(
+              http2, [f"u{i}" for i in range(_mi.MAX_IMAGES + 3)])) == 1
+          and len(http2.calls) == _mi.MAX_IMAGES, str(len(http2.calls)))
+
+
+asyncio.run(_check_mi_measure())
+
+
+class _MiPusher:
+    """记录三类出口的假 Pusher。`uploads` 给一批布尔值决定每次探针的结果。"""
+
+    def __init__(self, uploads: "list[bool] | None" = None, md_fails: bool = False):
+        self.texts: list[str] = []
+        self.rich: list[tuple[str, str]] = []
+        self.markdowns: list[str] = []
+        self.uploads: list[str] = []
+        self._queue = list(uploads) if uploads is not None else None
+        self._md_fails = md_fails
+
+    async def send_text(self, group_openid, content):
+        self.texts.append(content)
+
+    async def send_rich(self, group_openid, content, image_url):
+        self.rich.append((content, image_url))
+
+    async def send_markdown(self, group_openid, content):
+        if self._md_fails:
+            raise RuntimeError("no markdown template")
+        self.markdowns.append(content)
+
+    async def upload_image(self, group_openid, image_url):
+        self.uploads.append(image_url)
+        return self._queue.pop(0) if self._queue else True
+
+
+async def _check_mi_send() -> None:
+    from qq_rss_bot.scheduler import send_entry_images
+
+    http = _MiHttp({"https://a/1.jpg": (1000, 563), "https://a/2.jpg": (1000, 1000)})
+    two = ["https://a/1.jpg", "https://a/2.jpg"]
+
+    p = _MiPusher()
+    failed = await send_entry_images(
+        p, "G", "正文", two, http=http, link="https://a/page", markdown=True)
+    check("★ 多图合成**一条** markdown，一条富媒体都不发",
+          len(p.markdowns) == 1 and not p.rich, f"{p.markdowns} | {p.rich}")
+    check("★ 正文、两张图、原文链接都在同一条里",
+          all(x in p.markdowns[0] for x in
+              ("正文", "![图1 #208px #117px]", "![图2 #208px #208px]",
+               "[打开原文](https://a/page)")), p.markdowns[0])
+    check("全成功时没有失败列表", failed == [], str(failed))
+
+    p = _MiPusher()
+    await send_entry_images(p, "G", "正文", ["https://a/1.jpg"],
+                            http=http, link="l", markdown=True)
+    check("★ 只有一张图时不走 markdown（合并没意义，还多一次上传）",
+          not p.markdowns and len(p.rich) == 1, f"{p.markdowns} | {p.rich}")
+
+    p = _MiPusher()
+    await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=False)
+    check("★ 开关关掉时退回原来的连发",
+          not p.markdowns and len(p.rich) == 2 and not p.uploads)
+
+    p = _MiPusher(uploads=[False, False])
+    await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
+    check("★ QQ 一张都抓不到时退回连发，一条都不少",
+          not p.markdowns and len(p.rich) == 2, f"{p.markdowns} | {p.rich}")
+
+    p = _MiPusher(uploads=[True, False])
+    failed = await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
+    check("★ 只有部分抓不到时仍然合并成一条（能抓的照发）",
+          len(p.markdowns) == 1 and "![图1" in p.markdowns[0]
+          and "![图2" not in p.markdowns[0], str(p.markdowns))
+    check("★ 抓不到的那张进告警列表（裂图在群里是看不见的）",
+          failed == ["https://a/2.jpg"], str(failed))
+
+    p = _MiPusher(md_fails=True)
+    await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
+    check("★ markdown 发不出去（比如没有模板权限）时退回连发",
+          len(p.rich) == 2, str(p.rich))
+
+    p = _MiPusher()
+    await send_entry_images(p, "G", "正文", ["bad1", "bad2"],
+                            http=http, link="l", markdown=True)
+    check("★ 尺寸一张都读不到时退回连发（不硬猜比例）",
+          not p.markdowns and len(p.rich) == 2, f"{p.markdowns} | {p.rich}")
+
+    p = _MiPusher()
+    await send_entry_images(
+        p, "G", "正文", ["https://a/1.jpg", "https://a/2.jpg"],
+        http=_MiHttp({"https://a/1.jpg": (1000, 563)}), link="l", markdown=True)
+    check("★ 两张里只有一张读得到尺寸 → 那条 markdown 只带这一张",
+          len(p.markdowns) == 1 and "![图2" not in p.markdowns[0], str(p.markdowns))
+
+
+asyncio.run(_check_mi_send())
+
+# markdown 发送撞 `50035006` 必须重试一次。**不重试的代价是 1 条变 6 条**
+# （退回连发），2026-10-18 一天撞了 4 次。预热那条更亏：连发走
+# `post_group_file`，那条路预热不了渲染缓存，退回去等于预热白做。
+
+
+class _FlakyMarkdownPusher:
+    # noqa: 最小实现，只够 `_send_entry_markdown` 用
+    def __init__(self, fail_times: int) -> None:
+        self.fail_times = fail_times
+        self.calls = 0
+        self.markdowns: list = []
+
+    async def upload_image(self, g, u):
+        return True
+
+    async def send_markdown(self, g, c):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("50035006 消息发送异常，请稍后重试")
+        self.markdowns.append((g, c))
+
+
+async def _md_retry(fail_times: int):
+    from qq_rss_bot.scheduler import _send_entry_markdown  # noqa: PLC0415
+
+    p = _FlakyMarkdownPusher(fail_times)
+    http = _MiHttp({"https://a/1.jpg": (1000, 563), "https://a/2.jpg": (1000, 1000)})
+    dropped = await _send_entry_markdown(
+        p, "G", "正文", ["https://a/1.jpg", "https://a/2.jpg"], http, "l"
+    )
+    return p, dropped
+
+
+_p1, _d1 = asyncio.run(_md_retry(fail_times=1))
+check("★ markdown 撞 50035006 → 隔 1 秒重试一次，第二条就成功了（不退回连发）",
+      len(_p1.markdowns) == 1 and _p1.calls == 2 and _d1 == [],
+      f"calls={_p1.calls} sent={len(_p1.markdowns)}")
+
+_p2, _d2 = asyncio.run(_md_retry(fail_times=2))
+check("★ 重试一次仍然失败 → 才退回连发（返回 None）",
+      _p2.calls == 2 and _d2 is None and len(_p2.markdowns) == 0,
+      f"calls={_p2.calls} ret={_d2}")
+
+check("★ MULTI_IMAGE_MARKDOWN 开关存在且默认开",
+      cfg_stub().multi_image_markdown is True)
+
+# 摄入上限（rss.MAX_IMAGES）和渲染上限（multiimage.MAX_IMAGES）**必须一致**。
+# 不一致的症状是「这条明明有 6 张怎么只出来 4 张」，而且两处都不报错 ——
+# 2026-10-18 就是这个原因，一张 6 图的资讯只出来 4 张。
+from qq_rss_bot.rss import MAX_IMAGES as _RSS_MAX  # noqa: E402
+from qq_rss_bot.rss import all_images as _all_images  # noqa: E402
+
+check("★ 摄入上限是 6（原来 4 是按「每张图各占一条配额」定的，"
+      "多图合并成一条之后这个理由不成立了）", _RSS_MAX == 6, str(_RSS_MAX))
+check("★ 摄入上限和渲染上限一致，不许各改各的",
+      _RSS_MAX == _mi.MAX_IMAGES, f"rss={_RSS_MAX} multiimage={_mi.MAX_IMAGES}")
+
+_seven = "".join(f'<img src="https://a/{i}.jpg">' for i in range(7))
+check("★ 6 张全收", len(_all_images(_seven)) == 6, str(len(_all_images(_seven))))
+check("★ 第 7 张及以后丢掉", "https://a/6.jpg" not in _all_images(_seven))
+check("★ 去重仍然生效（不少源 `<img>` 和裸链接给了同一张）",
+      len(_all_images('<img src="https://a/1.jpg"> https://a/1.jpg')) == 1)
+
+
+# ---------------------------------------------------------------------------
+print("[4.63] markdown 多图预热 / 人工预览（喊「不发」挡下这一条）")
+# ---------------------------------------------------------------------------
+#
+# 为什么要有这一节：QQ 的图片缓存是**服务端、跨群共享**的，但**冷链接第一次
+# 渲染必炸** —— 2026-10-18 实测：一批 3.4 MB 的图 6 张全裂；同一批**同样的
+# URL** 隔 20 秒发到**另一个群**，6 张全好。冷发那次一张都没抓下来（客户端
+# 上什么都没缓存），所以只可能是服务端。
+#
+# 于是正式群之前先预热两次，中间留一个人工否决窗口。这一节**全部离线**：
+# `_poll_one` 换成假的，不碰网络也不发消息。
+
+import dataclasses as _dc  # noqa: E402
+
+from qq_rss_bot.db import Subscription as _Sub  # noqa: E402
+
+check("默认关闭：两个群都留空，行为完全等于改动前",
+      cfg_stub().warmup_group == "" and cfg_stub().preview_group == "")
+check("默认：预热等 45 秒，否决窗口 30 秒",
+      cfg_stub().preview_warmup_sec == 45 and cfg_stub().preview_veto_sec == 30)
+
+
+def _mk_sub(sid: int, gid: str, url: str = "http://rss/same") -> "_Sub":
+    return _Sub(
+        id=sid, group_openid=gid, url=url, title=None,
+        interval_sec=900, initialized=True, last_polled_at=None, last_error=None,
+    )
+
+
+class _FakeDB:
+    """只实现 `_stage_subs` 用到的那一个方法。"""
+
+    def __init__(self, subs: list) -> None:
+        self._subs = subs
+
+    def list_subscriptions(self, group_openid: str) -> list:
+        return [s for s in self._subs if s.group_openid == group_openid]
+
+
+async def _staged(*, veto: bool, real_due: bool = True):
+    """跑一遍三阶段，返回 (poller, 轮询顺序)。
+
+    **`due` 里默认只放正式群** —— 这才是线上真实情况：三个订阅虽然间隔一样，
+    但轮询时刻相差 90 秒（07:25:37 / 07:26:08 / 07:27:38），永远不会落在
+    同一个 `due` 批次里。靠 `due` 对齐的写法会一次都不触发。
+    """
+    cfg = _dc.replace(
+        cfg_stub(), warmup_group="W", preview_group="P",
+        preview_warmup_sec=0, preview_veto_sec=0.4,
+    )
+    all_subs = [
+        _mk_sub(1, "W"), _mk_sub(2, "P"),
+        # 预热群里订阅了**别的源** —— 不该被拉起来预热，预热它对正式群毫无意义
+        _mk_sub(5, "W", url="http://other/feed"),
+        _mk_sub(3, "REAL-A"), _mk_sub(4, "REAL-B"),
+    ]
+    poller = FeedPoller(cfg=cfg, db=_FakeDB(all_subs), http=None, pusher=None)
+    order: list = []
+
+    async def fake_poll_one(sub):
+        order.append(sub.group_openid)
+        if sub.group_openid == "P":
+            # 预览这条真发出去了 —— 阶段三靠它算出「这一批是哪些 key」
+            poller._last_pushed[sub.id] = ["k1", "k2"]
+        await asyncio.sleep(0)
+        return True
+
+    poller._poll_one = fake_poll_one
+
+    task = None
+    if veto:
+        async def holler():
+            # 等预览窗口真开了再喊，模拟「你看到预览之后才决定」
+            for _ in range(500):
+                if poller.veto_current():
+                    return
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(holler())
+
+    if real_due:
+        due = [s for s in all_subs if s.group_openid.startswith("REAL")]
+    else:
+        due = [s for s in all_subs if s.group_openid in ("W", "P")]
+    await poller._poll_staged(due)
+    if task is not None:
+        task.cancel()
+    return poller, order
+
+
+_p_ok, _order_ok = asyncio.run(_staged(veto=False))
+check("★ 正式群到点时，预热群/预览群被**主动拉起来**（它们自己在 due 里排不上）",
+      _order_ok[:2] == ["W", "P"], str(_order_ok))
+check("★ 顺序：预热群 → 预览群 → 正式群（并发发下去预热就白做了）",
+      _order_ok == ["W", "P", "REAL-A", "REAL-B"], str(_order_ok))
+check("★ 预热群里订阅的**别的源**不许被拉进来",
+      "W" not in _order_ok[2:] and _order_ok.count("W") == 1, str(_order_ok))
+check("没喊停 → 一条都不挡", _p_ok._vetoed == {}, str(_p_ok._vetoed))
+
+_p_no, _order_no = asyncio.run(_staged(veto=True))
+check("★ 喊「不发」→ 正好记下预览那批 key",
+      set(_p_no._vetoed) == {"k1", "k2"}, str(_p_no._vetoed))
+check("★ 喊停只挡那几条，正式群阶段照常跑",
+      set(_order_no[2:]) == {"REAL-A", "REAL-B"}, str(_order_no))
+
+_p_idle, _order_idle = asyncio.run(_staged(veto=False, real_due=False))
+check("★ 只有预热群/预览群到点时**什么都不发**"
+      "（让它们自己先跑一遍，正式群到点时就预热不出东西了）",
+      _order_idle == [], str(_order_idle))
+
+_special2 = _dc.replace(cfg_stub(), warmup_group="W", preview_group="P")
+check("★ 只配了群、due 里只有它们自己 → 也不单独跑",
+      asyncio.run(_staged(veto=False, real_due=False))[1] == [])
+
+
+async def _veto_outside() -> bool:
+    poller = FeedPoller(cfg=_special2, db=None, http=None, pusher=None)
+    return poller.veto_current()
+
+
+check("★ 预览窗口没开时喊「不发」不生效（防止随口一句吞掉下一条推送）",
+      asyncio.run(_veto_outside()) is False)
+
+
+class _RecorderPusher:
+    def __init__(self) -> None:
+        self.texts: list = []
+        self.rich: list = []
+        self.markdowns: list = []
+
+    async def send_text(self, g, c):
+        self.texts.append((g, c))
+
+    async def send_rich(self, g, c, u):
+        self.rich.append((g, c, u))
+
+    async def send_markdown(self, g, c):
+        self.markdowns.append((g, c))
+
+    async def upload_image(self, g, u):
+        return True
+
+
+async def _vetoed_skip():
+    cfg = _dc.replace(cfg_stub(), imas_tags=False, attach_images=False)
+    pusher = _RecorderPusher()
+    poller = FeedPoller(cfg=cfg, db=None, http=None, pusher=pusher)
+    poller._vetoed = {"KEY-OF-VETOED": time.monotonic()}
+    entry = Entry(key="KEY-OF-VETOED", title="被否掉的那条",
+                  link="https://x", published=None, summary="")
+    pushed = await poller._push_entries(_mk_sub(3, "REAL-A"), "源", [entry])
+    return pushed, pusher
+
+
+_pushed, _pusher = asyncio.run(_vetoed_skip())
+check("★ 被「不发」挡下的条目不进正式群（一条消息都不发）",
+      _pusher.texts == [] and _pusher.rich == [] and _pusher.markdowns == [],
+      f"text={len(_pusher.texts)} rich={len(_pusher.rich)} md={len(_pusher.markdowns)}")
+check("★ 但它要当「已推」返回，否则下一轮又捞出来，你得每轮否一次",
+      [e.key for e in _pushed] == ["KEY-OF-VETOED"], str([e.key for e in _pushed]))
 
 
 print("[5] 真实抓取 RSSHub")

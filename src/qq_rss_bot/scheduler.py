@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from functools import partial
 from typing import Awaitable, Protocol
 
 import httpx
 
-from . import ai
+from . import ai, idolmaster, multiimage
 from .config import Config
 from .db import Database, Subscription, utcnow
 from .notify import Notifier, NullNotifier
@@ -40,6 +41,11 @@ _MAX_CONTENT = 1500
 # 二是让客户端收到的顺序稳定（并发发出时到达顺序不保证）
 _PUSH_GAP_SEC = 0.4
 
+# 被「不发」否掉的条目 key 保留多久。**不能只留一轮** —— 正式群有好几个，
+# 它们的轮询是并发的，只要有一个这一轮抓取失败、下一轮才发，就已经过了本轮。
+# 6 小时足够覆盖任何退避重试，又不会让集合无限长。
+_VETO_KEEP_SEC = 6 * 3600
+
 # AI 摘要的并发数。抓正文 ~2s + 调模型 ~3s，3 条并发大概 5 秒能备好一批；
 # 再高意义不大（DeepSeek 那边也会限流），而且会把 RSSHub 那条链路挤到。
 _AI_CONCURRENCY = 3
@@ -55,9 +61,20 @@ def _truncate(text: str) -> str:
 # 中文文本 40000 字符 QQ 照样收（HTTP 200）。真正的约束是**可读性** ——
 # 群里一条消息超过一屏就没人看了，那还发它干什么。
 #
-# 400 是「一段完整的导语」的典型长度（36氪/少数派这类源的 `<description>`
-# 大致在这个量级），再长就该上「抓正文 + 摘要」那条路了。
-MAX_SUMMARY_CHARS = 400
+# **800 是量出来的，不是拍的**（2026-10-18 实测 4 个源的 `<description>`）：
+#
+#   idolmaster  中位 627 / p90 3545     ← 800 完整覆盖中位
+#   少数派      中位 3914（就是全文）
+#   Solidot     中位 485 / 最大 857     ← 800 全覆盖
+#   36氪快讯    中位 205 / 最大 422     ← 800 全覆盖
+#
+# 只有「`<description>` 就是全文」那类（少数派）才该上 AI 摘要 ——
+# 靠调大这个数解决不了，`rss.py` 入口处已经先截到 4000 了。
+#
+# ⚠️ **别往上调到 1200 以上**：`_MAX_CONTENT = 1500` 限的是**整条消息**，
+# 标题最长 120 + 源名 25 + 标签 20 + 链接 50 = 215，1200 左右就会把
+# 链接挤出去 —— 而链接是这条推送里最值钱的东西。
+MAX_SUMMARY_CHARS = 800
 
 
 def _clip(text: str, limit: int) -> str:
@@ -86,6 +103,8 @@ def format_entry(
     with_summary: bool = True,
     summary_chars: int = MAX_SUMMARY_CHARS,
     digest: "ai.Digest | None" = None,
+    tags: str = "",
+    with_link: bool = True,
 ) -> str:
     """单条新闻的推送文案：源名 + 标题 +（摘要）+ 链接。
 
@@ -103,17 +122,26 @@ def format_entry(
     而原题的信息量最低。`Digest.translated` 现在只用来写日志。
     """
     lines = [f"📰 {feed_title or url}"]
+    if tags:
+        lines.append(tags)
+    body = ""
     if digest is not None:
         lines.append(f"· {digest.title}")
-        if digest.summary:
-            lines.append(f"  {_clip(digest.summary, summary_chars)}")
+        body = _clip(digest.summary, summary_chars) if digest.summary else ""
     else:
         lines.append(f"· {entry.title}")
         if with_summary:
-            summary = _summary_line(entry, summary_chars)
-            if summary:
-                lines.append(f"  {summary}")
-    if entry.link:
+            body = _summary_line(entry, summary_chars)
+    if body:
+        # **空行是必须的，不是装饰。** 推送走的是 msg_type=0/7 的**纯文本**
+        # （不是 markdown），单换行在客户端里读起来就是「标题紧贴着正文」一坨。
+        # 空行把它切成两段。
+        #
+        # **只在真有正文时才加** —— 标题和正文一样时 `_summary_line` 返回空串，
+        # 这里就不会多出一个孤零零的空行。
+        lines.append("")
+        lines.append(f"  {body}")
+    if with_link and entry.link:
         lines.append(f"  {entry.link}")
     return _truncate("\n".join(lines))
 
@@ -166,13 +194,24 @@ def image_failure_message(reason: str, headline: str, failed: list[str]) -> str:
 
 
 async def send_entry_images(
-    pusher: Pusher, group_openid: str, text: str, images: "tuple[str, ...] | list[str]"
-) -> None:
+    pusher: Pusher,
+    group_openid: str,
+    text: str,
+    images: "tuple[str, ...] | list[str]",
+    *,
+    http: "httpx.AsyncClient | None" = None,
+    link: str = "",
+    markdown: bool = False,
+) -> list[str]:
     """把一条资讯连同它的**全部配图**发出去。
 
-    第一条带正文和首图，其余每条一张图、正文用 `（图 2/4）` 占位 ——
-    QQ 一条富媒体消息只能带一个媒体（`MediaInfo` 只有单个 `file_info`），
-    多图只能靠连发。
+    **两种形态，`markdown=True` 且不止一张图时走第一种**：
+
+    * **一条 markdown 带全部图**（`msg_type=2`）—— 1 条消息，省配额、不刷屏。
+      图由 QQ 的服务器去下载，语法和坑见 `multiimage.py` 的模块说明。
+      这条路**整条不通就落回连发**。
+    * **连发富媒体**（`msg_type=7`）—— 第一条带正文和首图，其余每条一张图、
+      正文用 `（图 2/4）` 占位。`MediaInfo` 只有单个 `file_info`，一条只能一张。
 
     **失败语义是分开的，这点很重要**：
 
@@ -185,6 +224,14 @@ async def send_entry_images(
     返回**没发出去**的图片 URL（空列表 = 全成功）。调用方拿它去私聊告警 ——
     配图失败在群里是**看不见**的，读者只会觉得「这条怎么少了两张图」。
     """
+    if markdown and http is not None and len(images) > 1:
+        sent = await _send_entry_markdown(
+            pusher, group_openid, text, images, http, link
+        )
+        if sent is not None:
+            return sent
+        _log.info("多图 markdown 这条路没走通，退回连发 %d 张", len(images))
+
     failed: list[str] = []
     total = len(images)
     send = partial(pusher.send_rich, group_openid)
@@ -198,6 +245,67 @@ async def send_entry_images(
             _log.warning("第 %d/%d 张配图失败，跳过 (%s): %s", index, total, url, exc)
             failed.append(url)
     return failed
+
+
+async def _send_entry_markdown(
+    pusher: Pusher,
+    group_openid: str,
+    text: str,
+    images: "tuple[str, ...] | list[str]",
+    http: httpx.AsyncClient,
+    link: str,
+) -> "list[str] | None":
+    """一条 markdown 带全部图。整条路不通返回 `None`，调用方落回连发。
+
+    返回 `[]` 表示**发成功了**，中间可能剔掉了几张 QQ 抓不到的图 —— 那些 URL
+    一起返回，交给调用方走告警。
+
+    **为什么要先逐张 `upload_image` 探一次**：markdown 的图裂了是**静默**的
+    （发送接口照样 HTTP 200，没有任何回执），事后完全无从发现；而富媒体那条路
+    有 `post_group_file` 的报错兜着。所以这里花 N 次「不发消息的上传」换回
+    「哪张图 QQ 抓不到」这个信息 —— 它不占配额、也不进令牌桶。
+
+    **尺寸必须逐张读**（`measure_all`）：尺寸提示在手机端是**必填**的，比例还得
+    和原图一致，否则整条 markdown 不渲染、或者图被拉伸。读不到尺寸的那张直接
+    剔掉，不猜。
+    """
+    items = await multiimage.measure_all(http, images)
+    if not items:
+        return None
+
+    good: list[tuple[str, tuple[int, int]]] = []
+    dropped: list[str] = []
+    for url, wh in items:
+        if await pusher.upload_image(group_openid, url):
+            good.append((url, wh))
+        else:
+            dropped.append(url)
+    if not good:
+        return None
+
+    md = multiimage.build(text, good, link)
+    for attempt in (1, 2):
+        try:
+            await pusher.send_markdown(group_openid, md)
+            break
+        except QuotaExceeded:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 2:
+                # 重试过还是不行 —— 落回连发，那条路更稳（但有代价，见下）
+                _log.warning("多图 markdown 发送失败，退回连发: %s", exc)
+                return None
+            # QQ 会拿 `50035006 消息发送异常，请稍后重试` 把**整条**拒掉，它自己
+            # 说可重试，那就重试一次。**不重试的代价是 1 条变 6 条**（退回连发），
+            # 2026-10-18 一天撞了 4 次。
+            #
+            # 预热那条尤其不能退回连发：连发走的是 `post_group_file`，**那条路
+            # 预热不了渲染缓存**（实测），退回去等于这条预热白做了。
+            _log.info(
+                "多图 markdown 发送失败，%.1f 秒后重试一次: %s", IMAGE_RETRY_GAP, exc
+            )
+            await asyncio.sleep(IMAGE_RETRY_GAP)
+    return dropped
 
 
 async def prepare_digests(
@@ -323,9 +431,29 @@ class FeedPoller:
         self._sem = asyncio.Semaphore(5)
         self._stopped = asyncio.Event()
         self._ticks = 0
+        # ---- markdown 多图预热 / 人工预览（见 Config.warmup_group 那段注释）----
+        # 「不发」喊停时置位。**只在预览窗口内有效**。
+        self._veto = asyncio.Event()
+        self._preview_open = False
+        # 被人工否掉的条目 key → 时间戳，见 `_VETO_KEEP_SEC`。
+        self._vetoed: dict[str, float] = {}
+        # 预览那轮真正发出去的 key，用来在喊停时**精确**挡住同一批，
+        # 而不是把这一轮所有条目都一起毙掉。
+        self._last_pushed: dict[int, list[str]] = {}
 
     def stop(self) -> None:
         self._stopped.set()
+
+    def veto_current(self) -> bool:
+        """人工喊「不发」。返回 True 表示**确实挡下了**。
+
+        **只有预览窗口开着才生效。** 窗口外返回 False —— 否则你随手打一句
+        「不发」，下一条正式推送会莫名其妙被吞掉，而且完全看不出原因。
+        """
+        if not self._preview_open:
+            return False
+        self._veto.set()
+        return True
 
     async def run(self) -> None:
         _log.info("轮询启动，每 %ss 扫描一次", self.cfg.tick_sec)
@@ -355,18 +483,109 @@ class FeedPoller:
         if not due:
             return
         _log.debug("本轮待抓取 %d 个订阅", len(due))
-        results = await asyncio.gather(
-            *(self._poll_one(sub) for sub in due), return_exceptions=True
-        )
-        # 必须检查返回值：return_exceptions=True 会把异常收进结果里静默丢弃，
-        # 不检查的话推送失败连一行日志都没有。
-        for sub, result in zip(due, results):
-            if isinstance(result, BaseException):
-                _log.error(
-                    "订阅 #%s (%s) 本轮处理失败", sub.id, sub.url, exc_info=result
-                )
-
+        collected = await self._poll_staged(due)
+        results = [collected.get(sub.id) for sub in due]
         await self._check_global_outage(due, results)
+
+    async def _gather_poll(self, subs: list[Subscription]) -> dict[int, object]:
+        """并发抓一批订阅，返回 `{订阅 id: 结果}`。
+
+        `return_exceptions=True` 会把异常收进结果里静默丢弃，所以必须逐个检查 ——
+        不检查的话推送失败连一行日志都没有。
+        """
+        results = await asyncio.gather(
+            *(self._poll_one(sub) for sub in subs), return_exceptions=True
+        )
+        for sub, result in zip(subs, results):
+            if isinstance(result, BaseException):
+                _log.error("订阅 #%s (%s) 本轮处理失败", sub.id, sub.url, exc_info=result)
+        return {sub.id: r for sub, r in zip(subs, results)}
+
+    def _stage_subs(self, group_openid: str, urls: set[str]) -> list[Subscription]:
+        """预热群 / 预览群自己的订阅，**绕开 `due` 直接取**。
+
+        **为什么不能靠 `due` 对齐**：实测这三个订阅虽然都是 900 秒，但轮询时刻
+        相差 90 秒（07:25:37 / 07:26:08 / 07:27:38）—— 它们**永远不会落进同一个
+        `due` 批次**。靠 `due` 判定的写法会一直退化成普通并发，三阶段一次都不
+        触发，正式群就一直冷发 —— 症状和没做这个功能一模一样。
+
+        只取和正式群**同一个源**的订阅：拿预热群去预热别的源毫无意义。
+        """
+        if not group_openid or self.db is None:
+            return []
+        return [
+            s for s in self.db.list_subscriptions(group_openid)
+            if s.enabled and s.url in urls
+        ]
+
+    async def _poll_staged(self, due: list[Subscription]) -> dict[int, object]:
+        """预热① → 预热②（=预览）→ 等喊停 → 正式群。
+
+        **三个阶段必须串行，这正是整个机制的意义** —— 一把 gather 发下去，
+        预热和正式群同时在飞，预热就白做了。
+
+        预热群 / 预览群**只在「有正式群要发」的这一轮被拉起来**（见
+        `_stage_subs`），不按它们自己的间隔单独跑 —— 让它们先自己发一遍的话，
+        等正式群到点时它们已经「没有新条目」了，预热不出任何东西。
+
+        两个群都留空 = 完全退回改动前的行为（一把 gather）。
+        """
+        cfg = self.cfg
+        special = {g for g in (cfg.warmup_group, cfg.preview_group) if g}
+        if not special:
+            return await self._gather_poll(due)
+
+        real = [s for s in due if s.group_openid not in special]
+        if not real:
+            # 只有预热群/预览群到点。**什么都不做** —— 它们由正式群那一轮带着跑。
+            return {}
+
+        now = time.monotonic()
+        self._vetoed = {k: t for k, t in self._vetoed.items() if now - t < _VETO_KEEP_SEC}
+        self._last_pushed = {}
+        collected: dict[int, object] = {}
+        urls = {s.url for s in real}
+
+        # ① 预热群。两个群配成同一个时跳过这步 —— 那样预览那条本身就是预热。
+        warm = self._stage_subs(cfg.warmup_group, urls)
+        if warm and cfg.warmup_group != cfg.preview_group:
+            collected.update(await self._gather_poll(warm))
+            _log.info(
+                "多图预热① 已发 %d 个订阅，等 %d 秒让 QQ 把图抓完",
+                len(warm), cfg.preview_warmup_sec,
+            )
+            await asyncio.sleep(cfg.preview_warmup_sec)
+
+        # ② 预览群 + 人工否决窗口
+        prev = self._stage_subs(cfg.preview_group, urls)
+        if prev:
+            self._veto.clear()
+            self._preview_open = True
+            try:
+                collected.update(await self._gather_poll(prev))
+                keys = [k for s in prev for k in self._last_pushed.get(s.id, [])]
+                if keys:
+                    _log.info(
+                        "多图预览已发（%d 条），等 %d 秒看你喊不喊停",
+                        len(keys), cfg.preview_veto_sec,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            self._veto.wait(), timeout=cfg.preview_veto_sec
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    else:
+                        for k in keys:
+                            self._vetoed[k] = time.monotonic()
+                        _log.info("收到「不发」：这 %d 条不进正式群", len(keys))
+            finally:
+                self._preview_open = False
+                self._veto.clear()
+
+        # ③ 正式群
+        collected.update(await self._gather_poll(real))
+        return collected
 
     async def _check_global_outage(self, due: list[Subscription], results: list) -> None:
         """整轮**全军覆没**时提醒一次：多半是 RSSHub 或网络挂了。
@@ -448,6 +667,7 @@ class FeedPoller:
             shown = fresh[: self.cfg.max_items_per_push]
             try:
                 pushed = await self._push_entries(sub, result.title, shown)
+                self._last_pushed[sub.id] = [e.key for e in pushed]
             except QuotaExceeded as exc:
                 # 配额用尽：剩下的逐条发也只会被拒，整批跳过。
                 # 仍然标记已见 —— 否则明天配额恢复后会倒灌一整天的积压。
@@ -533,9 +753,33 @@ class FeedPoller:
         digests = await prepare_digests(
             self.db, self.cfg, self.http, self.ai_http, sub, entries
         )
+        # 偶像大师官网 NEWS 的企划/分类标签。非那个源直接返回 {}，
+        # 所以这里不用先判订阅。
+        tags = (
+            await idolmaster.tags_for(self.http, sub.url, entries)
+            if self.cfg.imas_tags
+            else {}
+        )
         for index, entry in enumerate(entries):
             if index:
                 await asyncio.sleep(_PUSH_GAP_SEC)
+            if entry.key in self._vetoed:
+                # 人工在预览里否掉的条目。**当成「已推」返回** —— 调用方会把它
+                # 标成已见。不当成已推的话下一轮又捞出来，你得每轮否一次。
+                _log.info("被「不发」挡下，跳过: %s", entry.title[:40])
+                pushed.append(entry)
+                continue
+            # `entry.images` 可能是 None（源里没图），先归一成 list 再判断
+            images = list(entry.images or ())
+            if not self.cfg.rss_multi_image:
+                images = images[:1]
+            # 多图合并成一条 markdown 时，链接要排在图片**后面**，
+            # 所以这里先别把它排进正文（下面单独补 `[打开原文]`）。
+            use_md = (
+                self.cfg.multi_image_markdown
+                and self.cfg.attach_images
+                and len(images) > 1
+            )
             text = format_entry(
                 feed_title,
                 sub.url,
@@ -543,13 +787,20 @@ class FeedPoller:
                 with_summary=self.cfg.push_summary,
                 summary_chars=self.cfg.summary_chars,
                 digest=digests.get(entry.key),
+                tags=tags.get(entry.key, ""),
+                with_link=not use_md,
             )
 
-            images = entry.images if self.cfg.rss_multi_image else entry.images[:1]
             if self.cfg.attach_images and images:
                 try:
                     failed = await send_entry_images(
-                        self.pusher, sub.group_openid, text, images
+                        self.pusher,
+                        sub.group_openid,
+                        text,
+                        images,
+                        http=self.http,
+                        link=entry.link,
+                        markdown=use_md,
                     )
                     pushed.append(entry)
                     if failed:

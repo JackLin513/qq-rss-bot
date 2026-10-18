@@ -14,7 +14,7 @@ from typing import Protocol
 
 import httpx
 
-from . import ai
+from . import ai, idolmaster
 from .config import Config
 from .db import Database, Subscription
 from .menu import (
@@ -845,11 +845,18 @@ class CommandHandler:
         # AI 摘要**先整批备好**再开始发 —— 逐条现算的话，第 2 条要等前一条
         # 抓完正文调完模型（3~8 秒），用户会觉得机器人卡死了。
         digests: dict[int, dict[str, ai.Digest]] = {}
+        # 偶像大师的企划/分类标签，同样整批备好（一次 CMS 请求覆盖 30 篇，
+        # 逐条现取就是 12 次请求）。非那个源返回 {}。
+        tag_map: dict[int, dict[str, str]] = {}
         for sub, _result, entries in shown:
             if entries:
                 digests[sub.id] = await prepare_digests(
                     self.db, self.cfg, self.http, self.ai_http, sub, entries
                 )
+                if self.cfg.imas_tags:
+                    tag_map[sub.id] = await idolmaster.tags_for(
+                        self.http, sub.url, entries
+                    )
 
         seen: dict[int, list[str]] = {}
         sent = 0
@@ -863,6 +870,16 @@ class CommandHandler:
                 if sent:
                     await asyncio.sleep(_NEW_GAP_SEC)
                 sent += 1
+                # `entry.images` 可能是 None（源里没图），先归一成 list 再判断
+                images = list(entry.images or ())
+                if not self.cfg.rss_multi_image:
+                    images = images[:1]
+                # 和定时推送同一套：多图合并成一条 markdown 时，链接排到图片后面
+                use_md = (
+                    self.cfg.multi_image_markdown
+                    and self.cfg.attach_images
+                    and len(images) > 1
+                )
                 text = format_entry(
                     result.title,
                     sub.url,
@@ -870,13 +887,20 @@ class CommandHandler:
                     with_summary=self.cfg.push_summary,
                     summary_chars=self.cfg.summary_chars,
                     digest=digests.get(sub.id, {}).get(entry.key),
+                    tags=tag_map.get(sub.id, {}).get(entry.key, ""),
+                    with_link=not use_md,
                 )
                 ok = False
-                images = entry.images if self.cfg.rss_multi_image else entry.images[:1]
                 if self.cfg.attach_images and images:
                     try:
                         failed_urls = await send_entry_images(
-                            self.pusher, ctx.group_openid, text, images
+                            self.pusher,
+                            ctx.group_openid,
+                            text,
+                            images,
+                            http=self.http,
+                            link=entry.link,
+                            markdown=use_md,
                         )
                         img_total += len(images)
                         img_failed.extend(failed_urls)

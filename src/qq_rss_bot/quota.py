@@ -43,6 +43,10 @@ class Pusher(Protocol):
 
     async def send_rich(self, group_openid: str, content: str, image_url: str) -> None: ...
 
+    async def send_markdown(self, group_openid: str, content: str) -> None: ...
+
+    async def upload_image(self, group_openid: str, image_url: str) -> bool: ...
+
 
 class QuotaExceeded(RuntimeError):
     """今天的主动消息配额用完了。调用方应当降级，而不是重试。"""
@@ -153,3 +157,20 @@ class GroupSender:
         await self._send(
             group_openid, lambda: self.pusher.send_rich(group_openid, content, image_url)
         )
+
+    async def send_markdown(self, group_openid: str, content: str) -> None:
+        await self._send(
+            group_openid, lambda: self.pusher.send_markdown(group_openid, content)
+        )
+
+    async def upload_image(self, group_openid: str, image_url: str) -> bool:
+        """只让 QQ 去抓图、拿 `file_info`，**不发消息**。
+
+        所以它**不占配额、也不进令牌桶**（官方频控管的是消息，不是上传），
+        当然也不该拿群锁 —— 上传之间没有顺序要求。
+
+        多图那条路用它提前查一次「QQ 到底抓不抓得到」：markdown 的图裂了是
+        **静默**的（发送接口照样 HTTP 200，没有任何回执），事后无从发现，
+        只能事前查。
+        """
+        return await self.pusher.upload_image(group_openid, image_url)
