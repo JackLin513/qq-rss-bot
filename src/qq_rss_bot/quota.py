@@ -20,6 +20,7 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Protocol
 
 from .db import Database
@@ -46,6 +47,12 @@ class Pusher(Protocol):
     async def send_markdown(self, group_openid: str, content: str) -> None: ...
 
     async def upload_image(self, group_openid: str, image_url: str) -> bool: ...
+
+    async def send_local_image(self, group_openid: str, content: str, path: Path) -> None: ...
+
+    async def send_video(self, group_openid: str, path: Path) -> None: ...
+
+    async def send_voice(self, group_openid: str, path: Path) -> None: ...
 
 
 class QuotaExceeded(RuntimeError):
@@ -162,6 +169,50 @@ class GroupSender:
         await self._send(
             group_openid, lambda: self.pusher.send_markdown(group_openid, content)
         )
+
+    async def send_local_image(self, group_openid: str, content: str, path: Path) -> None:
+        """发一条「文字 + 本地图片」的富媒体消息（`file_type=1` + `msg_type=7`）。
+
+        **和 `upload_image` 的语义完全不同，别混**：那个只上传、不发消息，所以
+        不占配额也不进令牌桶；这个上传完就真发一条，所以**照常走 `_send`**。
+
+        ⚠️ **算一条主动消息**：月曜那条播报现在是「文案+表情包」一条、视频
+        一条，**一次播报吃两条配额**。
+        """
+        await self._send(
+            group_openid, lambda: self.pusher.send_local_image(group_openid, content, path)
+        )
+
+    async def send_video(self, group_openid: str, path: Path) -> None:
+        """发一条视频（`file_type=2` + `msg_type=7`）。
+
+        **没有 `content`** —— 视频那条 `content` 客户端不渲染（见 `RssBot.send_video`），
+        所以文案必须由调用方另发一条（`send_local_image` 或 `send_text`）。
+
+        **和 `upload_image` 的语义完全不同，别混**：那个只上传、不发消息，所以
+        不占配额也不进令牌桶；这个上传完就真发一条，所以**照常走 `_send`**
+        （群锁 + 令牌桶 + 每日配额）—— 一次视频就是一条主动消息。
+
+        视频体积上限见 `monday.MAX_VIDEO_BYTES`（实测 10 MiB），由 `RssBot`
+        那条路卡。
+        """
+        await self._send(group_openid, lambda: self.pusher.send_video(group_openid, path))
+
+
+    async def send_voice(self, group_openid: str, path: Path) -> None:
+        """发一条语音（`file_type=3` + `msg_type=7`）。
+
+        **没有 `content`** —— 用户定的「只发语音、不要字幕」，见
+        `RssBot.send_voice`。
+
+        **照常走 `_send`**（群锁 + 令牌桶 + 每日配额）—— 一条语音就是一条主动
+        消息。一天一条，相对 900/天 的配额可以忽略，但**别因此绕过 `_send`**：
+        绕过的话 `used_today` 会少算，配额那条日志就不准了。
+
+        格式校验（silk 魔数）在 `RssBot.send_voice` 里 —— 那是这条路上唯一的把关，
+        因为 QQ 的语音上传接口**完全不校验格式**。
+        """
+        await self._send(group_openid, lambda: self.pusher.send_voice(group_openid, path))
 
     async def upload_image(self, group_openid: str, image_url: str) -> bool:
         """只让 QQ 去抓图、拿 `file_info`，**不发消息**。

@@ -7,6 +7,7 @@ import base64
 import itertools
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import botpy
@@ -32,6 +33,10 @@ from .scheduler import (
     image_failure_message,
     send_with_retry,
 )
+from . import monday as monday_module
+from . import morning as morning_module
+from .monday import MondayPoller
+from .morning import MorningPoller
 from .tickets import TicketPoller
 
 _log = logging.getLogger("qq_rss_bot.bot")
@@ -104,6 +109,14 @@ class RssBot(botpy.Client):
         # `run()` 会立刻返回，等于功能关闭。
         self.tickets = TicketPoller(cfg, self.db, self.rss_http, self.sender)
         self._ticket_task: Any = None
+        # 「月曜が近いよ」每周播报。同样单独一个 task。没配 MONDAY_GROUPS 时
+        # `run()` 立刻返回，等于功能关闭。
+        self.monday = MondayPoller(cfg, self.db, self.sender)
+        self._monday_task: Any = None
+        # 每日早安语音。同样单独一个 task，没配 MORNING_GROUPS 时 `run()`
+        # 立刻返回，等于功能关闭。
+        self.morning = MorningPoller(cfg, self.db, self.sender)
+        self._morning_task: Any = None
 
     # ---------- 生命周期 ----------
 
@@ -118,6 +131,14 @@ class RssBot(botpy.Client):
         if self._ticket_task is None:
             self._ticket_task = self.loop.create_task(
                 self.tickets.run(), name="qq_rss_bot.tickets"
+            )
+        if self._monday_task is None:
+            self._monday_task = self.loop.create_task(
+                self.monday.run(), name="qq_rss_bot.monday"
+            )
+        if self._morning_task is None:
+            self._morning_task = self.loop.create_task(
+                self.morning.run(), name="qq_rss_bot.morning"
             )
         if self.autosub.enabled:
             # **先挂 poller 再补订阅**：补订阅万一抛异常，不能连累轮询器起不来。
@@ -212,6 +233,12 @@ class RssBot(botpy.Client):
         self.tickets.stop()
         if self._ticket_task is not None:
             self._ticket_task.cancel()
+        self.monday.stop()
+        if self._monday_task is not None:
+            self._monday_task.cancel()
+        self.morning.stop()
+        if self._morning_task is not None:
+            self._morning_task.cancel()
         await self.rss_http.aclose()
         await self.media_http.aclose()
         self.db.close()
@@ -694,6 +721,50 @@ class RssBot(botpy.Client):
             media={"file_info": file_info},
         )
 
+    async def send_local_image(self, group_openid: str, content: str, path: Path) -> None:
+        """主动发一条「文字 + 本地图片」（`file_type=1` + `msg_type=7`）。
+
+        和 `send_rich` 的唯一区别是**图片来源**：那个给 URL 让 QQ 自己去下，
+        这个由我们把字节 base64 传上去。本地素材（表情包）没有 URL 可给，
+        所以走这条。
+
+        ⚠️ **`msg_type=7` 带图片时 `content` 是渲染的**（带视频时不渲染，
+        见 `send_video`）—— 这就是「文案 + 表情包」能挤进一条消息的原因。
+
+        ⚠️ 机器人发不了**真·表情包**：QQ 的表情包是客户端的东西，bot API 里
+        没有对应的 `msg_type`。这里发出去的是普通图片。
+        """
+        raw = Path(path).read_bytes()
+        payload = base64.b64encode(raw).decode()
+        # 和 `_upload_image` 同一道闸：`file_data` 官方限 5M，限的是 base64 之后
+        # 那一串。超了直接抛（不像 preview 那条路降级成无图）—— 这里图就是主体，
+        # 悄悄少一张图等于文案白改。
+        if len(payload) > preview.MAX_FILE_DATA_BYTES:
+            raise RuntimeError(
+                f"图片 {Path(path).name} 原始 {len(raw)} 字节、base64 后 {len(payload)} 字节，"
+                f"超 QQ 的 {preview.MAX_FILE_DATA_BYTES} 直传上限"
+            )
+        media = await self.api.post_group_file(
+            group_openid=group_openid,
+            file_type=1,  # 1=图片
+            file_data=payload,
+            srv_send_msg=False,  # 只上传拿 file_info，不单独发一条
+        )
+        file_info = media.get("file_info") if isinstance(media, dict) else None
+        if not file_info:
+            raise RuntimeError(f"上传图片未拿到 file_info: {media!r}")
+
+        resp = await self.api.post_group_message(
+            group_openid=group_openid,
+            msg_type=7,  # 7=富媒体（图文）
+            content=content,
+            media={"file_info": file_info},
+        )
+        # 同 send_markdown：业务错误码是 200 带 code 回来的，不判就会被当成成功。
+        code = resp.get("code") if isinstance(resp, dict) else None
+        if code:
+            raise RuntimeError(f"发送图片失败 code={code}: {resp}")
+
     async def send_markdown(self, group_openid: str, content: str) -> None:
         """主动发 markdown（`msg_type=2`）。
 
@@ -715,6 +786,104 @@ class RssBot(botpy.Client):
         code = resp.get("code") if isinstance(resp, dict) else None
         if code:
             raise RuntimeError(f"发送 markdown 失败 code={code}: {resp}")
+
+    async def send_video(self, group_openid: str, path: Path) -> None:
+        """主动发一条视频（`file_type=2` + `msg_type=7`）。
+
+        和发图一样是**两步**：先上传拿 `file_info`（`srv_send_msg=False`），
+        再用 `msg_type=7` 发出去。
+
+        ⚠️ **没有 `content` 参数，是故意的。** `msg_type=7` 带**图片**时
+        `content` 会渲染，带**视频**时**客户端整个丢掉** —— 实测过：接口回
+        HTTP 200、`file_info` 也拿到了，群里就是只有视频、一个字都没有。
+        `MediaInfo` 里也只有 `file_info`，没有 caption/title 字段可挂。
+        所以「文案 + 视频」只能拆成**两条消息**（文案跟图走，见
+        `send_local_image`），别想着在这里塞文字。
+
+        **走 base64 而不是 URL**：URL 形态要 QQ 的服务器自己去下载，而它连
+        `i.ytimg.com` 都拉不到（`850027`）；本地素材更没有 URL 可给。
+
+        ⚠️ **10 MiB 是实测出来的硬上限**（`400 40093011`），和时长无关。
+        这条硬闸放在这里，超了直接抛 —— 不把注定被拒的 body 递出去。
+        完整那张实测表在 `monday.py` 的模块说明里。
+        """
+        raw = Path(path).read_bytes()
+        if len(raw) > monday_module.MAX_VIDEO_BYTES:
+            raise RuntimeError(
+                f"视频 {Path(path).name} 有 {len(raw) / 1048576:.2f} MiB，"
+                f"超过 {monday_module.MAX_VIDEO_BYTES / 1048576:.0f} MiB 上限"
+                "（QQ 会回 400 40093011），不发"
+            )
+        media = await self.api.post_group_file(
+            group_openid=group_openid,
+            file_type=2,  # 2=视频 mp4（1=图片 3=语音silk）
+            file_data=base64.b64encode(raw).decode(),
+            srv_send_msg=False,
+        )
+        file_info = media.get("file_info") if isinstance(media, dict) else None
+        if not file_info:
+            raise RuntimeError(f"上传视频未拿到 file_info: {media!r}")
+
+        resp = await self.api.post_group_message(
+            group_openid=group_openid,
+            msg_type=7,  # 7=富媒体
+            content="",  # 视频这条 content 客户端不渲染，见上面；留空而不是留文案
+            media={"file_info": file_info},
+        )
+        # 和 send_markdown 同理：botpy 只在 **HTTP** 非 2xx 时抛异常，业务错误码
+        # 是 200 带 code 回来的。不判这一下，超限/没权限会被当成发送成功。
+        code = resp.get("code") if isinstance(resp, dict) else None
+        if code:
+            raise RuntimeError(f"发送视频失败 code={code}: {resp}")
+
+    async def send_voice(self, group_openid: str, path: Path) -> None:
+        """主动发一条语音（`file_type=3` + `msg_type=7`）。
+
+        和发图/发视频一样是**两步**：先上传拿 `file_info`（`srv_send_msg=False`），
+        再用 `msg_type=7` 发出去。
+
+        ⚠️ **没有 `content` 参数，是故意的** —— 用户 2026-10-19 定的「只发语音、
+        不要字幕」。附带说明：语音那条的 `content` 到底渲不渲染**没测过**
+        （0:45 那条测试语音带了文字，用户只确认了「听到了」），所以这里留空，
+        只发语音气泡。
+
+        ⚠️ **这道 silk 魔数闸是这条路上唯一的把关。** 2026-10-19 实测：`file_type=3`
+        的上传接口**完全不校验格式** —— mp3 / wav / m4a、甚至 `\x02#!SILK_V3`
+        后面接两千个零字节的**纯垃圾**，全都 HTTP 200 拿到 `file_info`。
+        **「上传成功」在这里一点信息量都没有**，不自己挡就等着群里出现一个
+        点不开的语音气泡。视频那条至少还有 10 MiB 的硬边界，语音这条连格式都不挡。
+
+        ⚠️ **没有体积闸** —— 语音这边**没测出**上限（也不该有：一条 3 秒的
+        silk 只有几 KB）。真撞上官方 body 上限的话错误会和视频那条一样明显。
+        """
+        raw = Path(path).read_bytes()
+        if raw[:10] != morning_module.SILK_MAGIC:
+            raise RuntimeError(
+                f"{Path(path).name} 不是 silk（文件头 {raw[:10]!r}，"
+                f"应为 {morning_module.SILK_MAGIC!r}），不发 —— "
+                "上传接口对格式完全不校验，传上去就是个点不开的气泡"
+            )
+        media = await self.api.post_group_file(
+            group_openid=group_openid,
+            file_type=3,  # 3=语音 silk（1=图片 2=视频 mp4）
+            file_data=base64.b64encode(raw).decode(),
+            srv_send_msg=False,
+        )
+        file_info = media.get("file_info") if isinstance(media, dict) else None
+        if not file_info:
+            raise RuntimeError(f"上传语音未拿到 file_info: {media!r}")
+
+        resp = await self.api.post_group_message(
+            group_openid=group_openid,
+            msg_type=7,  # 7=富媒体
+            content="",  # 只发语音气泡，不要字幕 —— 见上面
+            media={"file_info": file_info},
+        )
+        # 和 send_markdown / send_video 同理：botpy 只在 **HTTP** 非 2xx 时抛异常，
+        # 业务错误码是 200 带 code 回来的。不判这一下，超限/没权限会被当成发送成功。
+        code = resp.get("code") if isinstance(resp, dict) else None
+        if code:
+            raise RuntimeError(f"发送语音失败 code={code}: {resp}")
 
     async def upload_image(self, group_openid: str, image_url: str) -> bool:
         """让 QQ 去抓一张图，只拿 `file_info`、**不发消息**。返回抓没抓到。

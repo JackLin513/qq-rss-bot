@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -93,6 +93,29 @@ CREATE TABLE IF NOT EXISTS ticket_alerts (
     kind         TEXT NOT NULL,
     sent_at      TEXT NOT NULL,
     PRIMARY KEY (reception_id, group_openid, kind)
+);
+
+-- 「月曜が近いよ」每周播报发过哪些。**主键是 (计划时刻, 群)** ——
+-- 同一个 slot 一个群只发一次，所以窗口内 tick 好几次、或者进程重启，
+-- 都不会重发。落库而不是放内存的理由同上：重启不能把「这周发过了」清零。
+CREATE TABLE IF NOT EXISTS monday_posts (
+    slot         TEXT NOT NULL,
+    group_openid TEXT NOT NULL,
+    video        TEXT NOT NULL,
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (slot, group_openid)
+);
+
+-- 每日早安语音。主键同样是 (计划时刻, 群) —— 一个 slot 一个群只发一次，
+-- 窗口内 tick 好几次、或者进程重启都不会重发。落库而不是放内存，
+-- 理由和 monday_posts 一样：重启不能把「今天发过了」清零。
+CREATE TABLE IF NOT EXISTS morning_posts (
+    slot         TEXT NOT NULL,
+    group_openid TEXT NOT NULL,
+    idol         TEXT NOT NULL,
+    line         TEXT NOT NULL,
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (slot, group_openid)
 );
 """
 
@@ -465,6 +488,99 @@ class Database:
             (reception_id, group_openid, kind, utcnow()),
         )
         self._conn.commit()
+
+    # ---------- 月曜が近いよ（每周播报）----------
+
+    def monday_posted(self, slot: str) -> set[str]:
+        """这个计划时刻已经发过哪些群。`slot` 形如 `2026-10-18T22:00`。"""
+        rows = self._conn.execute(
+            "SELECT group_openid FROM monday_posts WHERE slot = ?", (slot,)
+        ).fetchall()
+        return {row["group_openid"] for row in rows}
+
+    def mark_monday_posted(self, slot: str, group_openid: str, video: str) -> None:
+        """记下「这个 slot 发给这个群了」。重复调用无副作用。"""
+        self._conn.execute(
+            """
+            INSERT INTO monday_posts (slot, group_openid, video, sent_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (slot, group_openid) DO UPDATE SET
+                video = excluded.video, sent_at = excluded.sent_at
+            """,
+            (slot, group_openid, video, utcnow()),
+        )
+        self._conn.commit()
+
+    def monday_last_video(self) -> str | None:
+        """上一次实际发出去的文件名 —— 用来避免连着两周发同一个。
+
+        按 `sent_at` 排，**同时用 rowid 兜底**：同一秒内发的几条
+        `sent_at` 完全一样，只按它排顺序是不确定的。
+        """
+        row = self._conn.execute(
+            "SELECT video FROM monday_posts ORDER BY sent_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return row["video"] if row else None
+
+    # ---------- 每日早安语音 ----------
+
+    def morning_posted(self, slot: str) -> set[str]:
+        """这个计划时刻已经发过哪些群。`slot` 形如 `2026-10-20T07:30`。"""
+        rows = self._conn.execute(
+            "SELECT group_openid FROM morning_posts WHERE slot = ?", (slot,)
+        ).fetchall()
+        return {row["group_openid"] for row in rows}
+
+    def mark_morning_posted(
+        self, slot: str, group_openid: str, idol: str, line: str
+    ) -> None:
+        """记下「这个 slot 发给这个群了」。重复调用无副作用。"""
+        self._conn.execute(
+            """
+            INSERT INTO morning_posts (slot, group_openid, idol, line, sent_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (slot, group_openid) DO UPDATE SET
+                idol = excluded.idol,
+                line = excluded.line,
+                sent_at = excluded.sent_at
+            """,
+            (slot, group_openid, idol, line, utcnow()),
+        )
+        self._conn.commit()
+
+    def morning_last_line(self) -> str | None:
+        """上一次实际发出去的文件名 —— 用来避免连着两天发同一条。
+
+        按 `sent_at` 排，**同时用 rowid 兜底**：同一秒内发的几条
+        `sent_at` 完全一样，只按它排顺序是不确定的（同 `monday_last_video`）。
+        """
+        row = self._conn.execute(
+            "SELECT line FROM morning_posts ORDER BY sent_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        return row["line"] if row else None
+
+    def morning_recent_idols(self, days: int) -> set[str]:
+        """最近 `days` 天发过的偶像 id，用来避开重复。
+
+        ⚠️ 按 **`slot` 的字符串前缀**筛，**不用 `sent_at`** —— `sent_at` 是
+        UTC、`slot` 是本地时间，跨零点会错一天。`slot` 是 ISO 形态
+        （`2026-10-20T07:30`），所以字符串比较就等于时间比较。
+
+        **不管 `days` 是几，都至少带上最近那一次的那位** —— 否则
+        `MORNING_RECENT_DAYS=0` 时明天还会发同一个人，看起来像随机坏了。
+        """
+        days = max(days, 0)
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d") + "T00:00"
+        rows = self._conn.execute(
+            "SELECT idol FROM morning_posts WHERE slot >= ?", (cutoff,)
+        ).fetchall()
+        out = {row["idol"] for row in rows}
+        last = self._conn.execute(
+            "SELECT idol FROM morning_posts ORDER BY sent_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if last:
+            out.add(last["idol"])
+        return out
 
     # ---------- 出错时私聊谁 ----------
 

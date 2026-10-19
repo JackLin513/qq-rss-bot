@@ -5108,6 +5108,916 @@ _check_tk_cover()
 _check_tk_feed()
 _check_tk_db()
 
+print("[4.65] 月曜が近いよ（每周定时播报，全离线）")
+
+
+class _MondaySender:
+    """假 sender。
+
+    `fail` 里的群**发什么都抛**（验逐群隔离）；`fail_video` 只让视频抛
+    （验「文案发成了、视频挂了」那条路）。
+
+    `calls` 记调用**顺序**，用来钉死「文案一条、视频一条」这个形状。
+    """
+
+    def __init__(
+        self,
+        fail: set[str] | None = None,
+        fail_video: set[str] | None = None,
+    ) -> None:
+        self.captions: list[tuple[str, str, str | None]] = []  # (群, 文案, 表情包)
+        self.videos: list[tuple[str, str]] = []                # (群, 视频) 成功的
+        self.video_attempts: list[tuple[str, str]] = []        # 含失败的
+        self.calls: list[tuple[str, str]] = []                 # (类型, 群)
+        self.fail = fail or set()
+        self.fail_video = fail_video or set()
+
+    async def send_text(self, group: str, content: str) -> None:
+        if group in self.fail:
+            raise RuntimeError("模拟发送失败")
+        self.calls.append(("text", group))
+        self.captions.append((group, content, None))
+
+    async def send_local_image(self, group: str, content: str, path) -> None:
+        if group in self.fail:
+            raise RuntimeError("模拟发送失败")
+        self.calls.append(("image", group))
+        self.captions.append((group, content, str(path)))
+
+    async def send_video(self, group: str, path) -> None:
+        # 失败也要记一笔 —— 「重试有没有真的再试一次」只能靠这个看出来
+        # （失败的调用不会进 `calls` / `videos`）。
+        self.video_attempts.append((group, str(path)))
+        if group in self.fail or group in self.fail_video:
+            raise RuntimeError("模拟发送失败")
+        self.calls.append(("video", group))
+        self.videos.append((group, str(path)))
+
+
+def _md_dir_with(
+    tmp: Path, *, big: bool = False, appledouble: bool = False, sticker: bool = False
+) -> Path:
+    """造一个素材目录。`big` 会放一个**稀疏**的 11 MiB 文件（不真占磁盘）。"""
+    d = tmp / "monday"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "a.mp4").write_bytes(b"x" * 1024)
+    (d / "b.mp4").write_bytes(b"y" * 2048)
+    (d / "notes.txt").write_bytes(b"not a video")
+    (d / "empty.mp4").write_bytes(b"")
+    if sticker:
+        # 名字学真实素材（`月曜が近いよ.jpg`）—— 认后缀不认名字，钉死这一点
+        (d / "月曜が近いよ.jpg").write_bytes(b"\xff\xd8\xff" + b"j" * 512)
+    if appledouble:
+        # ⚠️ macOS 的 tar / Finder 会带这个，**它也以 .mp4 结尾**
+        (d / "._a.mp4").write_bytes(b"\x00\x05\x16\x07")
+    if big:
+        with (d / "huge.mp4").open("wb") as fh:
+            fh.truncate(11 * 1024 * 1024)
+    return d
+
+
+def _check_md_list() -> None:
+    import logging as _logging  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        d = _md_dir_with(tmp, big=True, appledouble=True)
+
+        records: list[_logging.LogRecord] = []
+
+        class _Cap(_logging.Handler):
+            def emit(self, record):  # noqa: ANN001
+                records.append(record)
+
+        log = _logging.getLogger("qq_rss_bot.monday")
+        cap = _Cap(level=_logging.WARNING)
+        log.addHandler(cap)
+        try:
+            videos = _md.list_videos(d)
+        finally:
+            log.removeHandler(cap)
+
+        names = [p.name for p in videos]
+        check("★ 只挑出真正的 mp4", names == ["a.mp4", "b.mp4"], str(names))
+        check("★ `._` 元数据文件不算视频（它同样以 .mp4 结尾）",
+              "._a.mp4" not in names, str(names))
+        check("★ 0 字节的不算视频", "empty.mp4" not in names, str(names))
+        check("★ 非 mp4 不算视频", "notes.txt" not in names, str(names))
+        check("★ 超过 10 MiB 的被剔除", "huge.mp4" not in names, str(names))
+        check("★ 剔除超限文件时**打了 WARNING**（静默跳过的话没人知道为什么没播）",
+              any("huge.mp4" in r.getMessage() for r in records),
+              str([r.getMessage() for r in records]))
+        check("★ 警告里说明了是哪个文件、多大",
+              any("10 MiB" in r.getMessage() for r in records),
+              str([r.getMessage() for r in records]))
+
+        # 目录不存在 / 空目录都不该抛
+        check("目录不存在 → 空列表、不抛", _md.list_videos(tmp / "nope") == [])
+        empty = tmp / "empty_dir"
+        empty.mkdir()
+        check("空目录 → 空列表、不抛", _md.list_videos(empty) == [])
+        check("★ 上限常量就是实测出来的 10 MiB",
+              _md.MAX_VIDEO_BYTES == 10 * 1024 * 1024, str(_md.MAX_VIDEO_BYTES))
+
+
+def _check_md_pick() -> None:
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+
+    a, b = Path("/x/月曜_1.mp4"), Path("/x/月曜_2.mp4")
+    both = [a, b]
+
+    # 两个素材时，上周发过 A → 这周必选 B。
+    # 纯随机有一半概率连着两周发同一个，看起来就像「随机根本没生效」。
+    check("★ 有得选时避开上次那个（跑 30 次都不重复）",
+          all(_md.pick_video(both, "月曜_1.mp4") == b for _ in range(30)))
+    check("★ 上次那个已不在目录里时不报错", _md.pick_video(both, "没了.mp4") in both)
+    check("★ 只有一个素材时照发（不能因为会重复就一条都不发）",
+          _md.pick_video([a], "月曜_1.mp4") == a)
+    check("★ 两个都能选到时结果不唯一（确实是随机）",
+          len({_md.pick_video(both, None).name for _ in range(60)}) == 2)
+    try:
+        _md.pick_video([], None)
+        check("空列表应当抛 ValueError", False)
+    except ValueError:
+        check("★ 空列表抛 ValueError", True)
+
+
+def _check_md_slot() -> None:
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+
+    at = _md.parse_time("22:00")
+    cases = [
+        # (now, 期望 slot, 说明)
+        ("2026-10-18T21:59", "2026-10-11T22:00", "周日 21:59 → 上周日（还没到）"),
+        ("2026-10-18T22:00", "2026-10-18T22:00", "正好 22:00 → **今天**（否则整点那一下会漏一周）"),
+        ("2026-10-18T22:01", "2026-10-18T22:00", "22:01 → 今天（窗口内）"),
+        ("2026-10-19T09:00", "2026-10-18T22:00", "周一 09:00 → 上周日（但已出窗口）"),
+        ("2026-10-25T12:00", "2026-10-18T22:00", "下周日中午 → 还是上周日"),
+    ]
+    for raw, want, why in cases:
+        got = _md.slot_for(datetime.fromisoformat(raw), 6, at)
+        check(f"★ slot：{why}", got.isoformat(timespec="minutes") == want,
+              f"{got.isoformat(timespec='minutes')} != {want}")
+
+    # 默认播出时间：2026-10-18 从 22:00 改成 23:30（中国时间）。
+    # 钉住它是为了「改时间只该改一个地方」—— .env 没配时也得是 23:30。
+    check("★ 默认播出时间是 23:30", _md.DEFAULT_TIME == "23:30", _md.DEFAULT_TIME)
+    check("★ 默认值是能吃的 HH:MM",
+          _md.parse_time(_md.DEFAULT_TIME).strftime("%H:%M") == "23:30")
+    check("★ 不给 at 时 slot_for 用默认时间（23:30 → 当天）",
+          _md.slot_for(datetime.fromisoformat("2026-10-18T23:30"), 6).isoformat(
+              timespec="minutes") == "2026-10-18T23:30")
+    check("★ 23:29 还没到 → 上周日 23:30",
+          _md.slot_for(datetime.fromisoformat("2026-10-18T23:29"), 6).isoformat(
+              timespec="minutes") == "2026-10-11T23:30")
+    check("★ Config 的默认值跟着 DEFAULT_TIME 走（只改一处）",
+          cfg_stub().monday_time == _md.DEFAULT_TIME, cfg_stub().monday_time)
+
+    # 窗口判定：只有抖动算数，不是补发
+    now = datetime.fromisoformat("2026-10-18T22:02")
+    slot = _md.slot_for(now, 6, at)
+    check("★ 22:02 在 180 秒窗口内（tick 抖动）",
+          (now - slot).total_seconds() <= _md.DEFAULT_WINDOW_SEC)
+    now = datetime.fromisoformat("2026-10-18T22:05")
+    slot = _md.slot_for(now, 6, at)
+    check("★ 22:05 已出窗口 —— 用户明确选了「不补发」",
+          (now - slot).total_seconds() > _md.DEFAULT_WINDOW_SEC)
+
+
+def _check_md_text() -> None:
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+
+    # 2026-10-18 用户明确不要「（あと N 時間）」这个尾巴 —— 就是这一句，一个字不多。
+    check("★ 文案就是「月曜が近いよ」，没有后缀",
+          _md.render_text(datetime.fromisoformat("2026-10-18T22:00")) == "月曜が近いよ")
+    check("★ 文案是**常量**：换任何时刻都一样（不可能再出现「あと -8 時間」）",
+          len({_md.render_text(datetime.fromisoformat(t)) for t in (
+              "2026-10-17T12:00", "2026-10-18T22:00", "2026-10-19T00:30",
+              "2026-10-19T09:00", "2026-10-25T23:59")}) == 1)
+    check("★ 不带参数也能调（探测脚本 / 调用方不该被 now 绑住）",
+          _md.render_text() == "月曜が近いよ")
+    check("★ 文案里没有裸的 markdown 语法符号（可能走 msg_type=0）",
+          all(ch not in _md.render_text(datetime.fromisoformat("2026-10-18T22:00"))
+              for ch in "**[]()`#>|"))
+
+    # 时间配置写错要**当场退出**，不能静默用一个默认值
+    for bad in ("25:00", "2200", "", "abc"):
+        try:
+            _md.parse_time(bad)
+            check(f"MONDAY_TIME={bad!r} 应当退出", False)
+        except SystemExit:
+            check(f"★ MONDAY_TIME={bad!r} → SystemExit", True)
+
+
+def _check_md_sticker() -> None:
+    """表情包：按**后缀**认，不要求文件名；没有就退化成纯文字。"""
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        d = _md_dir_with(tmp, sticker=True)
+        got = _md.find_sticker(d)
+        check("★ 认得出表情包（jpg）",
+              got is not None and got.name == "月曜が近いよ.jpg", str(got))
+        check("★ 表情包**按后缀认**，不看文件名（真实素材就叫 月曜が近いよ.jpg）",
+              got is not None and got.stem == "月曜が近いよ", str(got))
+        check("★ 表情包不会被当成视频",
+              got.name not in {q.name for q in _md.list_videos(d)})
+        check("★ 视频不会被当成表情包",
+              all(q.suffix.lower() not in _md._STICKER_SUFFIXES
+                  for q in _md.list_videos(d)))
+
+        # `._` 元数据：AppleDouble 的图片同样要跳过
+        ad = tmp / "ad"
+        ad.mkdir()
+        (ad / "._x.jpg").write_bytes(b"junk")
+        check("★ `._x.jpg` 不当表情包", _md.find_sticker(ad) is None)
+        (ad / "x.jpg").write_bytes(b"j")
+        one = _md.find_sticker(ad)
+        check("★ 有真图时 `._` 那个也不干扰",
+              one is not None and one.name == "x.jpg", str(one))
+
+        # 没有图 → None（调用方退化成纯文字），不能抛
+        plain = tmp / "plain"
+        plain.mkdir()
+        (plain / "a.mp4").write_bytes(b"v")
+        check("★ 没有图 → None（文案退化成纯文字）", _md.find_sticker(plain) is None)
+        check("★ 目录不存在 → None，不抛", _md.find_sticker(tmp / "nope") is None)
+
+        # 0 字节的图不算
+        z = tmp / "zero"
+        z.mkdir()
+        (z / "empty.jpg").write_bytes(b"")
+        check("★ 0 字节的图不算", _md.find_sticker(z) is None)
+
+        # 多张图：挑排第一的（确定性，不是随机）
+        m = tmp / "many"
+        m.mkdir()
+        (m / "b.png").write_bytes(b"b")
+        (m / "a.png").write_bytes(b"a")
+        many = _md.find_sticker(m)
+        check("★ 多张图时取按名字排第一的（确定性，不是随机）",
+              many is not None and many.name == "a.png", str(many))
+
+        # 各种后缀
+        for suf in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            box = tmp / ("one" + suf.strip("."))
+            box.mkdir()
+            (box / ("x" + suf)).write_bytes(b"i")
+            check("★ 认 " + suf, _md.find_sticker(box) is not None)
+
+
+def _check_md_poller() -> None:
+    import tempfile  # noqa: PLC0415
+    from dataclasses import replace  # noqa: PLC0415
+
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+
+    at = "2026-10-18T22:00"
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            d = _md_dir_with(tmp, appledouble=True, sticker=True)
+            db = Database(tmp / "t.db")
+            try:
+                cfg = replace(
+                    cfg_stub(),
+                    monday_groups=("G1", "G2"),
+                    monday_video_dir=d,
+                    monday_weekday=6,
+                    monday_time="22:00",
+                    monday_window_sec=180,
+                )
+                now = datetime.fromisoformat(at)
+
+                # --- 没配群 = 功能关闭 ---
+                off = replace(cfg, monday_groups=())
+                s0 = _MondaySender()
+                check("★ 没配 MONDAY_GROUPS → 一条都不发",
+                      await _md.MondayPoller(off, db, s0).poll_once(now=now) == 0)
+                check("★ 没配群时不发（sender 没被调用）",
+                      s0.videos == [] and s0.captions == [])
+
+                # --- 正常播报 ---
+                sender = _MondaySender()
+                poller = _md.MondayPoller(cfg, db, sender)
+                check("★ 窗口内发到 2 个群",
+                      await poller.poll_once(now=now) == 2, str(sender.videos))
+                check("★ 文案就是「月曜が近いよ」（不带「あと N 時間」）",
+                      all(c == "月曜が近いよ" for _, c, _ in sender.captions),
+                      str(sender.captions))
+                check("★ 文案跟**表情包**走（send_local_image，不是纯文本）",
+                      all(st is not None and st.endswith(".jpg")
+                          for _, _, st in sender.captions), str(sender.captions))
+                check("★ **两条消息**：文案一条、视频一条（不是一条）",
+                      sender.calls == [("image", "G1"), ("video", "G1"),
+                                       ("image", "G2"), ("video", "G2")],
+                      str(sender.calls))
+                check("★ 顺序是文案在前、视频在后",
+                      all(c[0] == "image" for c in sender.calls[::2])
+                      and all(c[0] == "video" for c in sender.calls[1::2]),
+                      str(sender.calls))
+                check("★ 视频那条**不带文案**（带了客户端也丢掉，只会误导）",
+                      all(len(v) == 2 for v in sender.videos), str(sender.videos))
+                check("★ 发的都是同一个视频（一周一条，不是每群随机）",
+                      len({p for _, p in sender.videos}) == 1, str(sender.videos))
+                check("★ 发的是真 mp4，不是 `._` 那个",
+                      all(Path(p).name in ("a.mp4", "b.mp4") for _, p in sender.videos),
+                      str(sender.videos))
+                check("★ 落库了（重启后同一周不会重发）",
+                      db.monday_posted("2026-10-18T22:00") == {"G1", "G2"})
+
+                # --- 幂等：同一个 slot 再跑一次，一条都不发 ---
+                again = _MondaySender()
+                check("★ 同一 slot 第二次 → 0 条",
+                      await _md.MondayPoller(cfg, db, again).poll_once(now=now) == 0)
+                check("★ 第二次真的没调用 sender",
+                      again.videos == [] and again.captions == [])
+
+                # --- 窗口外不发（不补发）---
+                late = datetime.fromisoformat("2026-10-19T09:00")
+                db2 = Database(tmp / "t2.db")
+                try:
+                    s2 = _MondaySender()
+                    check("★ 周一才起来 → 不发（不补发）",
+                          await _md.MondayPoller(cfg, db2, s2).poll_once(now=late) == 0)
+                    check("★ 窗口外真的没调用 sender",
+                          s2.videos == [] and s2.captions == [])
+                finally:
+                    db2.close()
+
+                # --- 逐群隔离：一个群挂了不影响别的群 ---
+                db3 = Database(tmp / "t3.db")
+                try:
+                    s3 = _MondaySender(fail={"G1"})
+                    check("★ 一个群失败时其余群照发",
+                          await _md.MondayPoller(cfg, db3, s3).poll_once(now=now) == 1,
+                          str(s3.videos))
+                    check("★ G1 挂了之后 G2 的两条都发出去了",
+                          s3.calls == [("image", "G2"), ("video", "G2")], str(s3.calls))
+                    check("★ 失败的群**不记账**（窗口内下次 tick 会重试）",
+                          db3.monday_posted("2026-10-18T22:00") == {"G2"},
+                          str(db3.monday_posted("2026-10-18T22:00")))
+                finally:
+                    db3.close()
+
+                # --- 没有素材：一条不发，也不能抛 ---
+                db4 = Database(tmp / "t4.db")
+                try:
+                    empty = tmp / "nothing"
+                    empty.mkdir()
+                    s4 = _MondaySender()
+                    cfg4 = replace(cfg, monday_video_dir=empty)
+                    check("★ 目录里没有素材 → 0 条、不抛",
+                          await _md.MondayPoller(cfg4, db4, s4).poll_once(now=now) == 0)
+                    check("★ 没素材时没调用 sender",
+                          s4.videos == [] and s4.captions == [])
+                    check("★ 没素材时不记账（下周还能补上）",
+                          db4.monday_posted("2026-10-18T22:00") == set())
+                finally:
+                    db4.close()
+
+                # --- 去重：上周发过 A，这周不会又发 A ---
+                db5 = Database(tmp / "t5.db")
+                try:
+                    db5.mark_monday_posted("2026-10-11T22:00", "G1", "a.mp4")
+                    check("★ 记住了上次发的", db5.monday_last_video() == "a.mp4")
+                    s5 = _MondaySender()
+                    await _md.MondayPoller(cfg, db5, s5).poll_once(now=now)
+                    check("★ 这周避开了上周那个",
+                          all(Path(p).name == "b.mp4" for _, p in s5.videos),
+                          str(s5.videos))
+                finally:
+                    db5.close()
+
+                # --- 视频挂了：那个群不记账；重试时**文案不重发** ---
+                db6 = Database(tmp / "t6.db")
+                try:
+                    s6 = _MondaySender(fail_video={"G1"})
+                    p6 = _md.MondayPoller(cfg, db6, s6)
+                    check("★ 视频挂了 → 那个群不算发成功",
+                          await p6.poll_once(now=now) == 1, str(s6.videos))
+                    check("★ 视频挂了但文案照样发（两条互不连累）",
+                          ("image", "G1") in s6.calls, str(s6.calls))
+                    check("★ 视频挂了 → 那个群**不记账**（窗口内会重试）",
+                          db6.monday_posted("2026-10-18T22:00") == {"G2"},
+                          str(db6.monday_posted("2026-10-18T22:00")))
+                    before = len(s6.captions)
+                    # 第一轮：G1 视频失败、G2 成功 → 2 次尝试
+                    check("★ 第一轮试了 2 个群的视频",
+                          len(s6.video_attempts) == 2, str(s6.video_attempts))
+                    await p6.poll_once(now=now)
+                    check("★ 重试时**文案不重发**（否则群里两条一样的文案）",
+                          len(s6.captions) == before, str(s6.captions))
+                    check("★ 重试时**真的又试了一次**视频（只有 G1，G2 已记账）",
+                          len(s6.video_attempts) == 3
+                          and s6.video_attempts[-1][0] == "G1",
+                          str(s6.video_attempts))
+                finally:
+                    db6.close()
+
+                # --- 没有表情包：文案退回纯文字，其余完全不变 ---
+                db7 = Database(tmp / "t7.db")
+                try:
+                    s7 = _MondaySender()
+                    noimg = _md_dir_with(tmp / "nosticker", appledouble=True)
+                    cfg7 = replace(cfg, monday_video_dir=noimg)
+                    check("★ 没表情包也照发",
+                          await _md.MondayPoller(cfg7, db7, s7).poll_once(now=now) == 2)
+                    check("★ 没表情包时文案走 msg_type=0（send_text）",
+                          [c[0] for c in s7.calls] == ["text", "video", "text", "video"],
+                          str(s7.calls))
+                    check("★ 没表情包时文案内容不变",
+                          all(c == "月曜が近いよ" for _, c, _ in s7.captions))
+                finally:
+                    db7.close()
+            finally:
+                db.close()
+
+    asyncio.run(run())
+
+
+class _MondayApi:
+    """记录 `post_group_file` / `post_group_message` 的调用参数。"""
+
+    def __init__(self) -> None:
+        self.uploads: list[dict] = []
+        self.sent: list[dict] = []
+        self.fail_send: int | None = None
+        self.no_file_info = False
+
+    async def post_group_file(self, **kw):
+        self.uploads.append(kw)
+        return {} if self.no_file_info else {"file_info": "FI-123"}
+
+    async def post_group_message(self, **kw):
+        self.sent.append(kw)
+        return {"code": self.fail_send} if self.fail_send else {"code": 0}
+
+
+class _MondayBotStub:
+    """只借 `RssBot` 的两个发送方法，不真造 botpy Client。"""
+
+    send_video = _RssBot.send_video
+    send_local_image = _RssBot.send_local_image
+
+    def __init__(self, api) -> None:
+        self.api = api
+
+
+def _check_md_send_video() -> None:
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import monday as _md  # noqa: PLC0415
+    from qq_rss_bot import preview as _pv  # noqa: PLC0415
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            small = tmp / "ok.mp4"
+            small.write_bytes(b"v" * 4096)
+            big = tmp / "huge.mp4"
+            with big.open("wb") as fh:
+                fh.truncate(_md.MAX_VIDEO_BYTES + 1)
+
+            api = _MondayApi()
+            bot = _MondayBotStub(api)
+            await bot.send_video("G1", small)
+
+            check("★ 上传走 file_type=2（视频 mp4）",
+                  api.uploads and api.uploads[0]["file_type"] == 2, str(api.uploads))
+            check("★ 上传带的是 file_data（字节），不是 url",
+                  "file_data" in api.uploads[0] and "url" not in api.uploads[0],
+                  str(list(api.uploads[0])))
+            check("★ srv_send_msg=False（只上传，不单独发一条）",
+                  api.uploads[0]["srv_send_msg"] is False, str(api.uploads[0]))
+            check("★ 正文走 msg_type=7（富媒体）",
+                  api.sent and api.sent[0]["msg_type"] == 7, str(api.sent))
+            check("★ media 里带上传拿到的 file_info",
+                  api.sent[0]["media"] == {"file_info": "FI-123"}, str(api.sent))
+            check("★ 视频那条**正文是空的** —— content 客户端不渲染，塞了只会误导",
+                  api.sent[0]["content"] == "", str(api.sent))
+            check("★ `send_video` 的签名里根本没有 content 形参（从根上不给塞）",
+                  "content" not in _RssBot.send_video.__code__.co_varnames,
+                  str(_RssBot.send_video.__code__.co_varnames))
+
+            # 硬闸：超过 10 MiB 连上传都不该发生
+            api2 = _MondayApi()
+            bot2 = _MondayBotStub(api2)
+            try:
+                await bot2.send_video("G1", big)
+                check("★ 超 10 MiB 应当抛", False)
+            except RuntimeError as exc:
+                check("★ 超 10 MiB 抛 RuntimeError", "10 MiB" in str(exc), str(exc))
+            check("★ 超限时**一个请求都没发出去**",
+                  api2.uploads == [] and api2.sent == [], str(api2.uploads))
+
+            # 业务错误码要当失败（botpy 只在 HTTP 非 2xx 时抛）
+            api3 = _MondayApi()
+            api3.fail_send = 40093011
+            try:
+                await _MondayBotStub(api3).send_video("G1", small)
+                check("★ 业务错误码应当抛", False)
+            except RuntimeError as exc:
+                check("★ 200 带 code 也算失败（40093011）",
+                      "40093011" in str(exc), str(exc))
+
+            # ---- send_local_image：文案 + 表情包挤进**一条**消息 ----
+            img = tmp / "月曜が近いよ.jpg"
+            img.write_bytes(b"\xff\xd8\xff" + b"j" * 4096)
+            api4 = _MondayApi()
+            await _MondayBotStub(api4).send_local_image("G1", "月曜が近いよ", img)
+            check("★ 图片上传走 file_type=1（图片，不是 2 视频）",
+                  api4.uploads and api4.uploads[0]["file_type"] == 1, str(api4.uploads))
+            check("★ 图片上传带 file_data、不带 url",
+                  "file_data" in api4.uploads[0] and "url" not in api4.uploads[0],
+                  str(list(api4.uploads[0])))
+            check("★ 图片也是 srv_send_msg=False（先传后发，两步）",
+                  api4.uploads[0]["srv_send_msg"] is False, str(api4.uploads[0]))
+            check("★ 图文走 msg_type=7",
+                  api4.sent and api4.sent[0]["msg_type"] == 7, str(api4.sent))
+            check("★ **文案和表情包在同一条消息里**（图片这条路 content 是渲染的）",
+                  api4.sent[0]["content"] == "月曜が近いよ", str(api4.sent))
+            check("★ 图文只发了**一条**消息（不是拆两条）",
+                  len(api4.sent) == 1, str(api4.sent))
+
+            # 图片 base64 后超 5M 要抛，不能静默少一张图
+            huge_img = tmp / "huge.jpg"
+            with huge_img.open("wb") as fh:
+                fh.truncate(_pv.MAX_FILE_DATA_BYTES)   # base64 后必然超
+            api5 = _MondayApi()
+            try:
+                await _MondayBotStub(api5).send_local_image("G1", "x", huge_img)
+                check("★ 图片超 5M 应当抛", False)
+            except RuntimeError as exc:
+                check("★ 图片 base64 后超 5M 抛 RuntimeError（不静默少一张图）",
+                      "上限" in str(exc), str(exc))
+            check("★ 图片超限时一个请求都没发",
+                  api5.uploads == [] and api5.sent == [], str(api5.uploads))
+
+            # 上传拿不到 file_info 也要抛
+            api6 = _MondayApi()
+            api6.no_file_info = True
+            try:
+                await _MondayBotStub(api6).send_local_image("G1", "x", img)
+                check("★ 没拿到 file_info 应当抛", False)
+            except RuntimeError as exc:
+                check("★ 上传没 file_info → 抛（不当成发送成功）",
+                      "file_info" in str(exc), str(exc))
+
+    asyncio.run(run())
+
+
+_check_md_list()
+_check_md_sticker()
+_check_md_pick()
+_check_md_slot()
+_check_md_text()
+_check_md_poller()
+_check_md_send_video()
+
+print("[4.9] 小偶像早安语音（全离线）")
+
+_MN_ROOT = Path(__file__).resolve().parents[1]
+
+
+class _MorningDb:
+    """只实现 `MorningPoller` 用到的那四个方法的假库。
+
+    `rows` 按 (slot, 群, 偶像, 文件) 追加 —— `morning_recent_idols` 直接吐
+    出现过的偶像，测试里够用了（真实实现按 slot 前缀筛，见 db.py 的注释）。
+    """
+
+    def __init__(self) -> None:
+        self.posted: dict[str, set[str]] = {}
+        self.rows: list[tuple[str, str, str, str]] = []
+
+    def morning_posted(self, slot: str) -> set[str]:
+        return set(self.posted.get(slot, ()))
+
+    def mark_morning_posted(self, slot: str, group: str, idol: str, line: str) -> None:
+        self.posted.setdefault(slot, set()).add(group)
+        self.rows.append((slot, group, idol, line))
+
+    def morning_last_line(self) -> str | None:
+        return self.rows[-1][3] if self.rows else None
+
+    def morning_recent_idols(self, days: int) -> set[str]:
+        return {row[2] for row in self.rows}
+
+
+class _MorningSender:
+    """假 sender。`fail` 里的群发语音抛异常（验逐群隔离）。"""
+
+    def __init__(self, fail: set[str] | None = None) -> None:
+        self.voices: list[tuple[str, str]] = []
+        self.attempts: list[tuple[str, str]] = []   # 含失败的
+        self.fail = fail or set()
+
+    async def send_voice(self, group: str, path) -> None:
+        self.attempts.append((group, str(path)))
+        if group in self.fail:
+            raise RuntimeError("模拟发送失败")
+        self.voices.append((group, str(path)))
+
+
+def _mn_dir(
+    tmp: Path, *, idols: tuple[str, ...] = ("mano",), per: int = 2,
+    bad_magic: bool = False, appledouble: bool = False,
+) -> Path:
+    """造一个 `morning/` 目录（只填 `audio/`）。返回值给 `morning_dir` 用。"""
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+
+    d = tmp / "morning" / "audio"
+    d.mkdir(parents=True, exist_ok=True)
+    for iid in idols:
+        for n in range(per):
+            (d / f"{iid}_{n}.silk").write_bytes(_mn.SILK_MAGIC + b"x" * 128)
+    (d / "notes.txt").write_bytes(b"not a voice")
+    (d / "empty_0.silk").write_bytes(b"")
+    (d / "nodigit_x.silk").write_bytes(_mn.SILK_MAGIC + b"x" * 16)
+    if bad_magic:
+        # ⚠️ 名字完全合法，只是文件头不对 —— 上传接口**看不出来**，只有这里能挡
+        (d / "broken_0.silk").write_bytes(b"ID3\x03\x00" + b"x" * 128)
+    if appledouble:
+        # macOS 的 tar / Finder 带出来的，**同样以 .silk 结尾**
+        (d / "._mano_0.silk").write_bytes(b"\x00\x05\x16\x07")
+    return tmp / "morning"
+
+
+def _check_mn_parts() -> None:
+    from datetime import datetime  # noqa: PLC0415
+
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+
+    check("★ 默认播报时间是 07:30（用户定的）",
+          _mn.DEFAULT_TIME == "07:30", _mn.DEFAULT_TIME)
+    check("cfg_stub 的 morning_time 就是那个默认值",
+          cfg_stub().morning_time == _mn.DEFAULT_TIME, cfg_stub().morning_time)
+
+    at = _mn.parse_time("07:30")
+    check("07:29 → 昨天 07:30",
+          _mn.slot_for(datetime(2026, 10, 20, 7, 29), at) == datetime(2026, 10, 19, 7, 30),
+          str(_mn.slot_for(datetime(2026, 10, 20, 7, 29), at)))
+    check("★ 正好 07:30 → **今天** 07:30（含边界，否则整点那一拍会算成昨天）",
+          _mn.slot_for(datetime(2026, 10, 20, 7, 30), at) == datetime(2026, 10, 20, 7, 30),
+          str(_mn.slot_for(datetime(2026, 10, 20, 7, 30), at)))
+    check("07:31 → 今天 07:30",
+          _mn.slot_for(datetime(2026, 10, 20, 7, 31), at) == datetime(2026, 10, 20, 7, 30),
+          str(_mn.slot_for(datetime(2026, 10, 20, 7, 31), at)))
+    # 周一是 2026-10-19，周三是 10-21 —— 两天都要落在**当天**，不能像月曜那样差 7 天
+    check("★ 是**每天**一次，不是每周（周一和周三各自落在当天）",
+          _mn.slot_for(datetime(2026, 10, 19, 7, 30), at) == datetime(2026, 10, 19, 7, 30)
+          and _mn.slot_for(datetime(2026, 10, 21, 7, 30), at) == datetime(2026, 10, 21, 7, 30))
+
+    # ---- 选人 ----
+    voices = {f"idol{i}": [Path(f"idol{i}_0.silk")] for i in range(28)}
+    recent = {f"idol{i}" for i in range(27)}
+    check("★ 避开最近发过的",
+          all(_mn.pick_idol(voices, recent) == "idol27" for _ in range(20)),
+          str(_mn.pick_idol(voices, recent)))
+    check("★ 全都在 recent 里时**照挑一位**（不死循环、不空转）",
+          _mn.pick_idol(voices, set(voices)) in voices)
+    check("只有一位偶像时照发",
+          _mn.pick_idol({"a": [Path("a_0.silk")]}, {"a"}) == "a")
+
+    # ---- 选台词 ----
+    two = [Path("a_0.silk"), Path("a_1.silk")]
+    check("★ 避开上一条（只有两条时要 100% 换）",
+          all(_mn.pick_line(two, "a_0.silk") == two[1] for _ in range(20)))
+    check("只有一条台词时照发",
+          _mn.pick_line([two[0]], "a_0.silk") == two[0])
+
+
+def _check_mn_list_voices() -> None:
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        mdir = _mn_dir(tmp, idols=("mano", "hiori"), per=2,
+                       bad_magic=True, appledouble=True)
+        got = _mn.list_voices(mdir / "audio")
+        names = [p.name for ps in got.values() for p in ps]
+        check("按 `<偶像id>_<序号>.silk` 归组",
+              set(got) == {"mano", "hiori"}, str(sorted(got)))
+        check("每位两条",
+              all(len(ps) == 2 for ps in got.values()), str({k: len(v) for k, v in got.items()}))
+        check("★ **魔数不对的 .silk 被跳过** —— 上传接口不校验格式，这是唯一的把关",
+              "broken_0.silk" not in names, str(names))
+        check("★ `._` 开头的（AppleDouble）不当成语音",
+              all(not n.startswith("._") for n in names), str(names))
+        check("0 字节的跳过", "empty_0.silk" not in names, str(names))
+        check("名字不合 `<id>_<序号>` 的跳过", "nodigit_x.silk" not in names, str(names))
+        check("非 .silk 后缀的跳过", "notes.txt" not in names, str(names))
+
+        check("目录不存在 → 空表，不抛", _mn.list_voices(tmp / "nope") == {})
+
+
+def _check_mn_poller() -> None:
+    import dataclasses  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            mdir = _mn_dir(tmp, idols=("mano", "hiori"), per=3)
+            cfg = dataclasses.replace(
+                cfg_stub(), morning_groups=("G1", "G2"),
+                morning_dir=mdir, morning_time="07:30", morning_recent_days=7,
+            )
+            slot_key = "2026-10-20T07:30"
+
+            db, sender = _MorningDb(), _MorningSender()
+            p = _mn.MorningPoller(cfg, db, sender)
+            n = await p.poll_once(now=datetime(2026, 10, 20, 7, 30))
+            check("07:30 准点发给两个群", n == 2, str(n))
+            check("★ 两个群拿到**同一条**语音（选人在循环外，多群不会精神分裂）",
+                  len({v[1] for v in sender.voices}) == 1, str(sender.voices))
+            check("落库：这个 slot 记了两个群",
+                  db.morning_posted(slot_key) == {"G1", "G2"}, str(db.posted))
+            check("落了偶像和文件名",
+                  all(len(r) == 4 and r[2] and r[3].endswith(".silk") for r in db.rows),
+                  str(db.rows))
+
+            n2 = await p.poll_once(now=datetime(2026, 10, 20, 7, 31))
+            check("★ 同一 slot 再跑不会重发（幂等靠库，不靠内存）", n2 == 0, str(n2))
+
+            # 窗口外 —— 不补发
+            db2, s2 = _MorningDb(), _MorningSender()
+            p2 = _mn.MorningPoller(cfg, db2, s2)
+            n3 = await p2.poll_once(now=datetime(2026, 10, 20, 8, 0))
+            check("★ 窗口外（08:00）**不发** —— 不补发", n3 == 0 and not s2.voices, str(n3))
+
+            # 一个群挂了不连累别的
+            cfg3 = dataclasses.replace(cfg, morning_groups=("G1", "G2", "G3"))
+            db3, s3 = _MorningDb(), _MorningSender(fail={"G2"})
+            p3 = _mn.MorningPoller(cfg3, db3, s3)
+            n4 = await p3.poll_once(now=datetime(2026, 10, 20, 7, 30))
+            check("★ 一个群发不出去，其余群照发",
+                  n4 == 2 and {v[0] for v in s3.voices} == {"G1", "G3"},
+                  f"{n4} {s3.voices}")
+            check("失败的群**不记账**（窗口内下一拍还会重试）",
+                  "G2" not in db3.morning_posted(slot_key), str(db3.posted))
+
+            # 目录空 / 不存在
+            for label, mdir2 in (("目录不存在", tmp / "nope"),
+                                 ("audio 空", (lambda d: (d.mkdir(parents=True), d)[1])(tmp / "e" / "audio"))):
+                cfg4 = dataclasses.replace(cfg, morning_groups=("G1",), morning_dir=mdir2)
+                s4 = _MorningSender()
+                n5 = await _mn.MorningPoller(cfg4, _MorningDb(), s4).poll_once(
+                    now=datetime(2026, 10, 20, 7, 30)
+                )
+                check(f"{label} → 返回 0、不抛、不发", n5 == 0 and not s4.voices, str(n5))
+
+            # 只有一位偶像、只有一条台词
+            cfg5 = dataclasses.replace(
+                cfg, morning_groups=("G1",), morning_dir=_mn_dir(tmp / "solo", idols=("mano",), per=1),
+            )
+            db5, s5 = _MorningDb(), _MorningSender()
+            n6 = await _mn.MorningPoller(cfg5, db5, s5).poll_once(
+                now=datetime(2026, 10, 20, 7, 30)
+            )
+            check("只有一位偶像、一条台词时照发", n6 == 1, str(n6))
+
+            # 未配置群 = 功能关闭
+            cfg6 = dataclasses.replace(cfg, morning_groups=())
+            s6 = _MorningSender()
+            n7 = await _mn.MorningPoller(cfg6, _MorningDb(), s6).poll_once(
+                now=datetime(2026, 10, 20, 7, 30)
+            )
+            check("MORNING_GROUPS 空 → 整个功能关闭（返回 0）", n7 == 0 and not s6.voices, str(n7))
+
+    asyncio.run(run())
+
+
+def _check_mn_send_voice() -> None:
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+    from qq_rss_bot.bot import RssBot as _RB  # noqa: PLC0415
+
+    class Stub:
+        send_voice = _RB.send_voice
+
+        def __init__(self, api) -> None:
+            self.api = api
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            good = tmp / "mano_0.silk"
+            good.write_bytes(_mn.SILK_MAGIC + b"x" * 512)
+
+            api = _MondayApi()
+            await Stub(api).send_voice("G1", good)
+            check("★ 上传走 file_type=3（语音 silk）",
+                  api.uploads and api.uploads[0]["file_type"] == 3, str(api.uploads))
+            check("上传带的是 file_data（字节），不是 url",
+                  "file_data" in api.uploads[0] and "url" not in api.uploads[0],
+                  str(list(api.uploads[0])))
+            check("srv_send_msg=False（先传后发，两步）",
+                  api.uploads[0]["srv_send_msg"] is False, str(api.uploads[0]))
+            check("★ 正文走 msg_type=7（富媒体）",
+                  api.sent and api.sent[0]["msg_type"] == 7, str(api.sent))
+            check("media 里带上传拿到的 file_info",
+                  api.sent[0]["media"] == {"file_info": "FI-123"}, str(api.sent))
+            check("★ **content 是空的** —— 只发语音气泡，用户明确不要字幕",
+                  api.sent[0]["content"] == "", str(api.sent))
+            check("`send_voice` 的签名里根本没有 content 形参（从根上不给塞）",
+                  "content" not in _RB.send_voice.__code__.co_varnames,
+                  str(_RB.send_voice.__code__.co_varnames))
+
+            # 200 带业务错误码也算失败
+            api_bad = _MondayApi()
+            api_bad.fail_send = 40093011
+            try:
+                await Stub(api_bad).send_voice("G1", good)
+                raised = False
+            except RuntimeError:
+                raised = True
+            check("200 带 code 也算失败（不静默当成发送成功）", raised)
+
+            # 非 silk —— **一个请求都不能发出去**
+            fake = tmp / "bad.silk"
+            fake.write_bytes(b"ID3\x03\x00" + b"x" * 512)
+            api2 = _MondayApi()
+            try:
+                await Stub(api2).send_voice("G1", fake)
+                raised2 = False
+            except RuntimeError:
+                raised2 = True
+            check("★ 非 silk → 抛 RuntimeError（上传接口不校验，只能自己挡）", raised2)
+            check("★ 非 silk 时**一个请求都没发出去**",
+                  not api2.uploads and not api2.sent, f"{api2.uploads} {api2.sent}")
+
+    asyncio.run(run())
+
+
+def _check_mn_lines_table() -> None:
+    """台词表本身的校验 —— 有 `data/morning/lines.toml` 才跑（`data/` 不进 git）。"""
+    import sys as _sys  # noqa: PLC0415
+
+    _sys.path.insert(0, str(_MN_ROOT / "scripts"))
+    import make_morning as _mm  # noqa: PLC0415
+
+    bad = [{
+        "id": "x", "voice_id": "a" * 32,
+        "lines": [
+            {"ja": "[softly] おはようございます", "zh": ""},            # 缺 zh
+            {"ja": "おはようございます", "zh": "早上好"},                # 没有提示
+            {"ja": "[quietly] おはようございます", "zh": "x"},           # 词表外
+            {"ja": "[softly] おはようございます[gently]", "zh": "x"},    # 提示在句尾
+            {"ja": "[softly] おはよう ABC", "zh": "x"},                  # 拉丁字母
+            {"ja": "[softly] おはよう♡", "zh": "x"},                     # 符号
+            {"ja": "[softly] あ", "zh": "x"},                            # 太短
+        ],
+    }]
+    problems = _mm.validate_lines(bad)
+    joined = "\n".join(problems)
+    check("缺 zh 被点名", "缺 zh" in joined, joined[:200])
+    check("★ 没有语气提示的台词被点名（否则整句只会平着念）",
+          "没有语气提示" in joined, joined[:200])
+    check("词表外的提示被点名", "不在词表里" in joined, joined[:200])
+    check("★ 提示写在**句尾**被点名（上游：句尾的提示永远不会被念出来）",
+          "[softly] おはようございます[gently]" in joined and "方括号不是恰好一对" in joined,
+          joined[:300])
+    check("正文里的拉丁字母被点名", "拉丁字母" in joined, joined[:200])
+    check("正文里的符号/颜文字被点名", "表情/颜文字" in joined, joined[:200])
+    check("太短的正文被点名", "超出" in joined, joined[:200])
+
+    table = _MN_ROOT / "data" / "morning" / "lines.toml"
+    if not table.is_file():
+        print("  SKIP  没有 data/morning/lines.toml（data/ 不进 git）")
+        return
+    try:
+        idols = _mm.load_lines(table)
+        total = sum(len(i["lines"]) for i in idols)
+        check(f"★ 真实台词表 {len(idols)} 位 / {total} 条全部通过校验",
+              len(idols) == 28 and total >= 28, f"{len(idols)} 位 {total} 条")
+        check("每位都有 voice_id（32 位十六进制）",
+              all(len(i["voice_id"]) == 32 and all(c in "0123456789abcdef" for c in i["voice_id"])
+                  for i in idols))
+    except _mm.Fatal as exc:
+        check("真实台词表通过校验", False, str(exc)[:400])
+
+
+_check_mn_parts()
+_check_mn_list_voices()
+_check_mn_poller()
+_check_mn_send_voice()
+_check_mn_lines_table()
+
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
 print(f"  rsshub = {cfg.rsshub_base}")

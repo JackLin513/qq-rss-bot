@@ -952,6 +952,210 @@ TICKET_IMAGE_W=320                            # 封面渲染宽度（QQ 不会�
   想造冷链接，结果**带参数的一张都不渲染、不带的全好**。
 - 觉得不显示就把 `TICKET_IMAGES=false` 关掉，其余功能不受影响。
 
+## 月曜が近いよ（每周定时播报）
+
+每周**周日 23:30（北京时间）**在指定的群里发**两条消息**：
+
+```
+月曜が近いよ            ← 第一条：文案 + 表情包（一条消息）
+[表情包图片]
+
+[视频]                  ← 第二条：视频（没有文案）
+```
+
+原型是 X 上的 `@ChocodateMonday`（シャニマス 的戏仿号，8.4 万关注）。
+**那个号 2026-09-27 已经停止活动**，所以这里不是「监控转发」，而是让机器人
+自己每周播一次。
+
+配置：
+
+```bash
+MONDAY_ENABLED=true
+MONDAY_GROUPS=<group_openid>      # 留空 = 功能关闭
+MONDAY_VIDEO_DIR=                 # 留空 = DB 旁边的 monday/ 目录
+MONDAY_WEEKDAY=6                  # 0=周一 … 6=周日
+MONDAY_TIME=23:30                 # 本地时间（周日 23:30）
+```
+
+素材放 `data/monday/`（容器 `/app/data/monday/`）：
+
+- **`.mp4` 是视频** —— 放几个进去就行，每周随机挑一个，而且会**避开上周那个**；
+- **图片（`.png` / `.jpg` / `.jpeg` / `.gif` / `.webp`）是表情包** ——
+  跟文案同一条消息发出去，按后缀认、不看文件名。放多张只发排第一的那张，
+  并在日志里点名。**没有图片也能跑**，那时文案退化成纯文字。
+
+### ⚠️ 为什么是两条消息，不是一条
+
+`msg_type=7`（富媒体）的 `content` 字段**带图片时渲染、带视频时客户端整个丢掉**。
+视频那条实测：接口回 HTTP 200、`file_info` 也拿到了，群里就是只有视频、一个字
+都没有；`MediaInfo` 里也只有一个 `file_info`，没有 caption/title 可挂。
+
+所以文案跟**图**走（`msg_type=7` + `file_type=1`），视频单独发（`content=""`）。
+**一次播报吃两条主动消息配额。**
+
+机器人也**发不了真·表情包** —— QQ 的表情包是客户端的东西，bot API 里没有对应的
+`msg_type`，发出去的是普通图片。
+
+### ⚠️ 单个视频不能超过 10 MiB，而且限的是体积不是时长
+
+这条路是实测出来的（`file_type=2` + base64 上传）：
+
+| 原始体积 | 结果 |
+|---|---|
+| 5.8 KB ~ 9.86 MiB | ✅ |
+| **10.11 MiB** | ❌ `400 40093011` |
+| 12.96 / 14.35 MiB | ❌ `400 40093011` |
+| 19.5 / 26.0 MiB | ❌ `413` |
+
+**和时长无关** —— 20 秒 / 5.57 MiB 能发，2.8 秒 / 14.35 MiB 不能。要压得压码率：
+
+```bash
+ffmpeg -i in.mp4 -c:v libx264 -crf 26 -preset slow -c:a aac out.mp4
+```
+
+超限的文件会被跳过，并在日志里**点名说是哪个、多大**。
+（顺带一提：官方文档那句「`file_data` 要在 5M 以内」在**视频**这条路上不成立，
+5.85 / 13.8 MiB 的 base64 都传上去了 —— 那个 5M 只管图片。）
+
+### 其他行为
+
+- **不补发**：NAS 重启错过了周日晚，就跳过这一周，不会周二又冒出来一条。
+  `MONDAY_WINDOW_SEC`（默认 180 秒）只覆盖调度抖动。
+- 一周一条，**所有群发同一个视频**。
+- 目录空 / 素材全超限 → 跳过这一周并打 WARNING，**不会退回发条纯文字**。
+- 一个群发失败不影响别的群。
+
+想看会发什么（**默认一条都不发**）：
+
+```bash
+uv run python scripts/probe_monday.py                     # 离线：文件、slot、窗口
+uv run python scripts/probe_monday.py --group <openid> --send   # 才真发
+```
+
+## 小偶像的每日早安语音
+
+每天早上 **07:30**（北京时间）随机挑一位《偶像大师 闪耀色彩》的偶像，
+用她的声线说一句**带她口癖**的日语早上好。**只发语音气泡，没有字幕。**
+
+```
+🔊  （一条 2~4 秒的语音，点开就播）
+```
+
+差别靠**自称 / 对制作人的称呼 / 句尾口癖 / 语气**拉开 ——
+真乃的「ほわっ」、摩美美的拖长音、恋鐘的佐世保方言「〜ばい」、
+咲耶的「フフ」、透的「あー……おはよ」。同一位偶像有 7 条轮换。
+
+### 语音是**离线预生成**的，运行时零 TTS
+
+```bash
+# ① 抓资料（GitHub 直连；抓来的东西**不进 git**，见下面的版权说明）
+uv run python scripts/fetch_morning_source.py
+
+# ② 台词在 data/morning/lines.toml，人工审过
+# ③ 合成（需要 Fish Audio 的 key + pysilk + 代理，都只在 Mac 上用）
+export FISH_AUDIO_API_KEY=...           # fish.audio → 个人设置 → API key
+uv venv /tmp/silkvenv && uv pip install --python /tmp/silkvenv/bin/python silk-python
+uv run python scripts/make_morning.py --only mano     # 先做一位试听
+uv run python scripts/make_morning.py                 # 全量（缺什么补什么）
+
+# ④ 同步到 NAS（**只要 audio/**，别把 source/ 和 lines.toml 传上去）
+rsync -av data/morning/audio/ nas:/volume1/docker/qq-rss-bot/data/morning/audio/
+```
+
+**为什么不在容器里合成**：那样就得把 `pysilk` 装进镜像、把 Fish Audio 的 key
+塞进 `.env`，而且每天 07:30 那一刻多一跳外网 —— Fish Audio 一抖当天就没问候。
+离线做完，那一刻只剩「读文件 → base64 → 上传」。
+
+⚠️ **`api.fish.audio` 直连不通**（实测 HTTP 000），`make_morning.py` 默认走
+Surge 代理 `http://192.168.0.63:6152`（`--proxy` 可改，传空串强制直连）。
+抓资料那一步相反，**GitHub 直连是通的**，别互相抄。
+
+### 配置
+
+```bash
+MORNING_ENABLED=true
+MORNING_GROUPS=<group_openid>     # 留空 = 功能关闭。**先只填测试群**
+MORNING_DIR=                      # 留空 = DB 旁边的 morning/ 目录
+MORNING_TIME=07:30                # 本地时间
+MORNING_WINDOW_SEC=180            # 只覆盖调度抖动，**不是补发窗口**
+MORNING_RECENT_DAYS=7             # 多久之内不重复同一位
+```
+
+### 素材目录
+
+```
+data/morning/
+  audio/             ← **运行时只用这个目录**，同步到 NAS 的也只有它
+    mano_0.silk      ← 櫻木真乃的第 0 条
+    mano_1.silk
+    hiori_0.silk
+  lines.toml         ← 台词表（人工审过，不进 git）
+  source/            ← 抓来的第三方资料（不进 git）
+  .manifest.json     ← 合成用的幂等记录（不进 git）
+```
+
+文件名必须是 **`<偶像 id>_<序号>.silk`**，序号是数字。不合规的、0 字节的、
+`._` 开头的（macOS 带出来的）、**以及文件头不是 `\x02#!SILK_V3` 的**，
+都会被跳过并在日志里点名。
+
+### ⚠️ 合成时会多垫 200ms 静音再砍掉 —— 为了消掉开头那声「啪」
+
+`pysilk` 编码器的**第 0 帧是坏的**（冷启动）：拿 1 秒纯数字静音编一遍再解回来，
+开头照样炸出 ±28871，位置固定在解码输出的第 131 个样本。Fish Audio 给的原始
+WAV 是干净的，所以这不是 TTS 的问题。
+
+`make_morning.py` 的做法是**编之前垫 200ms 静音、编之后丢掉前 8 帧** ——
+让冷启动那几帧落在静音上再整帧扔掉，留 2 帧（40ms）静音当前导。解码后前 400
+个样本的峰值从 **20778 降到 3**。完整实测表和推导在 `make_morning.py` 里
+`SILK_WARMUP_MS` 上面那段注释。
+
+⚠️ **改这些参数（`SILK_WARMUP_MS` / `SILK_WARMUP_DROP`）要把 `SILK_ENCODER_VERSION`
+一起 +1**，否则台词一个字没变、manifest 认不出「音频该重做了」而跳过，
+**必须再跑一次 `--force`**。
+
+### ⚠️ 「上传成功」在这条路上一点信息量都没有
+
+QQ 的**语音**上传接口**完全不校验格式**（2026-10-19 实测）：mp3 / wav / m4a、
+甚至 `\x02#!SILK_V3` 后面接两千个零字节的**纯垃圾**，全都 HTTP 200 拿到
+`file_info`。视频那条至少还有 10 MiB 的硬边界，语音这条**连格式都不挡**。
+
+所以唯一的把关是客户端侧的 **silk 魔数闸**：扫目录时跳过一道、
+发送前再挡一道。素材里混进非 silk 文件的话，日志里会有
+`早安：… 跳过了 N 个文件：xxx.silk（不是 silk（头 b'...'））`。
+
+### 其他行为
+
+- **不补发**：错过了 07:30 就跳过今天，不会九点又冒出来一条。
+  `MORNING_WINDOW_SEC`（默认 180 秒）只覆盖调度抖动。
+- 一天一条，**所有群发同一位偶像、同一句台词**。
+- 一个群发失败不影响别的群，而且**失败的群不记账**，窗口内还会重试。
+- 素材目录空 / 全是坏文件 → 跳过并打 WARNING（每个 slot 只警告一次）。
+- **一条语音算一条主动消息配额** —— 一天一条，相对 900/天 可以忽略。
+- 隔几天会听到同一条（每位只有 7 条）；28 位轮一圈约一个月，同一条要七个月
+  才重复。v1 只做「一句早上好」，没有素材拉开差别，这是刻意的。
+
+想看会发什么（**默认一条都不发**）：
+
+```bash
+uv run python scripts/probe_morning.py                     # 离线：文件、slot、窗口、会挑谁
+uv run python scripts/probe_morning.py --now 2026-10-20T07:30
+uv run python scripts/probe_morning.py --group <openid> --send   # 才真发（只发测试群）
+
+# 上线前把 196 条**全听一遍**（默认只列清单，加 --send 才发）
+uv run python scripts/probe_morning_all.py
+uv run python scripts/probe_morning_all.py --group <openid> --send
+```
+
+### 版权
+
+台词是**我们自己写的文案**，不复制任何原作台词。角色音色是社区上传到
+[Fish Audio](https://fish.audio) 的**公开模型**，人设 / 档案资料来自
+[Sallyn0225/eidolon-sc](https://github.com/Sallyn0225/eidolon-sc)（**AGPL-3.0**），
+角色版权属于原作方。**个人粉丝群自用的姿态和那个仓库一致。**
+
+**`data/morning/` 整个不进 git**（`data/` 已在 `.gitignore` 里）——
+这既是版权要求，也顺带保证抓来的第三方资料不会进这个公开仓库。
+
 ## 推送配图
 
 条目正文里的图会被抠出来当配图（`rss.all_images()`，**最多 6 张**），支持 RSS 的
@@ -1100,6 +1304,8 @@ src/qq_rss_bot/
   bilibili.py    群里分享的 bilibili 链接 → 卡片（含四种分享形态的说明）
   preview.py     群里分享的 YouTube / X 链接 → 卡片（含为什么图要 base64 上传）
   tickets.py     ASOBI TICKET 抽票提醒（含 slug=品牌 的判据和三个反例）
+  monday.py      月曜が近いよ 每周播报（含视频 10 MiB 上限的实测表）
+  morning.py     小偶像每日早安语音（含「语音上传不校验格式」的实测结论）
   bot.py         botpy 客户端，事件 → 指令/轮询
 scripts/
   smoke.py            离线逻辑 + 真实抓取
@@ -1108,4 +1314,9 @@ scripts/
   probe_meta.py       探 YouTube / X 的接口在容器里通不通（不碰 QQ）
   probe_media.py      探 QQ 的服务器拉不拉得到某个图片 URL
   probe_ticket.py     看抽票接口拉到什么、滤掉什么、会推什么（默认不发消息）
+  probe_monday.py     看月曜播报会挑哪个视频、slot 对不对（默认不发消息）
+  fetch_morning_source.py  抓小偶像的人设/档案/读音表（GitHub 直连，不进 git）
+  make_morning.py          离线合成早安语音（Fish Audio + pysilk + 代理，只在 Mac 跑）
+  probe_morning.py         看早安会挑谁和哪一条、哪些文件被跳过（默认不发消息）
+  probe_morning_all.py     把 audio/ 里 196 条**全部**发一遍试听（默认只列清单）
 ```

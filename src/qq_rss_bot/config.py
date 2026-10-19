@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 # 默认值只在 ai.py 里写一份，免得两边漂
 from . import ai as ai_module
+# 同上：「月曜が近いよ」的时段 / 上限只在 monday.py 里写一份
+from . import monday as monday_module
+from . import morning as morning_module
 # 同上：抽票的品牌白名单和接口地址只在 tickets.py 里写一份
 from . import tickets as tickets_module
 
@@ -184,6 +187,44 @@ class Config:
     # 占满的填进来。
     ticket_image_w: int = tickets_module.DEFAULT_IMAGE_W
 
+    # ===== 月曜が近いよ（每周定时的视频播报，见 monday.py 的模块说明）=====
+    #
+    # 原型是 X 上的 @ChocodateMonday，**那个号 2026-09-27 已停止活动**，所以
+    # 这里是让机器人自己每周播一次：周日 22:00（北京时间）发一条
+    # 「月曜が近いよ」+ 一个本地视频，素材从 MONDAY_VIDEO_DIR 里随机挑。
+    monday_enabled: bool = True
+    # 推到哪些群。**空 = 整个功能关闭。** 先只填测试群。
+    monday_groups: tuple[str, ...] = ()
+    # 素材目录。**留空就跟着 DB_PATH 走**（本地 `data/monday`、容器
+    # `/app/data/monday`），所以正常情况下不用配。
+    monday_video_dir: Path = Path("data/monday")
+    # 星期几。**口径同 `datetime.weekday()`：0=周一 … 6=周日。**
+    monday_weekday: int = monday_module.DEFAULT_WEEKDAY
+    # 几点发，`HH:MM`，**本地时间**（不是 JST —— 见 monday.py 里的说明）。
+    monday_time: str = monday_module.DEFAULT_TIME
+    # 容忍多久的调度抖动。**这不是补发窗口** —— 用户明确选了「不补发」，
+    # 所以它只该覆盖 tick 间隔（60 秒），别调成几小时。
+    monday_window_sec: int = monday_module.DEFAULT_WINDOW_SEC
+
+    # ===== 小偶像的每日早安语音（见 morning.py 的模块说明）=====
+    #
+    # 每天早上 07:30（北京时间）随机挑一位偶像，用她的声线说一句日语早上好。
+    # 语音**离线预生成**（`scripts/make_morning.py`），运行时只扫
+    # `data/morning/audio/` 上传，**零 LLM、零 TTS、零新依赖**。
+    morning_enabled: bool = True
+    # 推到哪些群。**空 = 整个功能关闭。** 先只填测试群 —— 这是**每天**在响，
+    # 比月曜那种一周一次更需要先稳。
+    morning_groups: tuple[str, ...] = ()
+    # 素材目录。**留空就跟着 DB_PATH 走**（本地 `data/morning`、容器
+    # `/app/data/morning`），正常情况下不用配。运行时只用里面的 `audio/`。
+    morning_dir: Path = Path("data/morning")
+    # 几点发，`HH:MM`，**本地时间**。用户定的是 07:30。
+    morning_time: str = morning_module.DEFAULT_TIME
+    # 容忍多久的调度抖动。**不是补发窗口** —— 九点补一条早安比不补更怪。
+    morning_window_sec: int = morning_module.DEFAULT_WINDOW_SEC
+    # 多久之内不重复同一位偶像。28 位轮一圈约一个月，7 天足够。
+    morning_recent_days: int = morning_module.DEFAULT_RECENT_DAYS
+
     # ===== AI 摘要（抓正文 + DeepSeek 翻译/精简）=====
     # 按源开关，默认所有源都是关的（`subscriptions.ai_enabled`）。
     # key 留空 = 整个功能关掉，不报错。
@@ -240,6 +281,44 @@ def load_config() -> Config:
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
 
+    # 月曜的素材目录：留空就跟着 DB_PATH 走。容器里 DB_PATH=/app/data/bot.db，
+    # 所以默认是 /app/data/monday —— 正好在挂载卷里，不用额外配一项。
+    monday_dir_raw = _env_str("MONDAY_VIDEO_DIR", "")
+    monday_video_dir = (
+        Path(monday_dir_raw) if monday_dir_raw else db_path.parent / "monday"
+    )
+    if not monday_video_dir.is_absolute():
+        monday_video_dir = PROJECT_ROOT / monday_video_dir
+    # 星期几的口径校验放这儿：写错 7 或 -1 的话 `slot_for` 会静默算出
+    # 一个永远不匹配的时刻，功能看着「开着」但一周都不响。
+    monday_weekday = _env_int("MONDAY_WEEKDAY", monday_module.DEFAULT_WEEKDAY)
+    if not 0 <= monday_weekday <= 6:
+        raise SystemExit(
+            f"MONDAY_WEEKDAY 必须是 0（周一）~ 6（周日），当前值：{monday_weekday}"
+        )
+    # 时间也在这儿校验。只在轮询器里解析的话，写错要等到周日 22:00 那一拍
+    # 才炸 —— 而那正好是唯一该发消息的时刻。启动就退出，别沉默一周。
+    monday_time = _env_str("MONDAY_TIME", monday_module.DEFAULT_TIME)
+    monday_module.parse_time(monday_time)
+
+    # 早安素材目录：和月曜一字不差的推导 —— 留空就跟着 DB_PATH 走，
+    # 容器里 DB_PATH=/app/data/bot.db，所以默认 /app/data/morning。
+    morning_dir_raw = _env_str("MORNING_DIR", "")
+    morning_dir = (
+        Path(morning_dir_raw) if morning_dir_raw else db_path.parent / "morning"
+    )
+    if not morning_dir.is_absolute():
+        morning_dir = PROJECT_ROOT / morning_dir
+    # 时间同样在启动时校验。只在轮询器里解析的话，写错要等到 07:30 那一拍
+    # 才炸 —— 而那正好是唯一该发消息的时刻。
+    morning_time = _env_str("MORNING_TIME", morning_module.DEFAULT_TIME)
+    morning_module.parse_time(morning_time)
+    morning_recent_days = _env_int(
+        "MORNING_RECENT_DAYS", morning_module.DEFAULT_RECENT_DAYS
+    )
+    if morning_recent_days < 0:
+        raise SystemExit(f"MORNING_RECENT_DAYS 不能是负数：{morning_recent_days}")
+
     return Config(
         appid=appid,
         secret=secret,
@@ -284,6 +363,20 @@ def load_config() -> Config:
         ticket_images=_env_bool("TICKET_IMAGES", True),
         ticket_image_size=_env_str("TICKET_IMAGE_SIZE", tickets_module.DEFAULT_IMAGE_SIZE),
         ticket_image_w=_env_int("TICKET_IMAGE_W", tickets_module.DEFAULT_IMAGE_W),
+        monday_enabled=_env_bool("MONDAY_ENABLED", True),
+        monday_groups=_env_list("MONDAY_GROUPS"),
+        monday_video_dir=monday_video_dir,
+        monday_weekday=monday_weekday,
+        monday_time=monday_time,
+        monday_window_sec=_env_int("MONDAY_WINDOW_SEC", monday_module.DEFAULT_WINDOW_SEC),
+        morning_enabled=_env_bool("MORNING_ENABLED", True),
+        morning_groups=_env_list("MORNING_GROUPS"),
+        morning_dir=morning_dir,
+        morning_time=morning_time,
+        morning_window_sec=_env_int(
+            "MORNING_WINDOW_SEC", morning_module.DEFAULT_WINDOW_SEC
+        ),
+        morning_recent_days=morning_recent_days,
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),
         ai_base_url=_env_str("DEEPSEEK_BASE_URL", ai_module.DEFAULT_BASE_URL),
         ai_model=_env_str("DEEPSEEK_MODEL", ai_module.DEFAULT_MODEL),

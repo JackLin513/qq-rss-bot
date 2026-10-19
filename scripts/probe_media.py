@@ -22,6 +22,29 @@ bilibili 的 `i1.hdslb.com` 实测可以；YouTube / Twitter 的图床在墙内�
     uv run python scripts/probe_media.py --c2c-me --data
     uv run python scripts/probe_media.py --c2c-me --data --proxy http://192.168.0.63:6152
 
+    # 视频（file_type=2）：**只上传、不发消息**，所以也不会往群里发东西
+    uv run python scripts/probe_media.py --group <openid> --video /tmp/x.mp4
+    uv run python scripts/probe_media.py --group <openid> --voice /tmp/x.silk
+    # 加 --send 才会真发一条 msg_type=7（**这条会出现在群里**）
+    uv run python scripts/probe_media.py --group <openid> --video /tmp/x.mp4 --send
+
+**2026-10-18 实测：视频这条路能走通，但有两个独立的坎**（全部是只上传测出来的）：
+
+| 原始体积 | 结果 |
+|---|---|
+| 5.8 KB ~ 9.86 MiB | ✅ 拿到 file_info |
+| **10.11 MiB** | ❌ `400 40093011` |
+| 12.96 / 14.35 MiB | ❌ `400 40093011` |
+| 19.5 / 26.0 MiB | ❌ `413`（另一个坎：HTTP body 太大） |
+
+- **视频文件上限 ≈ 10 MiB**（9.86 过 / 10.11 不过，边界正好卡在 10 MiB）。
+  和时长**无关** —— 20 秒 / 5.57 MiB 过，2.8 秒 / 14.35 MiB 不过。
+- ⚠️ **官方那条「`file_data` 5M」在视频这条路上不成立**：5.85 MiB、13.8 MiB 的
+  base64 都传上去了。图片那条路才受 5M 约束（`preview.MAX_IMAGE_BYTES`）。
+- HTTP body 另有一个更高的坎（19.5 MiB base64 起 413），所以在撞到它之前
+  会先撞 10 MiB 那个。
+- **上传成功 ≠ 群里渲染出来**。要确认得加 `--send`。
+
 **2026-10-17 实测结论**（决定了为什么需要 `--data`）：
 `i.ytimg.com` 交给 QQ 的服务器去拉，返回 `850027 富媒体文件上传超时`
 （err_code 40034003）—— **不是 404 也不是 DNS 失败，是超时**，说明 QQ 的服务器
@@ -76,15 +99,80 @@ CANDIDATES: list[tuple[str, str]] = [
 ]
 
 
-def parse_args(argv: list[str]) -> tuple[str, str, list[str], bool, str]:
-    """返回 (模式, 目标 openid, 额外的 URL, 是否走 base64, 下载用的代理)。"""
+SILK_MAGIC = b"\x02#!SILK_V3"
+
+
+def _as_silk(path: Path) -> bytes:
+    """把音频读成 silk 字节。已经是 silk 就原样返回，否则用 `pysilk` 转。
+
+    ⚠️ **silk 是 Skype 的私有编解码，ffmpeg 默认不带** —— 实测 `ffmpeg
+    -encoders` 里没有 silk、brew 里也没有。能用的是 PyPI 上的 `pysilk`，
+    而且**必须 `tencent=True`**（腾讯自己那套变体，QQ/微信用的就是这个）：
+
+        uv venv /tmp/silkvenv
+        uv pip install --python /tmp/silkvenv/bin/python silk-python
+        /tmp/silkvenv/bin/python -c "from pysilk import encode; \
+            encode(open('in.wav','rb'), open('out.silk','wb'), 24000, 24000, tencent=True)"
+
+    输入要 **24000 Hz 单声道** WAV，那一半用 ffmpeg：
+        ffmpeg -i in.mp3 -ar 24000 -ac 1 -c:a pcm_s16le out.wav
+    """
+    raw = path.read_bytes()
+    if raw[:10] == SILK_MAGIC:
+        return raw
+    try:
+        from pysilk import encode as _encode  # noqa: PLC0415
+    except ImportError:
+        raise SystemExit(
+            f"{path.name} 不是 silk（文件头不是 {SILK_MAGIC!r}），而 pysilk 没装，"
+            "转不了。\n装法见本文件 _as_silk 的说明（**必须 tencent=True**）。"
+        ) from None
+    import io  # noqa: PLC0415
+
+    wav = raw
+    if path.suffix.lower() != ".wav":
+        raise SystemExit(
+            f"{path.name} 不是 silk、也不是 wav —— pysilk 只吃 WAV。\n"
+            f"先转一道：ffmpeg -i {path.name} -ar 24000 -ac 1 -c:a pcm_s16le out.wav"
+        )
+    out = io.BytesIO()
+    _encode(io.BytesIO(wav), out, 24000, 24000, tencent=True)
+    print(f"  （{path.name} 不是 silk，已用 pysilk 现编 → {out.tell()} 字节）")
+    return out.getvalue()
+
+
+def parse_args(
+    argv: list[str],
+) -> tuple[str, str, list[str], bool, str, str, str, bool]:
+    """返回 (模式, 目标 openid, 额外的 URL, 是否走 base64, 代理, 视频, 语音, 是否真发)。
+
+    `--video <本地文件>` / `--voice <本地文件>` 是**另外两条路**：不走 URL、
+    不走图片，而是把本地文件用 base64 传上去，`file_type=2`（视频 mp4）/
+    `file_type=3`（语音 silk）。见下面 `VIDEO` / `VOICE` 两段说明。
+    """
     mode, target, extra = "c2c", "", []
-    use_data, proxy = False, ""
+    use_data, proxy, video, voice, do_send = False, "", "", "", False
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--data":
             use_data = True
+        elif a == "--send":
+            do_send = True
+        elif a == "--video":
+            if i + 1 >= len(argv):
+                raise SystemExit("--video 后面要跟一个本地 mp4 路径")
+            i += 1
+            video = argv[i]
+        elif a.startswith("--video="):
+            video = a.split("=", 1)[1]
+        elif a == "--voice":
+            if i + 1 >= len(argv):
+                raise SystemExit("--voice 后面要跟一个本地音频路径（silk 或 wav/mp3）")
+            i += 1
+            voice = argv[i]
+        elif a.startswith("--voice="):
+            voice = a.split("=", 1)[1]
         elif a == "--proxy":
             if i + 1 >= len(argv):
                 raise SystemExit("--proxy 后面要跟代理地址，如 http://192.168.0.63:6152")
@@ -112,7 +200,7 @@ def parse_args(argv: list[str]) -> tuple[str, str, list[str], bool, str]:
         else:
             extra.append(a)
         i += 1
-    return mode, target, extra, use_data, proxy
+    return mode, target, extra, use_data, proxy, video, voice, do_send
 
 
 def resolve_me(cfg) -> str:
@@ -148,11 +236,34 @@ def resolve_me(cfg) -> str:
 
 
 async def main() -> int:
-    mode, target, extra, use_data, proxy = parse_args(sys.argv[1:])
+    mode, target, extra, use_data, proxy, video, voice, do_send = parse_args(
+        sys.argv[1:]
+    )
     urls = extra or [u for _, u in CANDIDATES]
     labels = {u: n for n, u in CANDIDATES}
     if extra:
         labels.update({u: "命令行给的" for u in extra})
+
+    if do_send and not (video or voice):
+        print("--send 只对 --video / --voice 有意义（图片那条路一直是只上传不发）。")
+        return 2
+
+    if video:
+        # 视频这条路和图片无关，提前把要传的东西打出来（还没碰 QQ）
+        vp = Path(video)
+        if not vp.is_file():
+            print(f"❌ 找不到视频文件：{vp}")
+            return 2
+        raw_v = vp.read_bytes()
+        b64_v = base64.b64encode(raw_v).decode()
+        print(f"视频：{vp}  {len(raw_v):,} 字节 → base64 {len(b64_v):,} 字节")
+        # `file_data` 的 5 MiB 上限限的是 **base64 之后**（见 preview.py 那段），
+        # 所以这里按 base64 长度判，不是原始字节。
+        if len(b64_v) > 5 * 1024 * 1024:
+            print(f"⚠️  base64 超过 5 MiB（{len(b64_v) / 1048576:.2f} MiB）—— "
+                  "`file_data` 官方上限就是 5M，这条路必然被拒。")
+            print("    要么压小，要么走 URL 形态（`file_type=2` + `url`），"
+                  "要么上分片上传（项目没做）。")
 
     if not target:
         print("候选 URL（还没碰 QQ）：\n")
@@ -188,6 +299,142 @@ async def main() -> int:
 
         print("=" * 72)
         ok_count = 0
+
+        if video:
+            # ---- 视频：只上传，不发消息 ----
+            # `file_type=2` 是官方枚举里的「视频 mp4」，但**项目里从没跑过**。
+            # `srv_send_msg=False` 意味着这一步**群里看不到任何东西** ——
+            # 拿到 file_info 就说明 QQ 收了这个视频，报错就是没收。
+            raw_v = Path(video).read_bytes()
+            body = {
+                "file_type": 2,
+                "file_data": base64.b64encode(raw_v).decode(),
+                "srv_send_msg": False,
+            }
+            print(f"\n### 视频 file_type=2 · {Path(video).name} "
+                  f"({len(raw_v):,} 字节)")
+            resp = await http.post(route, headers=headers, json=body)
+            try:
+                data = resp.json() or {}
+            except ValueError:
+                data = {}
+            code = str(data.get("code") or "")
+            if resp.status_code == 200 and not code and data.get("file_info"):
+                ok_count += 1
+                print(f"  ✅ QQ 收下了这个视频（HTTP {resp.status_code}）")
+                print(f"     file_info 长度 {len(str(data['file_info']))}")
+                if do_send:
+                    # 这一步是**真的会出现在群里**的。留着的意义只有一个：
+                    # 确认 `msg_type=7` 的 media 塞视频时，客户端到底渲不渲染 ——
+                    # 上传成功 ≠ 显示出来，图片那条路已经吃过一次这个亏
+                    # （markdown 的图裂了是静默的）。
+                    send_route = (f"{API_BASE}/v2/users/{target}/messages"
+                                  if mode == "c2c"
+                                  else f"{API_BASE}/v2/groups/{target}/messages")
+                    sbody = {
+                        "msg_type": 7,
+                        "content": "月曜が近いよ（视频测试）",
+                        "media": {"file_info": data["file_info"]},
+                    }
+                    print(f"  → 真发一条 msg_type=7 到{'私聊' if mode == 'c2c' else '群'}…")
+                    sresp = await http.post(send_route, headers=headers, json=sbody)
+                    try:
+                        sdata = sresp.json() or {}
+                    except ValueError:
+                        sdata = {}
+                    scode = str(sdata.get("code") or "")
+                    if sresp.status_code < 300 and not scode:
+                        print(f"  ✅ 发出去了（HTTP {sresp.status_code}）—— "
+                              "去客户端看视频有没有渲染出来")
+                    else:
+                        print(f"  ❌ 发送失败 HTTP {sresp.status_code} code={scode or '-'}")
+                        print(f"     {json.dumps(sdata, ensure_ascii=False)[:400]}")
+                else:
+                    print("     下一步才需要真发一条 msg_type=7 看群里渲不渲染"
+                          "（加 --send）。")
+            else:
+                print(f"  ❌ HTTP {resp.status_code} code={code or '-'}")
+                print(f"     {ERROR_HINTS.get(code, '')}")
+                print(f"     {json.dumps(data, ensure_ascii=False)[:400]}")
+                if not data:
+                    print(f"     {resp.text[:400]}")
+            print("\n" + "=" * 72)
+            print(f"结论：视频上传{'成功' if ok_count else '失败'}。")
+            print("**到这里为止没往群里发过东西**（srv_send_msg=False）。"
+                  if not do_send else
+                  "⚠️ 上面那条 `msg_type=7` 是**真发进群了** —— 去客户端看渲染。")
+            return 0 if ok_count else 1
+
+        if voice:
+            # ---- 语音：只上传，不发消息 ----
+            # `file_type=3` 是官方枚举里的「语音 silk」。2026-10-19 实测：
+            # **上传这一步完全不校验格式** —— mp3 / wav / m4a、甚至
+            # `\x02#!SILK_V3` 后面接两千个零字节的**纯垃圾**，全都 HTTP 200
+            # 拿到 `file_info`。所以「上传成功」在这里**一点信息量都没有**，
+            # 能不能播只能真发一条看客户端（加 --send）。
+            #
+            # 这条和视频那条的结论一样，但视频至少还有个 10 MiB 的硬边界；
+            # 语音这边**连格式都不挡**，更得靠肉眼看。
+            raw_a = _as_silk(Path(voice))
+            body = {
+                "file_type": 3,  # 3 = 语音 silk
+                "file_data": base64.b64encode(raw_a).decode(),
+                "srv_send_msg": False,
+            }
+            print(f"\n### 语音 file_type=3 · {Path(voice).name} "
+                  f"({len(raw_a):,} 字节，头 {raw_a[:10]!r})")
+            resp = await http.post(route, headers=headers, json=body)
+            try:
+                data = resp.json() or {}
+            except ValueError:
+                data = {}
+            code = str(data.get("code") or "")
+            if resp.status_code == 200 and not code and data.get("file_info"):
+                ok_count += 1
+                print(f"  ✅ QQ 收下了（HTTP {resp.status_code}）—— "
+                      "**但上传成功不代表能播**，见上面那段说明")
+                if do_send:
+                    send_route = (f"{API_BASE}/v2/users/{target}/messages"
+                                  if mode == "c2c"
+                                  else f"{API_BASE}/v2/groups/{target}/messages")
+                    sbody = {
+                        "msg_type": 7,
+                        # 视频那条的 content 客户端是丢掉的；语音这条到底渲不渲染
+                        # **没测过**，所以故意带一句 —— 看群里有没有这行字。
+                        "content": "语音测试（这条文字渲染了吗）",
+                        "media": {"file_info": data["file_info"]},
+                    }
+                    print("  → 真发一条 msg_type=7…")
+                    sresp = await http.post(send_route, headers=headers, json=sbody)
+                    try:
+                        sdata = sresp.json() or {}
+                    except ValueError:
+                        sdata = {}
+                    scode = str(sdata.get("code") or "")
+                    if sresp.status_code < 300 and not scode:
+                        print(f"  ✅ 发出去了（HTTP {sresp.status_code}）—— "
+                              "去客户端看：① 能不能播 ② 那行文字渲没渲染")
+                    else:
+                        print(f"  ❌ 发送失败 HTTP {sresp.status_code} code={scode or '-'}")
+                        print(f"     {json.dumps(sdata, ensure_ascii=False)[:400]}")
+                else:
+                    print("     要真发一条看能不能播，加 --send。")
+            else:
+                print(f"  ❌ HTTP {resp.status_code} code={code or '-'}")
+                print(f"     {ERROR_HINTS.get(code, '')}")
+                print(f"     {json.dumps(data, ensure_ascii=False)[:400]}")
+                if not data:
+                    print(f"     {resp.text[:400]}")
+            print("\n" + "=" * 72)
+            print(f"结论：语音上传{'成功' if ok_count else '失败'}。")
+            # 这句必须跟着 do_send 走 —— 写死「没发消息」的话，--send 时
+            # 它就是在撒谎，而这条路的全部结论都靠肉眼看群里，不能误导。
+            print("**到这里为止没往群里发过东西**（srv_send_msg=False）。"
+                  if not do_send else
+                  "⚠️ 上面那条 `msg_type=7` 是**真发进群了** —— 去客户端看："
+                  "① 能不能播 ② 那行文字渲没渲染。")
+            return 0 if ok_count else 1
+
         for url in urls:
             print(f"\n### {labels.get(url, '')}\n{url}")
             if use_data:
