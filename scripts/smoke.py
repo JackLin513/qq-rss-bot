@@ -7593,6 +7593,12 @@ def _rp_wiring() -> None:
     check("★ 「忽略非 @ 消息」那行日志的语义没变（只在**真的什么都没做**时才记）",
           "if not (previewed or repeated):" in hook, "")
 
+    ready = inspect.getsource(_RB.on_ready)
+    check("★ `on_ready` 里自报了状态 —— 复读没有 task，别的功能都是在自己的 "
+          "`run()` 里报的；而且 `REPEAT_GROUPS` 是创建容器时烘进去的，"
+          "改 .env 只 restart 是**静默**失败，没这行根本看不出读进去没有",
+          "复读：已启用" in ready and "功能关闭" in ready, "")
+
     cfg = cfg_stub()
     check("cfg_stub 带上复读字段了（默认值和模块常量一致）",
           cfg.repeat_max_len == _rp.DEFAULT_MAX_LEN

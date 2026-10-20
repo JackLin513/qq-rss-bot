@@ -147,6 +147,16 @@ class RssBot(botpy.Client):
 
     async def on_ready(self) -> None:
         _log.info("机器人「%s」已上线", self.robot.name)
+        # 复读机没有 task（它挂在群消息事件上），所以状态在这里自报 ——
+        # 别的功能都是在自己的 `run()` 里报的。
+        # ⚠️ 这行**必须有**：`REPEAT_GROUPS` 是**创建容器时**烘进去的环境变量，
+        # 改完 `.env` 只 `restart` 的话新值不生效，而症状**完全静默**
+        # （见 CLAUDE.md「改 .env 用 up -d」那条）。没有这行就无从判断到底
+        # 读进去没有 —— 只能等群里真的复读才知道。
+        if self.repeater.enabled:
+            _log.info("复读：已启用，跟这 %d 个群", len(self.repeater.groups))
+        else:
+            _log.info("复读：未配置 REPEAT_GROUPS（或 REPEAT_ENABLED=false），功能关闭")
         await self._announce_previews()
         # 轮询器和 botpy 共用一个事件循环，在 on_ready 里挂上去最省事
         if self._poller_task is None:
