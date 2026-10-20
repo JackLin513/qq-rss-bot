@@ -99,6 +99,7 @@ git remote -v
 | 路径 | 为什么 |
 |---|---|
 | `.env` | 真实凭据（QQ AppSecret、X cookie、Fish Audio key、DeepSeek key） |
+| `.env.bak-*` / `.env.local` | 同上。⚠️ `.gitignore` 里原来只写了 `.env` **这一个路径**，`.env.bak-20261021` 这种**不在忽略之列** —— 改 `.env` 前习惯性 `cp .env .env.bak-$(date +%Y%m%d)` 的话，一次 `git add -A` 就把全部凭据推进公开仓库了。现在有 `.env.*` + `!.env.example` 兜着 |
 | `data/` | 已在 `.gitignore`。含 `bot.db`、`data/morning/`（第三方资料 + 版权素材）、`data/birthday/` |
 | `my-chat-history.md` | 会话导出，可能含日志片段和路径 |
 

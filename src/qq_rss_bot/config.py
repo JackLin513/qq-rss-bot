@@ -178,9 +178,7 @@ class Config:
     # ⚠️ **首轮只把 `new` 建成 baseline，一条 `new` 都不推** —— 存量有 31 条
     # 受付，直接跑会当场倒灌十几条。但締切提醒故意不 baseline，该响就响。
     ticket_alert: bool = True
-    # 推到哪些群。**空 = 整个功能关闭。**
-    # 先只填老测试群，跑几天确认没问题再往里加正式群（加一个 openid 就行）。
-    ticket_groups: tuple[str, ...] = ()
+    # 群列表**不在配置里** —— 在数据库的 group_features 表（见 features.py）
     # 多久检查一次。接口带 ETag，没变时是 304 + 0 字节，所以可以给得很松。
     ticket_check_sec: int = 300
     # booth slug 的品牌前缀白名单。**认不出来的前缀一律不推**（fail-closed），
@@ -211,8 +209,7 @@ class Config:
     # 这里是让机器人自己每周播一次：周日 22:00（北京时间）发一条
     # 「月曜が近いよ」+ 一个本地视频，素材从 MONDAY_VIDEO_DIR 里随机挑。
     monday_enabled: bool = True
-    # 推到哪些群。**空 = 整个功能关闭。** 先只填测试群。
-    monday_groups: tuple[str, ...] = ()
+    # 群列表**不在配置里** —— 在数据库的 group_features 表（见 features.py）
     # 素材目录。**留空就跟着 DB_PATH 走**（本地 `data/monday`、容器
     # `/app/data/monday`），所以正常情况下不用配。
     monday_video_dir: Path = Path("data/monday")
@@ -229,9 +226,7 @@ class Config:
     # 连着**两个人**发同样的话，机器人跟着复读一句。用户 2026-10-20 定的规则。
     # ⚠️ 这个功能和别的不同：**每条群消息都可能触发**，不是定时任务。
     repeat_enabled: bool = True
-    # 跟到哪些群。**空 = 整个功能关闭。** 先只填两个测试群 —— 正式群里
-    # 复读频率合不合适还没验证过。
-    repeat_groups: tuple[str, ...] = ()
+    # 群列表**不在配置里** —— 在数据库的 group_features 表（见 features.py）
     # 超过这个长度就不跟（复读长文像刷屏）。
     repeat_max_len: int = repeat_module.DEFAULT_MAX_LEN
     # 同一个群两次复读之间的最小间隔（秒）。防的是「一群人反复刷同一句」。
@@ -243,9 +238,7 @@ class Config:
     # 语音**离线预生成**（`scripts/make_morning.py`），运行时只扫
     # `data/morning/audio/` 上传，**零 LLM、零 TTS、零新依赖**。
     morning_enabled: bool = True
-    # 推到哪些群。**空 = 整个功能关闭。** 先只填测试群 —— 这是**每天**在响，
-    # 比月曜那种一周一次更需要先稳。
-    morning_groups: tuple[str, ...] = ()
+    # 群列表**不在配置里** —— 在数据库的 group_features 表（见 features.py）
     # 素材目录。**留空就跟着 DB_PATH 走**（本地 `data/morning`、容器
     # `/app/data/morning`），正常情况下不用配。运行时只用里面的 `audio/`。
     morning_dir: Path = Path("data/morning")
@@ -265,8 +258,7 @@ class Config:
     # scripts/fetch_birthday_source.py），配图每天实时抓 —— 两条链路互相独立，
     # **抓不到图照样发名单**。
     birthday_enabled: bool = True
-    # 推到哪些群。**空 = 整个功能关闭。**
-    birthday_groups: tuple[str, ...] = ()
+    # 群列表**不在配置里** —— 在数据库的 group_features 表（见 features.py）
     # 冷数据目录。**留空就跟着 DB_PATH 走**（本地 `data/birthday`、容器
     # `/app/data/birthday`），正常情况下不用配。
     birthday_dir: Path = Path("data/birthday")
@@ -289,8 +281,7 @@ class Config:
     # 傍晚到深夜**（= 北京 17:00–23:00），中午去搜只捞得到当天上午那批。
     # 22:30 北京 = 23:30 JST，当天基本收尾。想改回去改这一个变量就行。
     birthday_art_enabled: bool = True
-    # 发到哪些群。**空 = 整个功能关闭。**
-    birthday_art_groups: tuple[str, ...] = ()
+    # 群列表**不在配置里** —— 在数据库的 group_features 表（见 features.py）
     # 几点收，`HH:MM`，本地时间。
     birthday_art_time: str = birthday_art_module.DEFAULT_TIME
     # 重试窗口 —— 搜索失败（网络抖 / 被限流）时窗口内每拍重试。
@@ -462,7 +453,6 @@ def load_config() -> Config:
         summary_chars=_env_int("SUMMARY_CHARS", 800),
         imas_tags=_env_bool("IMAS_TAGS", True),
         ticket_alert=_env_bool("TICKET_ALERT", True),
-        ticket_groups=_env_list("TICKET_GROUPS"),
         ticket_check_sec=_env_int("TICKET_CHECK_SEC", 300),
         ticket_brands=_env_list("TICKET_BRANDS") or tickets_module.DEFAULT_BRANDS,
         ticket_url=_env_str("TICKET_URL", tickets_module.DEFAULT_API),
@@ -470,17 +460,14 @@ def load_config() -> Config:
         ticket_image_size=_env_str("TICKET_IMAGE_SIZE", tickets_module.DEFAULT_IMAGE_SIZE),
         ticket_image_w=_env_int("TICKET_IMAGE_W", tickets_module.DEFAULT_IMAGE_W),
         monday_enabled=_env_bool("MONDAY_ENABLED", True),
-        monday_groups=_env_list("MONDAY_GROUPS"),
         monday_video_dir=monday_video_dir,
         monday_weekday=monday_weekday,
         monday_time=monday_time,
         monday_window_sec=_env_int("MONDAY_WINDOW_SEC", monday_module.DEFAULT_WINDOW_SEC),
         repeat_enabled=_env_bool("REPEAT_ENABLED", True),
-        repeat_groups=_env_list("REPEAT_GROUPS"),
         repeat_max_len=_env_int("REPEAT_MAX_LEN", repeat_module.DEFAULT_MAX_LEN),
         repeat_gap_sec=_env_float("REPEAT_GAP_SEC", repeat_module.DEFAULT_GAP_SEC),
         morning_enabled=_env_bool("MORNING_ENABLED", True),
-        morning_groups=_env_list("MORNING_GROUPS"),
         morning_dir=morning_dir,
         morning_time=morning_time,
         morning_window_sec=_env_int(
@@ -488,14 +475,12 @@ def load_config() -> Config:
         ),
         morning_recent_days=morning_recent_days,
         birthday_enabled=_env_bool("BIRTHDAY_ENABLED", True),
-        birthday_groups=_env_list("BIRTHDAY_GROUPS"),
         birthday_dir=birthday_dir,
         birthday_time=birthday_time,
         birthday_window_sec=_env_int(
             "BIRTHDAY_WINDOW_SEC", birthday_module.DEFAULT_WINDOW_SEC
         ),
         birthday_art_enabled=_env_bool("BIRTHDAY_ART_ENABLED", True),
-        birthday_art_groups=_env_list("BIRTHDAY_ART_GROUPS"),
         birthday_art_time=birthday_art_time,
         birthday_art_window_sec=_env_int(
             "BIRTHDAY_ART_WINDOW_SEC", birthday_art_module.DEFAULT_WINDOW_SEC

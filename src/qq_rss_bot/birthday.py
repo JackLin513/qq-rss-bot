@@ -368,9 +368,9 @@ class BirthdayPoller:
     def groups(self) -> tuple[str, ...]:
         """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
 
-        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        群开关存在库里（见 `features.py`），`.env` 里**一个群参数都没有**。
         """
-        return features.groups_for(self.db, "birthday", self.cfg.birthday_groups)
+        return features.groups_for(self.db, "birthday")
 
     @property
     def enabled(self) -> bool:
@@ -407,15 +407,19 @@ class BirthdayPoller:
         return self._calendar
 
     async def run(self) -> None:
+        # ⚠️ **这里不能 return。** 群开关在库里（`features.py`），`/set` 的语义是
+        # 「改完下一拍就生效」—— 启动时库里一个群都没开的话，一 return 这个 task
+        # 就**永久结束**了：之后再怎么 `/set` 开群都不会跑，只能重启容器。
+        # 留着轮询不花什么钱 —— `poll_once` 每拍开头 `if not self.enabled: return 0`。
         if not self.enabled:
-            _log.info("生日：未配置 BIRTHDAY_GROUPS，功能关闭")
-            return
-        _log.info(
-            "生日：已启用，每天 %s（本地时间）推送**第二天**的生日，目标 %d 个群，名单 %s",
-            self.cfg.birthday_time,
-            len(self.groups),
-            self.calendar_path,
-        )
+            _log.info("生日：库里没有开着的群，功能关闭（**仍然轮询**，/set 开了下一拍生效）")
+        else:
+            _log.info(
+                "生日：已启用，每天 %s（本地时间）推送**第二天**的生日，目标 %d 个群，名单 %s",
+                self.cfg.birthday_time,
+                len(self.groups),
+                self.calendar_path,
+            )
         while not self._stopped.is_set():
             try:
                 await self.poll_once()

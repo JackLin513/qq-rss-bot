@@ -1,7 +1,11 @@
 .venv/
 __pycache__/
 *.py[cod]
+# 真实凭据。`.env.*` 是给「备份 / 本机覆盖」用的 —— 光写 `.env` 只匹配这一个
+# 文件，`.env.bak-20261021` 这种**不在忽略之列**，一不小心就提交进公开仓库了。
 .env
+.env.*
+!.env.example
 data/
 *.db
 *.sqlite3

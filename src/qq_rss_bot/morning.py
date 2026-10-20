@@ -309,9 +309,9 @@ class MorningPoller:
     def groups(self) -> tuple[str, ...]:
         """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
 
-        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        群开关存在库里（见 `features.py`），`.env` 里**一个群参数都没有**。
         """
-        return features.groups_for(self.db, "morning", self.cfg.morning_groups)
+        return features.groups_for(self.db, "morning")
 
     @property
     def enabled(self) -> bool:
@@ -333,15 +333,19 @@ class MorningPoller:
         self._stopped.set()
 
     async def run(self) -> None:
+        # ⚠️ **这里不能 return。** 群开关在库里（`features.py`），`/set` 的语义是
+        # 「改完下一拍就生效」—— 启动时库里一个群都没开的话，一 return 这个 task
+        # 就**永久结束**了：之后再怎么 `/set` 开群都不会跑，只能重启容器。
+        # 留着轮询不花什么钱 —— `poll_once` 每拍开头 `if not self.enabled: return 0`。
         if not self.enabled:
-            _log.info("早安：未配置 MORNING_GROUPS，功能关闭")
-            return
-        _log.info(
-            "早安：已启用，每天 %s（本地时间）推送，目标 %d 个群，素材目录 %s",
-            self.cfg.morning_time,
-            len(self.groups),
-            self.audio_dir,
-        )
+            _log.info("早安：库里没有开着的群，功能关闭（**仍然轮询**，/set 开了下一拍生效）")
+        else:
+            _log.info(
+                "早安：已启用，每天 %s（本地时间）推送，目标 %d 个群，素材目录 %s",
+                self.cfg.morning_time,
+                len(self.groups),
+                self.audio_dir,
+            )
         # 头像和 manifest 都是**可选**的（缺了退回纯语音），但缺了要让人知道，
         # 所以在启动时就把状态打出来，不用等出问题才发现。
         lines = load_lines(self.morning_dir)

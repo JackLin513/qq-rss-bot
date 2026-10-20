@@ -858,9 +858,9 @@ class TicketPoller:
     def groups(self) -> tuple[str, ...]:
         """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
 
-        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        群开关存在库里（见 `features.py`），`.env` 里**一个群参数都没有**。
         """
-        return features.groups_for(self.db, "tickets", self.cfg.ticket_groups)
+        return features.groups_for(self.db, "tickets")
 
     @property
     def enabled(self) -> bool:
@@ -943,14 +943,18 @@ class TicketPoller:
         return [g for g in groups if await self._try_send(g, text, label)]
 
     async def run(self) -> None:
+        # ⚠️ **这里不能 return。** 群开关在库里（`features.py`），`/set` 的语义是
+        # 「改完下一拍就生效」—— 启动时库里一个群都没开的话，一 return 这个 task
+        # 就**永久结束**了：之后再怎么 `/set` 开群都不会跑，只能重启容器。
+        # 留着轮询不花什么钱 —— `poll_once` 每拍开头 `if not self.enabled: return 0`。
         if not self.enabled:
-            _log.info("抽票提醒：未配置 TICKET_GROUPS，功能关闭")
-            return
-        _log.info(
-            "抽票提醒：已启用，推送到 %d 个群，每 %ss 检查一次",
-            len(self.groups),
-            self.cfg.ticket_check_sec,
-        )
+            _log.info("抽票提醒：库里没有开着的群，功能关闭（**仍然轮询**，/set 开了下一拍生效）")
+        else:
+            _log.info(
+                "抽票提醒：已启用，推送到 %d 个群，每 %ss 检查一次",
+                len(self.groups),
+                self.cfg.ticket_check_sec,
+            )
         while not self._stopped.is_set():
             try:
                 await self.poll_once()

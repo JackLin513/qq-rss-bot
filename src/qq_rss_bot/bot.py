@@ -141,7 +141,7 @@ class RssBot(botpy.Client):
         # `REPEAT_ENABLED=false` 时永远给空（= 关闭），此时一次库都不查。
         self.repeater = repeat.Repeater(
             lambda: (
-                features.groups_for(self.db, "repeat", cfg.repeat_groups)
+                features.groups_for(self.db, "repeat")
                 if cfg.repeat_enabled
                 else ()
             ),
@@ -155,22 +155,17 @@ class RssBot(botpy.Client):
         _log.info("机器人「%s」已上线", self.robot.name)
         # 复读机没有 task（它挂在群消息事件上），所以状态在这里自报 ——
         # 别的功能都是在自己的 `run()` 里报的。
-        # ⚠️ 这行**必须有**：`REPEAT_GROUPS` 是**创建容器时**烘进去的环境变量，
-        # 改完 `.env` 只 `restart` 的话新值不生效，而症状**完全静默**
-        # （见 CLAUDE.md「改 .env 用 up -d」那条）。没有这行就无从判断到底
-        # 读进去没有 —— 只能等群里真的复读才知道。
-        # ⚠️ 这条**全局**的提示必须有：群列表现在存在库里，`.env` 只用于
-        # **首次灌入** —— 灌过之后改 `.env` 不再生效，而症状是**完全静默**的
-        # （和「改 .env 用 restart」那个坑长得一模一样）。
-        # 顺带它也是**灌入点**：`summarize` 会逐功能把 `.env` 灌进库（幂等）。
+        # ⚠️ 这行**必须有**：群列表存在库里（`group_features` 表），`.env` 里
+        # 一个群参数都没有 —— 所以「为什么这个功能没推」只能靠这行判断。
+        # 群数不对 = 开关的问题（`/set` 或库里那一行），不是代码的问题。
         _log.info(
-            "功能开关：群列表来自数据库（.env 只用于首次灌入）—— %s",
-            features.summarize(self.db, features.defaults_from(self.cfg)),
+            "功能开关：群列表来自数据库 —— %s",
+            features.summarize(self.db),
         )
         if self.repeater.enabled:
             _log.info("复读：已启用，跟这 %d 个群", len(self.repeater.groups))
         else:
-            _log.info("复读：没有开着的群（REPEAT_GROUPS 或 REPEAT_ENABLED），功能关闭")
+            _log.info("复读：库里一个群都没开（或 REPEAT_ENABLED=false），功能关闭")
         await self._announce_previews()
         # 轮询器和 botpy 共用一个事件循环，在 on_ready 里挂上去最省事
         if self._poller_task is None:
