@@ -63,7 +63,7 @@ from datetime import date as Date
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
-from . import preview
+from . import features, preview
 
 _log = logging.getLogger("qq_rss_bot.birthday")
 
@@ -365,8 +365,16 @@ class BirthdayPoller:
         self._load_failed = False
 
     @property
+    def groups(self) -> tuple[str, ...]:
+        """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
+
+        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        """
+        return features.groups_for(self.db, "birthday", self.cfg.birthday_groups)
+
+    @property
     def enabled(self) -> bool:
-        return bool(self.cfg.birthday_enabled and self.cfg.birthday_groups)
+        return bool(self.cfg.birthday_enabled and self.groups)
 
     @property
     def calendar_path(self) -> Path:
@@ -405,7 +413,7 @@ class BirthdayPoller:
         _log.info(
             "生日：已启用，每天 %s（本地时间）推送**第二天**的生日，目标 %d 个群，名单 %s",
             self.cfg.birthday_time,
-            len(self.cfg.birthday_groups),
+            len(self.groups),
             self.calendar_path,
         )
         while not self._stopped.is_set():
@@ -439,7 +447,7 @@ class BirthdayPoller:
         d = birthday_date(slot)
         day_key = d.isoformat()
         done = self.db.birthday_posted(day_key)
-        targets = [g for g in self.cfg.birthday_groups if g not in done]
+        targets = [g for g in self.groups if g not in done]
         if not targets:
             return 0
 

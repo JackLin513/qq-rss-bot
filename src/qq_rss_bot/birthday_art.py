@@ -119,6 +119,7 @@ from typing import Any, Iterable
 import httpx
 
 from . import birthday as birthday_module
+from . import features
 from . import preview
 from .tickets import JST
 
@@ -652,11 +653,19 @@ class BirthdayArtPoller:
         self.x = XSearch(media_http, cfg.x_auth_token, cfg.x_ct0)
 
     @property
+    def groups(self) -> tuple[str, ...]:
+        """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
+
+        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        """
+        return features.groups_for(self.db, "birthday_art", self.cfg.birthday_art_groups)
+
+    @property
     def enabled(self) -> bool:
         """三样都要：开关、群、**cookie**。缺 cookie 时整条链路跑不起来。"""
         return bool(
             self.cfg.birthday_art_enabled
-            and self.cfg.birthday_art_groups
+            and self.groups
             and self.cfg.x_auth_token
             and self.cfg.x_ct0
         )
@@ -690,7 +699,7 @@ class BirthdayArtPoller:
             "贺图：已启用，每天 %s（本地时间）收**当天**的贺图，目标 %d 个群，"
             "带年份的 tag 翻 %s，最多发 %d 张，点赞下限 %d",
             self.cfg.birthday_art_time,
-            len(self.cfg.birthday_art_groups),
+            len(self.groups),
             "+".join(PAGE_PLAN_YEARFUL),
             self.cfg.birthday_art_max,
             self.cfg.birthday_art_min_likes,
@@ -759,7 +768,7 @@ class BirthdayArtPoller:
         和「今天真没人画」长得一模一样。`C2CNotifier` 自带冷却，不会刷屏。"""
         if self.notifier is None:
             return
-        for group in self.cfg.birthday_art_groups[:1]:
+        for group in self.groups[:1]:
             try:
                 await self.notifier.notify(group, text, key="xart")
             except Exception as exc:  # noqa: BLE001
@@ -784,7 +793,7 @@ class BirthdayArtPoller:
         d = art_date(slot)
         day_key = d.isoformat()
         done = self.db.birthday_art_posted(day_key)
-        targets = [g for g in self.cfg.birthday_art_groups if g not in done]
+        targets = [g for g in self.groups if g not in done]
         if not targets:
             return 0
 

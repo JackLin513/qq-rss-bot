@@ -15,7 +15,7 @@ import botpy
 import httpx
 from botpy.message import GroupMessage
 
-from . import ai, bilibili, preview, repeat
+from . import ai, bilibili, features, preview, repeat
 from .autosub import AutoSubscriber
 from .commands import (
     ADMIN_ROLES,
@@ -136,9 +136,15 @@ class RssBot(botpy.Client):
         # 群复读机：连着两个人发同样的话，跟着复读一句。**没有 task** ——
         # 它挂在 `on_group_message_create` 那条路上，每条非 @ 群消息都会喂进来
         # 一次（`consider` 有副作用，不能只在「看起来像复读」时才调）。
-        # `REPEAT_ENABLED=false` 或 `REPEAT_GROUPS` 留空都等于关闭。
+        # ⚠️ 传的是**取值函数**而不是群列表 —— 群开关现在存在库里（features.py），
+        # `/set` 改完要下一拍就生效，构造时定死就做不到。
+        # `REPEAT_ENABLED=false` 时永远给空（= 关闭），此时一次库都不查。
         self.repeater = repeat.Repeater(
-            cfg.repeat_groups if cfg.repeat_enabled else (),
+            lambda: (
+                features.groups_for(self.db, "repeat", cfg.repeat_groups)
+                if cfg.repeat_enabled
+                else ()
+            ),
             max_len=cfg.repeat_max_len,
             gap_sec=cfg.repeat_gap_sec,
         )
@@ -153,10 +159,18 @@ class RssBot(botpy.Client):
         # 改完 `.env` 只 `restart` 的话新值不生效，而症状**完全静默**
         # （见 CLAUDE.md「改 .env 用 up -d」那条）。没有这行就无从判断到底
         # 读进去没有 —— 只能等群里真的复读才知道。
+        # ⚠️ 这条**全局**的提示必须有：群列表现在存在库里，`.env` 只用于
+        # **首次灌入** —— 灌过之后改 `.env` 不再生效，而症状是**完全静默**的
+        # （和「改 .env 用 restart」那个坑长得一模一样）。
+        # 顺带它也是**灌入点**：`summarize` 会逐功能把 `.env` 灌进库（幂等）。
+        _log.info(
+            "功能开关：群列表来自数据库（.env 只用于首次灌入）—— %s",
+            features.summarize(self.db, features.defaults_from(self.cfg)),
+        )
         if self.repeater.enabled:
             _log.info("复读：已启用，跟这 %d 个群", len(self.repeater.groups))
         else:
-            _log.info("复读：未配置 REPEAT_GROUPS（或 REPEAT_ENABLED=false），功能关闭")
+            _log.info("复读：没有开着的群（REPEAT_GROUPS 或 REPEAT_ENABLED），功能关闭")
         await self._announce_previews()
         # 轮询器和 botpy 共用一个事件循环，在 on_ready 里挂上去最省事
         if self._poller_task is None:

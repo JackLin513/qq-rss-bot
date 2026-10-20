@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Iterable
 
 _log = logging.getLogger("qq_rss_bot.repeat")
 
@@ -71,17 +70,28 @@ class Repeater:
 
     def __init__(
         self,
-        groups: Iterable[str],
+        groups,
         *,
         max_len: int = DEFAULT_MAX_LEN,
         gap_sec: float = DEFAULT_GAP_SEC,
     ) -> None:
-        self.groups = {g for g in groups if g}
+        """`groups` 是「哪些群要跟」。
+
+        传 set/tuple（测试里方便）或**取值函数**（运行时）。
+        ⚠️ 运行时**必须**传函数：群开关现在存在库里（见 `features.py`），
+        `/set` 改完要**下一拍就生效**，构造时定死就做不到。
+        """
+        self._source = groups if callable(groups) else (lambda: groups)
         self.max_len = max_len
         self.gap_sec = gap_sec
         self._last: dict[str, tuple[str, str]] = {}   # 群 → (归一化文本, 发送人)
         self._repeated: dict[str, str] = {}           # 群 → 刚跟过的那句（刹车）
         self._at: dict[str, float] = {}               # 群 → 上次复读的时刻
+
+    @property
+    def groups(self) -> set[str]:
+        """当前开着复读的群。**每次算一遍**，所以 `/set` 立刻生效。"""
+        return {g for g in self._source() if g}
 
     @property
     def enabled(self) -> bool:

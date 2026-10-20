@@ -95,6 +95,8 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
 
+from . import features
+
 _log = logging.getLogger("qq_rss_bot.morning")
 
 # silk 的文件头。QQ 语音要的就是这个格式，**这条路唯一的格式校验点**。
@@ -304,8 +306,16 @@ class MorningPoller:
         self._warned_avatar: str | None = None    # 缺这位偶像的头像
 
     @property
+    def groups(self) -> tuple[str, ...]:
+        """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
+
+        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        """
+        return features.groups_for(self.db, "morning", self.cfg.morning_groups)
+
+    @property
     def enabled(self) -> bool:
-        return bool(self.cfg.morning_enabled and self.cfg.morning_groups)
+        return bool(self.cfg.morning_enabled and self.groups)
 
     @property
     def morning_dir(self) -> Path:
@@ -329,7 +339,7 @@ class MorningPoller:
         _log.info(
             "早安：已启用，每天 %s（本地时间）推送，目标 %d 个群，素材目录 %s",
             self.cfg.morning_time,
-            len(self.cfg.morning_groups),
+            len(self.groups),
             self.audio_dir,
         )
         # 头像和 manifest 都是**可选**的（缺了退回纯语音），但缺了要让人知道，
@@ -375,7 +385,7 @@ class MorningPoller:
 
         slot_key = slot.strftime("%Y-%m-%dT%H:%M")
         done = self.db.morning_posted(slot_key)
-        targets = [g for g in self.cfg.morning_groups if g not in done]
+        targets = [g for g in self.groups if g not in done]
         if not targets:
             return 0
 

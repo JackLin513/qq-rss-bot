@@ -71,6 +71,8 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
 
+from . import features
+
 _log = logging.getLogger("qq_rss_bot.monday")
 
 # 实测边界，见模块 docstring 的表。**别按官方文档改成 5 MiB** ——
@@ -251,8 +253,16 @@ class MondayPoller:
         self._caption_sent: set[tuple[str, str]] = set()
 
     @property
+    def groups(self) -> tuple[str, ...]:
+        """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
+
+        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        """
+        return features.groups_for(self.db, "monday", self.cfg.monday_groups)
+
+    @property
     def enabled(self) -> bool:
-        return bool(self.cfg.monday_enabled and self.cfg.monday_groups)
+        return bool(self.cfg.monday_enabled and self.groups)
 
     def stop(self) -> None:
         self._stopped.set()
@@ -265,7 +275,7 @@ class MondayPoller:
             "月曜：已启用，%s %s（本地时间）播报，推送到 %d 个群，素材目录 %s",
             _WD[self.cfg.monday_weekday % 7],
             self.cfg.monday_time,
-            len(self.cfg.monday_groups),
+            len(self.groups),
             self.cfg.monday_video_dir,
         )
         while not self._stopped.is_set():
@@ -296,7 +306,7 @@ class MondayPoller:
 
         slot_key = slot.strftime("%Y-%m-%dT%H:%M")
         done = self.db.monday_posted(slot_key)
-        targets = [g for g in self.cfg.monday_groups if g not in done]
+        targets = [g for g in self.groups if g not in done]
         if not targets:
             return 0
 

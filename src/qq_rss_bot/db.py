@@ -138,6 +138,19 @@ CREATE TABLE IF NOT EXISTS birthday_art_posts (
     sent_at      TEXT NOT NULL,
     PRIMARY KEY (day, group_openid)
 );
+
+-- 按群的「功能开关」—— 每个群单独决定收不收某个功能的推送。
+-- 见 features.py 的模块说明：为什么落库而不是写 .env、为什么 .env 只用于首次灌入。
+--
+-- ⚠️ **关掉 = 写 enabled=0，不是删行。** 删了的话 `feature_seeded` 会判成
+-- 「没灌过」，下次启动又按 .env 灌回来 —— 用户会以为开关失灵，日志上看不出来。
+CREATE TABLE IF NOT EXISTS group_features (
+    group_openid TEXT NOT NULL,
+    feature      TEXT NOT NULL,   -- features.FEATURES 里的名字
+    enabled      INTEGER NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (group_openid, feature)
+);
 """
 
 # 老库缺的列。本项目没有成套迁移框架，但「加一列」这类向前兼容的改动
@@ -788,3 +801,78 @@ class Database:
                 "SELECT COUNT(*) c FROM subscriptions WHERE enabled = 0"
             ).fetchone()["c"],
         }
+
+    # ---------- 按群的功能开关（见 features.py）----------
+
+    def feature_seeded(self, feature: str) -> bool:
+        """这个功能在库里有没有**任何**一行（开着的和关掉的都算）。
+
+        ⚠️ 判据必须是「有没有行」，不是「有没有**开着**的行」——
+        用户把所有群都关掉之后，按后者判会认为没灌过、下次启动又按 `.env`
+        灌回来，开关看起来就失灵了。
+        """
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM group_features WHERE feature = ?", (feature,)
+        ).fetchone()
+        return bool(row["n"])
+
+    def seed_feature(self, feature: str, groups: Sequence[str]) -> int:
+        """库里这个功能一行都没有时，按 `groups` 灌一遍（全开）。返回灌了几行。
+
+        **只灌一次** —— 灌完 `feature_seeded` 就为真，`.env` 之后不再参与。
+        `groups` 为空时什么都不灌（等于「这个功能先不开」），
+        而且下次启动还会再试 —— 这正好让「先把 `.env` 填上再重启」这条路留着。
+        """
+        if self.feature_seeded(feature):
+            return 0
+        now = utcnow()
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO group_features "
+            "(group_openid, feature, enabled, updated_at) VALUES (?, ?, 1, ?)",
+            [(g, feature, now) for g in groups],
+        )
+        self._conn.commit()
+        return len(groups)
+
+    def feature_groups(self, feature: str) -> tuple[str, ...]:
+        """这个功能**开着**的群。
+
+        ⚠️ `ORDER BY rowid` 是**故意**的，不是随手写的：灌入时按 `.env` 的顺序
+        插入，rowid 就保住了那个顺序。`birthday_art._alert` 取的是 `[:1]`
+        （第一个群），而 `C2CNotifier` 拿这个群去查「谁在这个群发过指令」——
+        **换个群就是换了一批收件人**。
+        """
+        rows = self._conn.execute(
+            "SELECT group_openid FROM group_features "
+            "WHERE feature = ? AND enabled = 1 ORDER BY rowid",
+            (feature,),
+        ).fetchall()
+        return tuple(r["group_openid"] for r in rows)
+
+    def set_group_feature(self, group_openid: str, feature: str, enabled: bool) -> None:
+        """开 / 关某个群的一个功能。
+
+        ⚠️ **只 upsert，从不删行** —— 删行会被 `feature_seeded` 当成「没灌过」，
+        下次启动按 `.env` 灌回来。见 `SCHEMA` 里那张表的注释。
+        """
+        self._conn.execute(
+            """
+            INSERT INTO group_features (group_openid, feature, enabled, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (group_openid, feature) DO UPDATE SET
+                enabled = excluded.enabled, updated_at = excluded.updated_at
+            """,
+            (group_openid, feature, 1 if enabled else 0, utcnow()),
+        )
+        self._conn.commit()
+
+    def all_group_features(self) -> dict[str, dict[str, bool]]:
+        """`{群: {功能: 开没开}}`。`/set` 列状态用，一次查完别逐群查。"""
+        out: dict[str, dict[str, bool]] = {}
+        for row in self._conn.execute(
+            "SELECT group_openid, feature, enabled FROM group_features ORDER BY rowid"
+        ):
+            out.setdefault(row["group_openid"], {})[row["feature"]] = bool(
+                row["enabled"]
+            )
+        return out

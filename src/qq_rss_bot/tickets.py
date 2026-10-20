@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Mapping, Sequence
 
-from . import multiimage
+from . import features, multiimage
 
 if TYPE_CHECKING:
     import httpx
@@ -855,8 +855,16 @@ class TicketPoller:
         self._preview_open = False
 
     @property
+    def groups(self) -> tuple[str, ...]:
+        """这个功能该发到哪些群。**每次重查库** —— `/set` 改完下一拍就生效。
+
+        群开关存在库里（见 `features.py`），`.env` 只用于**首次灌入**。
+        """
+        return features.groups_for(self.db, "tickets", self.cfg.ticket_groups)
+
+    @property
     def enabled(self) -> bool:
-        return bool(self.cfg.ticket_alert and self.cfg.ticket_groups)
+        return bool(self.cfg.ticket_alert and self.groups)
 
     def stop(self) -> None:
         self._stopped.set()
@@ -940,7 +948,7 @@ class TicketPoller:
             return
         _log.info(
             "抽票提醒：已启用，推送到 %d 个群，每 %ss 检查一次",
-            len(self.cfg.ticket_groups),
+            len(self.groups),
             self.cfg.ticket_check_sec,
         )
         while not self._stopped.is_set():
@@ -981,7 +989,7 @@ class TicketPoller:
             # 窗口里的该推就推（实测总有一两条正好卡在窗口边上）。return 的话
             # 第一次启动群里一条消息都没有，根本没法判断功能通没通。
             seeded = 0
-            for group in self.cfg.ticket_groups:
+            for group in self.groups:
                 for rec in recs:
                     if rec.status == "within_entry_period":
                         self.db.mark_ticket_alert(rec.id, group, "new")
@@ -991,11 +999,11 @@ class TicketPoller:
         # **先算完整轮要发什么，再逐条发。** 不能像原来那样在「群 × 受付 × kind」
         # 的三层循环里直接发 —— 预热/预览是按**一条消息**组织的，同一条提醒
         # 会被预热好几次（每个正式群一次），而且三阶段会被拆散成并发的。
-        seen = {g: self.db.ticket_alert_kinds(g) for g in self.cfg.ticket_groups}
+        seen = {g: self.db.ticket_alert_kinds(g) for g in self.groups}
         pending: list[tuple[Reception, str, list[str]]] = []
         for rec in recs:
             groups_for: dict[str, list[str]] = {}
-            for group in self.cfg.ticket_groups:
+            for group in self.groups:
                 for kind in due_alerts(rec, now, seen[group].get(rec.id, set())):
                     groups_for.setdefault(kind, []).append(group)
             for kind, groups in groups_for.items():

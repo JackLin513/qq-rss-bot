@@ -5744,7 +5744,42 @@ print("[4.9] 小偶像早安语音（全离线）")
 _MN_ROOT = Path(__file__).resolve().parents[1]
 
 
-class _MorningDb:
+class _FeatureDbMixin:
+    """混进各功能的假库：`features.groups_for()` 要的那四个方法。
+
+    ⚠️ 内部套的是**真的** `Database`，不是手写桩 —— 这一层的语义
+    （**关掉 = 写 `enabled=0`，不删行**、「没灌过才灌」、群顺序）本身就是
+    被测的东西；手写桩等于把被测逻辑再抄一遍，抄错了还测不出来。
+
+    别的功能的测试（monday / tickets）用的是真 `Database`，不需要这个。
+    """
+
+    _fdb = None
+
+    def _feature_db(self):
+        if self._fdb is None:
+            import tempfile  # noqa: PLC0415
+
+            from qq_rss_bot.db import Database  # noqa: PLC0415
+
+            self._tmp = tempfile.TemporaryDirectory()
+            self._fdb = Database(Path(self._tmp.name) / "features.db")
+        return self._fdb
+
+    def seed_feature(self, feature, groups):
+        return self._feature_db().seed_feature(feature, groups)
+
+    def feature_seeded(self, feature):
+        return self._feature_db().feature_seeded(feature)
+
+    def feature_groups(self, feature):
+        return self._feature_db().feature_groups(feature)
+
+    def set_group_feature(self, group_openid, feature, enabled):
+        self._feature_db().set_group_feature(group_openid, feature, enabled)
+
+
+class _MorningDb(_FeatureDbMixin):
     """只实现 `MorningPoller` 用到的那四个方法的假库。
 
     `rows` 按 (slot, 群, 偶像, 文件) 追加 —— `morning_recent_idols` 直接吐
@@ -6437,8 +6472,8 @@ def _bd_html() -> str:
     )
 
 
-class _BdDb:
-    """只实现 `BirthdayPoller` 用到的那两个方法。"""
+class _BdDb(_FeatureDbMixin):
+    """只实现 `BirthdayPoller` 用到的那几个方法。"""
 
     def __init__(self) -> None:
         self.posted: dict[str, set[str]] = {}
@@ -6797,8 +6832,8 @@ print("[4.97] 誕生祭 贺图聚合（全离线）")
 
 
 def _ba_db():
-    class _Db:
-        """只实现 `BirthdayArtPoller` 用到的那两个方法。"""
+    class _Db(_FeatureDbMixin):
+        """只实现 `BirthdayArtPoller` 用到的那几个方法。"""
 
         def __init__(self) -> None:
             self.posted: dict[str, set[str]] = {}
@@ -7568,8 +7603,12 @@ def _rp_wiring() -> None:
     init = inspect.getsource(_RB.__init__)
     check("★ `RssBot.__init__` 里建了 self.repeater",
           "self.repeater = repeat.Repeater(" in init)
-    check("★ `REPEAT_ENABLED=false` 时传空元组（= 关闭）",
-          "cfg.repeat_groups if cfg.repeat_enabled else ()" in init, "")
+    check("★ 传的是**取值函数**不是群列表 —— 群开关存在库里（features.py），"
+          "`/set` 改完要下一拍就生效，构造时定死做不到",
+          "lambda:" in init
+          and 'features.groups_for(self.db, "repeat"' in init, "")
+    check("★ `REPEAT_ENABLED=false` 时永远给空（而且一次库都不查）",
+          "if cfg.repeat_enabled" in init and "else ()" in init, "")
 
     raw = inspect.getsource(_RB._maybe_repeat)
     # 只查**代码**，不查 docstring —— 说明里正好提到了 `self.sender.send_text`
@@ -7676,6 +7715,233 @@ _rp_trigger()
 _rp_skip()
 _rp_wiring()
 _rp_end_to_end()
+
+# ---------------------------------------------------------------------------
+# 按群的功能开关（.env 只用于首次灌入，库是事实来源）
+# ---------------------------------------------------------------------------
+
+print("[4.99] 按群的功能开关（全离线）")
+
+
+def _gf_seed_and_off() -> None:
+    """灌入 + 关掉不复活 —— 整个设计的支点。"""
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import features as _F  # noqa: PLC0415
+    from qq_rss_bot.db import Database  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "gf.db")
+        A, B, C = "AAA", "BBB", "CCC"
+
+        check("★ 库里没灌过时按 `.env` 灌一遍（全开）",
+              _F.groups_for(db, "morning", (A, B)) == (A, B),
+              str(_F.groups_for(db, "morning", (A, B))))
+        check("★ 顺序就是 `.env` 的顺序 —— `birthday_art._alert` 取 `[:1]`，"
+              "而 `C2CNotifier` 拿那个群查「谁发过指令」，**换个群就是换批收件人**",
+              db.feature_groups("morning") == (A, B),
+              str(db.feature_groups("morning")))
+        check("灌过之后 `feature_seeded` 为真（判据是「有没有行」）",
+              db.feature_seeded("morning") is True)
+
+        db.set_group_feature(A, "morning", False)
+        check("关掉一个群 → 立刻从列表里消失（不用重启）",
+              _F.groups_for(db, "morning", (A, B)) == (B,),
+              str(_F.groups_for(db, "morning", (A, B))))
+
+        got = None
+        for _ in range(3):
+            got = _F.groups_for(db, "morning", (A, B))
+        check("★★ 反复灌也不会把关掉的群灌回来（**关 = 写 enabled=0，不是删行**）",
+              got == (B,), str(got))
+
+        db.set_group_feature(B, "morning", False)
+        check("★ 全部关掉 → 空（功能关闭），而且**不会**被当成「没灌过」重新灌",
+              _F.groups_for(db, "morning", (A, B, C)) == ()
+              and db.feature_seeded("morning") is True)
+
+        db.set_group_feature(C, "morning", True)
+        check("显式打开一个新群 → 立刻生效",
+              _F.groups_for(db, "morning", (A, B)) == (C,),
+              str(_F.groups_for(db, "morning", (A, B))))
+
+        check("★ `.env` 为空时**不灌** —— 所以「先把 .env 配上再重启」这条路留着",
+              _F.groups_for(db, "monday", ()) == ()
+              and db.feature_seeded("monday") is False)
+        check("  之后再给 `.env` 配上就能灌进去",
+              _F.groups_for(db, "monday", (A,)) == (A,))
+
+        raised = False
+        try:
+            _F.groups_for(db, "mornig", (A,))
+        except ValueError:
+            raised = True
+        check("★ 功能名写错 → 抛异常（不能静默变成「这个功能一个群都不发」）", raised)
+
+        check("`FEATURES` 和 `NAMES` 一一对应（加功能时漏一边会静默）",
+              set(_F.FEATURES) == set(_F.NAMES)
+              and len(_F.FEATURES) == len(_F.NAMES),
+              f"{_F.FEATURES} vs {list(_F.NAMES)}")
+        check("★ `defaults_from(cfg)` 覆盖了所有功能（漏掉的那个会静默不发）",
+              set(_F.defaults_from(cfg_stub())) == set(_F.FEATURES),
+              str(sorted(_F.defaults_from(cfg_stub()))))
+
+        check("`set_group_feature` 是 upsert：重复开同一个不炸",
+              (db.set_group_feature(C, "morning", True),
+               db.set_group_feature(C, "morning", True),
+               db.feature_groups("morning"))[2] == (C,))
+
+
+def _gf_parse() -> None:
+    """`/set` 的参数解析。"""
+    from qq_rss_bot import features as _F  # noqa: PLC0415
+
+    check("编号能解析（`/set 1 off`）",
+          _F.resolve_feature(None, "1") == _F.FEATURES[0]
+          and _F.resolve_feature(None, "6") == _F.FEATURES[5],
+          str(_F.resolve_feature(None, "1")))
+    check("英文名也能（`/set morning on`）",
+          _F.resolve_feature(None, "morning") == "morning"
+          and _F.resolve_feature(None, "MORNING") == "morning")
+    check("★ 越界编号 / 不认识的名字 → None（不是抛，指令要能回一句人话）",
+          _F.resolve_feature(None, "0") is None
+          and _F.resolve_feature(None, "99") is None
+          and _F.resolve_feature(None, "早安") is None
+          and _F.resolve_feature(None, "") is None)
+    check("`on`/`off` 认，中文也认，乱码返回 None",
+          _F.parse_bool("on") is True and _F.parse_bool("off") is False
+          and _F.parse_bool("开") is True and _F.parse_bool("关") is False
+          and _F.parse_bool("x") is None)
+
+
+def _gf_repeater_dynamic() -> None:
+    """复读机的群列表必须是**动态**的 —— `/set` 改完要下一拍就生效。"""
+    from qq_rss_bot import repeat as _rp  # noqa: PLC0415
+
+    live = {"G1"}
+    r = _rp.Repeater(lambda: set(live))
+    check("取值函数形态可用（`groups` / `enabled` 每次都重算）",
+          r.enabled is True and r.groups == {"G1"}, str(r.groups))
+    r.consider("G1", "X", "A", now=0)
+    check("G1 开着时正常跟", r.consider("G1", "X", "B", now=1) == "X")
+
+    live.clear()
+    r2 = _rp.Repeater(lambda: set(live))
+    r2.consider("G1", "Y", "A", now=0)
+    check("★ 把 G1 关掉之后，同一个 Repeater **立刻**不跟了",
+          r2.consider("G1", "Y", "B", now=1) is None and r2.enabled is False)
+
+    live.add("G2")
+    check("★ 反过来：新打开的群立刻生效",
+          r2.enabled is True and r2.groups == {"G2"}, str(r2.groups))
+    check("  不在名单里的群 `consider` 直接返回 None（不推进状态）",
+          r2.consider("G1", "Z", "A", now=0) is None)
+
+    check("传 list/set 仍然可用（静态形态，测试和一次性脚本用）",
+          _rp.Repeater(["G1"]).groups == {"G1"}
+          and _rp.Repeater([]).enabled is False)
+
+
+def _gf_wiring() -> None:
+    """启动自报 + **每个 poller 都真的走库了**。
+
+    ⚠️ 这两类钉子缺一不可：行为测试全绿也可能只是「还在读 .env」——
+    那样 `/set` 对那个功能就是**失效的**，而且症状完全静默。
+    """
+    import inspect  # noqa: PLC0415
+
+    import qq_rss_bot.birthday as _bd  # noqa: PLC0415
+    import qq_rss_bot.birthday_art as _bda  # noqa: PLC0415
+    import qq_rss_bot.monday as _md  # noqa: PLC0415
+    import qq_rss_bot.morning as _mn  # noqa: PLC0415
+    import qq_rss_bot.tickets as _tk  # noqa: PLC0415
+    from qq_rss_bot.bot import RssBot as _RB  # noqa: PLC0415
+
+    ready = inspect.getsource(_RB.on_ready)
+    check("★ `on_ready` 里自报了「群列表来自数据库（.env 只用于首次灌入）」",
+          "群列表来自数据库" in ready and "只用于首次灌入" in ready, "")
+    check("★ 而且它同时是**灌入点**（summarize 会逐功能把 .env 灌进库）",
+          "features.summarize(self.db, features.defaults_from(self.cfg))" in ready,
+          "")
+
+    CASES = (
+        (_mn, "MorningPoller", "morning"),
+        (_md, "MondayPoller", "monday"),
+        (_bd, "BirthdayPoller", "birthday"),
+        (_bda, "BirthdayArtPoller", "birthday_art"),
+        (_tk, "TicketPoller", "tickets"),
+    )
+    for mod, cls_name, feature in CASES:
+        cls = getattr(mod, cls_name)
+        prop = inspect.getsource(cls.groups.fget)
+        check(f"★ {cls_name}.groups 走 features.groups_for({feature!r})",
+              f'groups_for(self.db, "{feature}"' in prop, prop.strip()[:70])
+
+        whole = inspect.getsource(cls)
+        stray = [
+            ln.strip() for ln in whole.splitlines()
+            if "_groups" in ln and "groups_for" not in ln
+        ]
+        check(f"★ {cls_name} 里 `cfg.X_groups` **只**出现在 groups 属性"
+              f"（别处还在读 .env 的话 `/set` 对它就是失效的）",
+              not stray, str(stray[:2]))
+
+
+def _gf_poller_respects_db() -> None:
+    """真把一个群从库里关掉 → poller 下一拍就不发了。**这是整个改动的目的。**"""
+    import dataclasses  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        mdir = _mn_dir(Path(td), idols=("mano",), per=1)
+        cfg = dataclasses.replace(
+            cfg_stub(), morning_groups=("G1", "G2"), morning_dir=mdir,
+            morning_time="07:30", morning_recent_days=7,
+        )
+        old_gap = _mn.MESSAGE_GAP_SEC
+        _mn.MESSAGE_GAP_SEC = 0
+        try:
+            db, s = _MorningDb(), _MorningSender()
+            n = asyncio.run(_mn.MorningPoller(cfg, db, s).poll_once(
+                now=datetime(2026, 10, 20, 7, 30)))
+            check("基线：`.env` 里那两个群都收到（首次灌入生效）",
+                  n == 2 and {g for g, _ in s.voices} == {"G1", "G2"},
+                  f"n={n} {s.voices}")
+
+            db.set_group_feature("G2", "morning", False)
+            s2 = _MorningSender()
+            n2 = asyncio.run(_mn.MorningPoller(cfg, db, s2).poll_once(
+                now=datetime(2026, 10, 21, 7, 30)))
+            check("★ 把 G2 从库里关掉 → **下一拍**就只发 G1（不用重启）",
+                  n2 == 1 and {g for g, _ in s2.voices} == {"G1"},
+                  f"n={n2} {s2.voices}")
+
+            db.set_group_feature("G1", "morning", False)
+            s3 = _MorningSender()
+            n3 = asyncio.run(_mn.MorningPoller(cfg, db, s3).poll_once(
+                now=datetime(2026, 10, 22, 7, 30)))
+            check("★ 两个都关掉 → 一条都不发（**不会退回 .env 重新打开**）",
+                  n3 == 0 and not s3.voices, f"n={n3} {s3.voices}")
+
+            db.set_group_feature("G1", "morning", True)
+            s4 = _MorningSender()
+            n4 = asyncio.run(_mn.MorningPoller(cfg, db, s4).poll_once(
+                now=datetime(2026, 10, 23, 7, 30)))
+            check("★ 再打开 → 下一拍又发了",
+                  n4 == 1 and {g for g, _ in s4.voices} == {"G1"},
+                  f"n={n4} {s4.voices}")
+        finally:
+            _mn.MESSAGE_GAP_SEC = old_gap
+
+
+_gf_seed_and_off()
+_gf_parse()
+_gf_repeater_dynamic()
+_gf_wiring()
+_gf_poller_respects_db()
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
