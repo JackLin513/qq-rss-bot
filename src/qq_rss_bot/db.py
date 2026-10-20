@@ -117,6 +117,27 @@ CREATE TABLE IF NOT EXISTS morning_posts (
     sent_at      TEXT NOT NULL,
     PRIMARY KEY (slot, group_openid)
 );
+
+-- 偶像生日推送。主键是 **(被祝福的那天, 群)**，**不是推送时刻** ——
+-- 23:05 推的是第二天的生日（见 birthday.py），按推送时刻记的话
+-- 「10-18 晚上推的 10-19 生日」和「10-19 晚上推的 10-19 生日」会分成两行，
+-- 而它们本来就是同一天，重试 / 重启时会重复发。
+CREATE TABLE IF NOT EXISTS birthday_posts (
+    day          TEXT NOT NULL,   -- 被祝福的那天，YYYY-MM-DD
+    group_openid TEXT NOT NULL,
+    tweet        TEXT NOT NULL,   -- 推文 id；**空串 = 没抓到图，发的是纯文字**
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (day, group_openid)
+);
+
+CREATE TABLE IF NOT EXISTS birthday_art_posts (
+    day          TEXT NOT NULL,   -- 被庆祝的那天（JST），YYYY-MM-DD
+    group_openid TEXT NOT NULL,
+    sent         INTEGER NOT NULL,-- 实际发出去几张（一条一张）
+    tweets       TEXT NOT NULL,   -- 逗号分隔的推文 id，诊断用
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (day, group_openid)
+);
 """
 
 # 老库缺的列。本项目没有成套迁移框架，但「加一列」这类向前兼容的改动
@@ -581,6 +602,80 @@ class Database:
         if last:
             out.add(last["idol"])
         return out
+
+    # ---------- 偶像生日推送 ----------
+
+    def birthday_posted(self, day: str) -> set[str]:
+        """这一天已经发过哪些群。`day` 是**被祝福的那天**，形如 `2026-10-19`。"""
+        rows = self._conn.execute(
+            "SELECT group_openid FROM birthday_posts WHERE day = ?", (day,)
+        ).fetchall()
+        return {row["group_openid"] for row in rows}
+
+    def mark_birthday_posted(self, day: str, group_openid: str, tweet: str) -> None:
+        """记下「这一天的生日推发给这个群了」。重复调用无副作用。
+
+        `tweet` 传空串表示**这条是没配图发的**，不是漏填 —— 排查时能分清
+        「当时没抓到图」和「当时压根没记」。
+        """
+        self._conn.execute(
+            """
+            INSERT INTO birthday_posts (day, group_openid, tweet, sent_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (day, group_openid) DO UPDATE SET
+                tweet = excluded.tweet,
+                sent_at = excluded.sent_at
+            """,
+            (day, group_openid, tweet, utcnow()),
+        )
+        self._conn.commit()
+
+    def birthday_art_posted(self, day: str) -> set[str]:
+        """这一天已经发过贺图的群。`day` 是**被庆祝的那天**（JST），形如 `2026-10-19`。
+
+        ⚠️ 键是**被庆祝的那天**，不是推送时刻 —— 和 `birthday_posts` 同一个理由：
+        重试 / 重启 / 跨零点都不会重复发。
+        """
+        rows = self._conn.execute(
+            "SELECT group_openid FROM birthday_art_posts WHERE day = ?", (day,)
+        ).fetchall()
+        return {row["group_openid"] for row in rows}
+
+    def clear_birthday_art(self, day: str, group_openid: str) -> bool:
+        """删掉「这一天发给这个群」的记录，返回**原来有没有**。
+
+        **只给探针重测用** —— 生产代码永远不该调它。记账的意义就是「同一天
+        同一个群不重复发」，删了就等于允许重发。`scripts/probe_birthday_art.py`
+        的 `--reset` 走这条路：改完挑选规则想拿同一天重测，不清账就会被
+        `poll_once` 直接挡回来（返回 0，看起来像「什么都没发」）。
+        """
+        cur = self._conn.execute(
+            "DELETE FROM birthday_art_posts WHERE day = ? AND group_openid = ?",
+            (day, group_openid),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_birthday_art(
+        self, day: str, group_openid: str, sent: int, tweets: str
+    ) -> None:
+        """记下「这一天的贺图发给这个群了」。
+
+        `sent` 是**真的发出去了几张**（中间某张挂掉时会小于总数），
+        `tweets` 是那几张的推文 id —— 排查「今天为什么只有 3 张」时要靠它。
+        """
+        self._conn.execute(
+            """
+            INSERT INTO birthday_art_posts (day, group_openid, sent, tweets, sent_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (day, group_openid) DO UPDATE SET
+                sent = excluded.sent,
+                tweets = excluded.tweets,
+                sent_at = excluded.sent_at
+            """,
+            (day, group_openid, sent, tweets, utcnow()),
+        )
+        self._conn.commit()
 
     # ---------- 出错时私聊谁 ----------
 

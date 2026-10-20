@@ -13,9 +13,50 @@
     data/morning/audio/mano_1.silk
     data/morning/audio/hiori_0.silk
 
-**运行时只认文件名，不读 `lines.toml`、不读 manifest、不读读音表。**
-这样少一个「索引说有、文件没同步过去」的脏状态；代价是日志里只有 `idol_id`
-和文件名，没有台词原文 —— 够排查了。
+## 一条早安 = 两条消息（2026-10-20 起）
+
+原本只发一条语音。**群里没人点开听**，所以改成：
+
+    ① msg_type=7：头像 + 「角色名\n日语原文」     ← send_local_image
+    ② msg_type=7：语音                            ← send_voice
+
+`msg_type=7` 的 `MediaInfo` 只有一个 `file_info`，一条只能带一个媒体，
+所以必然是两条。**图片那条的 `content` 是渲染的**（实测过），文字就搭在图上。
+
+**不走 markdown**：markdown 的图必须公网 URL，QQ 自己派服务器去拉，
+本地文件一个字节都送不进去 —— 而头像就是本地文件。180×180 在 `msg_type=7`
+下渲染出来的大小客户端自己定，实测**够用**，所以 `#Wpx #Hpx` 那套用不上。
+
+### 头像
+
+`data/morning/avatar/<偶像 id>.png`，180×180，**按 id 直接取文件，不扫目录**。
+用 `scripts/crop_morning_avatar.py` 从官方立绘大图裁（Mac 上离线跑，用 ffmpeg）。
+
+### 文字从哪来 —— ⚠️ manifest 成了运行时输入
+
+角色名和日语原文都在 `data/morning/.manifest.json` 里，**键就是 silk 文件名**
+（`line.name`），不做任何索引换算。`name` 是 2026-10-20 才加的字段，
+老记录用 `scripts/backfill_morning_names.py` 补，**不用重跑 TTS**。
+
+⚠️ 这意味着 manifest **必须跟 `audio/` 一起同步到 NAS**。缺了的症状是
+「文字静默消失」，所以拿不到文字时**退回纯语音**（= 加这个功能之前的行为，
+不是发一条光秃秃的图），并且打一条 WARNING。
+
+`ja` 带 TTS 语气提示（`[softly] ` 之类），**发到群里要剥掉** —— 那是喂给
+TTS 的，不是给人看的。
+
+### 失败语义
+
+| 哪一条挂了 | 行为 |
+|---|---|
+| **① 头像+文字** | 抛出去 → 这一轮**不记账**，窗口内下一拍重试 |
+| **② 语音** | 只记 WARNING，**照样记账** —— 头像已经发出去了，再退一次就是重复刷屏 |
+
+逐群隔离：一个群失败不连累别的群。和 `birthday_art` / `monday` 同一条规矩。
+
+## 时间用本地时间（`Asia/Shanghai`）
+
+不涉及日本时间。别照抄`ticket`那套 JST 换算。
 
 ## ⚠️ silk 魔数闸是这条路上**唯一的把关**
 
@@ -34,10 +75,6 @@ mp3 / wav / m4a、甚至 `\\x02#!SILK_V3` 后面接两千个零字节的**纯垃
 窗口 180 秒只覆盖调度抖动。07:33 之后起来的就当今天没发 ——
 九点钟补一条「早上好」比不补更怪。这和 `monday.py` 同一个取舍。
 
-## 时间用本地时间（`Asia/Shanghai`）
-
-不涉及日本时间。别照抄`ticket`那套 JST 换算。
-
 ## 版权
 
 `data/morning/` 整个是**不提交**的：`source/` 是从 [Sallyn0225/eidolon-sc]
@@ -50,8 +87,10 @@ mp3 / wav / m4a、甚至 `\\x02#!SILK_V3` 后面接两千个零字节的**纯垃
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import re
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
@@ -60,6 +99,18 @@ _log = logging.getLogger("qq_rss_bot.morning")
 
 # silk 的文件头。QQ 语音要的就是这个格式，**这条路唯一的格式校验点**。
 SILK_MAGIC = b"\x02#!SILK_V3"
+
+# 角色名 + 日语原文的索引。**运行时要读**（见模块说明），键是 silk 文件名。
+MANIFEST_NAME = ".manifest.json"
+
+# 头像+文字 和 语音 两条之间的间隔。挨太近客户端可能把气泡叠在一起
+# （2026-10-20 手工实测用的就是 2 秒）。**没有反例证明非它不可**，
+# 但留着的成本只有每群两秒，比顺序乱了强。
+MESSAGE_GAP_SEC = 2.0
+
+# TTS 语气提示的形态：`[softly] ` / `[cheerfully] `。**只给 TTS 用**，
+# 发到群里得剥掉。上游只保证英文、字母/空格/逗号/撇号/连字符。
+_CUE = re.compile(r"\[[A-Za-z][A-Za-z ,'-]*\]\s*")
 
 DEFAULT_TIME = "07:30"
 # 只容忍**调度抖动**（tick 60 秒，窗口 180 秒保证至少落到一次）。
@@ -143,6 +194,55 @@ def list_voices(directory: Path) -> dict[str, list[Path]]:
     return out
 
 
+def strip_cue(ja: str) -> str:
+    """`[softly] あ……おはよう` → `あ……おはよう`。
+
+    语气提示是喂给 TTS 的，不是给人看的 —— 直接发到群里只会显得莫名其妙。
+    """
+    return _CUE.sub("", ja).strip()
+
+
+def load_lines(morning_dir: Path) -> dict[str, dict]:
+    """读 `.manifest.json` → `{silk 文件名: {"name": 角色名, "ja": 日语原文}}`。
+
+    **键就是文件名** —— 运行时手里正好有 `line.name`，不用做任何索引换算，
+    也就没有「第几条对第几条」这种会错位的东西。
+
+    读不到就返回空 dict，**不抛**：早安这条的主体是语音，文字没了不该连语音
+    一起不发。调用方（`MorningPoller`）会打 WARNING，不静默。
+    """
+    path = morning_dir / MANIFEST_NAME
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        _log.warning("早安：%s 读不了，这轮只发语音", path)
+        return {}
+    if not isinstance(data, dict):
+        _log.warning("早安：%s 不是一个对象，这轮只发语音", path)
+        return {}
+    out: dict[str, dict] = {}
+    for fname, rec in data.items():
+        if not isinstance(rec, dict):
+            continue
+        out[fname] = {
+            "name": str(rec.get("name") or ""),
+            "ja": strip_cue(str(rec.get("ja") or "")),
+        }
+    return out
+
+
+def render_content(rec: dict | None) -> str:
+    """`{"name": …, "ja": …}` → `"角色名\\n日语原文"`。缺哪行就少哪行。
+
+    两行**都是空**时返回 `""` —— 调用方据此退回纯语音（见 `poll_once`）。
+    """
+    if not rec:
+        return ""
+    return "\n".join(x for x in (rec.get("name", ""), rec.get("ja", "")) if x)
+
+
 def pick_idol(voices: dict[str, list[Path]], recent: set[str]) -> str:
     """随机挑一位，**尽量避开最近发过的**。
 
@@ -186,9 +286,10 @@ def slot_for(now: datetime, at: time | None = None) -> datetime:
 
 
 class MorningPoller:
-    """每天一次的早安语音。和 `MondayPoller` / `TicketPoller` 同形。
+    """每天一次的早安：一条「头像 + 角色名 + 日语原文」，一条语音。
 
-    单独一个 task，不塞进 `FeedPoller` —— 数据源、节奏、失败语义都不一样。
+    和 `MondayPoller` / `TicketPoller` 同形，单独一个 task，不塞进 `FeedPoller`
+    —— 数据源、节奏、失败语义都不一样。
     """
 
     def __init__(self, cfg, db, sender) -> None:
@@ -196,17 +297,27 @@ class MorningPoller:
         self.db = db
         self.sender = sender
         self._stopped = asyncio.Event()
-        # 同一个 slot 只警告一次。窗口内会醒好几次，不记的话
-        # 「目录空 / 全是坏文件」会每分钟刷一条。
-        self._warned_slot: str | None = None
+        # 同一个 slot 只警告一次。窗口内会醒好几次，不记的话会每分钟刷一条。
+        # 三条各自记 —— 用同一个 key 的话，「目录空」会把「缺头像」盖掉。
+        self._warned_slot: str | None = None      # 目录空 / 全是坏文件
+        self._warned_text: str | None = None      # 读不到角色名 / 原文
+        self._warned_avatar: str | None = None    # 缺这位偶像的头像
 
     @property
     def enabled(self) -> bool:
         return bool(self.cfg.morning_enabled and self.cfg.morning_groups)
 
     @property
+    def morning_dir(self) -> Path:
+        return Path(self.cfg.morning_dir)
+
+    @property
     def audio_dir(self) -> Path:
-        return Path(self.cfg.morning_dir) / "audio"
+        return self.morning_dir / "audio"
+
+    @property
+    def avatar_dir(self) -> Path:
+        return self.morning_dir / "avatar"
 
     def stop(self) -> None:
         self._stopped.set()
@@ -220,6 +331,22 @@ class MorningPoller:
             self.cfg.morning_time,
             len(self.cfg.morning_groups),
             self.audio_dir,
+        )
+        # 头像和 manifest 都是**可选**的（缺了退回纯语音），但缺了要让人知道，
+        # 所以在启动时就把状态打出来，不用等出问题才发现。
+        lines = load_lines(self.morning_dir)
+        avatars = (
+            len(list(self.avatar_dir.glob("*.png"))) if self.avatar_dir.is_dir() else 0
+        )
+        _log.info(
+            "早安：台词表 %s（%d 条），头像 %d 张 —— %s",
+            "读到了" if lines else f"没读到（{self.morning_dir / MANIFEST_NAME}）",
+            len(lines),
+            avatars,
+            "发「头像+文字+语音」"
+            if lines and avatars
+            else "**只有语音**（缺台词表或头像，跑 scripts/backfill_morning_names.py "
+                 "和 scripts/crop_morning_avatar.py）",
         )
         while not self._stopped.is_set():
             try:
@@ -269,16 +396,63 @@ class MorningPoller:
         idol = pick_idol(voices, recent)
         line = pick_line(voices[idol], self.db.morning_last_line())
 
+        # 文字：角色名 + 日语原文，从 manifest 按**文件名**取（不用索引换算）。
+        content = render_content(load_lines(self.morning_dir).get(line.name))
+
+        # 头像：按 id 直接取文件，**不扫目录**。缺了退回纯语音，不静默。
+        avatar = self.avatar_dir / f"{idol}.png"
+        if not avatar.is_file():
+            if self._warned_avatar != slot_key:
+                self._warned_avatar = slot_key
+                _log.warning(
+                    "早安：没有 %s 的头像，今天只发语音。"
+                    "跑 scripts/crop_morning_avatar.py 裁一批，再同步到 NAS",
+                    avatar,
+                )
+            avatar = None
+
+        # 文字拿不到就**整条退回纯语音**（= 加这个功能之前的行为），
+        # 而不是发一条光秃秃的图 —— 没文字的头像不如不发。
+        if not content:
+            if self._warned_text != slot_key:
+                self._warned_text = slot_key
+                _log.warning(
+                    "早安：%s 里没有 %s 的角色名/原文，今天只发语音。"
+                    "跑 scripts/backfill_morning_names.py 补，再同步到 NAS",
+                    self.morning_dir / MANIFEST_NAME,
+                    line.name,
+                )
+            avatar = None
+
         sent = 0
         for group in targets:
             # 逐群隔离：一个群发不出去（配额、权限、接口抖动）不能连累别的群。
-            # 失败**不记账**，窗口内下一次 tick 会重试；窗口过了就当今天没发。
             try:
-                await self.sender.send_voice(group, line)
+                if avatar is None:
+                    await self.sender.send_voice(group, line)
+                else:
+                    # ① 头像 + 文字。这一条挂了整轮不算数 —— 不记账，
+                    # 窗口内下一拍会重试。
+                    await self.sender.send_local_image(group, content, avatar)
+                    await asyncio.sleep(MESSAGE_GAP_SEC)
+                    # ② 语音。这一条挂了**只记 WARNING、照样记账** ——
+                    # 头像已经发出去了，再退一次就是重复刷屏。
+                    try:
+                        await self.sender.send_voice(group, line)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.warning(
+                            "早安：语音没发出去（头像已发，不重试）→ %s: %s",
+                            group[:8], exc,
+                        )
             except Exception as exc:  # noqa: BLE001
                 _log.warning("早安：发送失败 → %s: %s", group[:8], exc)
                 continue
             self.db.mark_morning_posted(slot_key, group, idol, line.name)
             sent += 1
-            _log.info("早安：已推送 %s（%s）→ %s", idol, line.name, group[:8])
+            _log.info(
+                "早安：已推送 %s（%s，%s）→ %s",
+                idol, line.name,
+                "头像+文字+语音" if avatar is not None else "纯语音",
+                group[:8],
+            )
         return sent

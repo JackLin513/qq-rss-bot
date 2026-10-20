@@ -64,7 +64,11 @@ mp3 分片方便。我们是离线一次性拿整段，`wav` 少一次有损转�
 
 `data/morning/.manifest.json` 记每条台词的 `sha256(voice_id + model + ja)[:16]`
 —— **`ja` 含语气提示**，因为提示也进 TTS 输入，改提示等于改了音频。
-manifest 只在离线用，**运行时不读**。改一条台词只会重合成那一条。
+改一条台词只会重合成那一条。
+
+⚠️ **manifest 现在运行时要读**（早安那条要发「角色名 + 日语原文」，
+见 `morning.load_lines`）—— 所以它得跟 `audio/` 一起同步到 NAS，
+缺了不会报错，只是**文字静默消失**（`MorningPoller` 会打一条 WARNING）。
 """
 
 from __future__ import annotations
@@ -623,6 +627,11 @@ async def main() -> int:
                         "key": lkey, "idol": idol["id"], "line": n,
                         "voice_id": idol["voice_id"], "model": args.model,
                         "ja": ja, "bytes": len(silk),
+                        # 角色显示名。运行时发「头像 + 角色名 + 日语原文」要用，
+                        # 所以 manifest 从「只在离线用」变成了**运行时要读的索引**
+                        # （见 morning.load_lines）。只补这一项的话不用重合成 ——
+                        # 跑 scripts/backfill_morning_names.py。
+                        "name": idol.get("name", ""),
                     }
                     done += 1
                     print(f"  ✅ {label}  {len(silk):,} 字节  {ja}")

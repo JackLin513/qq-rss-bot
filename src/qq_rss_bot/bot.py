@@ -35,6 +35,8 @@ from .scheduler import (
 )
 from . import monday as monday_module
 from . import morning as morning_module
+from .birthday import BirthdayPoller
+from .birthday_art import BirthdayArtPoller
 from .monday import MondayPoller
 from .morning import MorningPoller
 from .tickets import TicketPoller
@@ -117,6 +119,19 @@ class RssBot(botpy.Client):
         # 立刻返回，等于功能关闭。
         self.morning = MorningPoller(cfg, self.db, self.sender)
         self._morning_task: Any = None
+        # 偶像生日推送。同样单独一个 task。它和上面几个的**唯一结构差别**是
+        # 要自己去抓推文，所以多收一个 **`media_http`**（带代理的那个）——
+        # 容器直连 x.com / pbs.twimg.com 全不通，见 birthday.py 的模块说明。
+        self.birthday = BirthdayPoller(cfg, self.db, self.sender, self.media_http)
+        self._birthday_task: Any = None
+        # 誕生祭贺图：**带 cookie 直接打 X 的 GraphQL**（不是 RSS，也不是爬 HTML），
+        # 所以同样收 `media_http`（带代理的那个）。多一个 `notifier` 是因为
+        # **cookie 失效的症状是「群里今天没图」**，和「今天真没人画」长得一样，
+        # 只能走私聊告警。见 birthday_art.py 的模块说明。
+        self.birthday_art = BirthdayArtPoller(
+            cfg, self.db, self.sender, self.media_http, notifier=self.notifier
+        )
+        self._birthday_art_task: Any = None
 
     # ---------- 生命周期 ----------
 
@@ -139,6 +154,14 @@ class RssBot(botpy.Client):
         if self._morning_task is None:
             self._morning_task = self.loop.create_task(
                 self.morning.run(), name="qq_rss_bot.morning"
+            )
+        if self._birthday_task is None:
+            self._birthday_task = self.loop.create_task(
+                self.birthday.run(), name="qq_rss_bot.birthday"
+            )
+        if self._birthday_art_task is None:
+            self._birthday_art_task = self.loop.create_task(
+                self.birthday_art.run(), name="qq_rss_bot.birthday_art"
             )
         if self.autosub.enabled:
             # **先挂 poller 再补订阅**：补订阅万一抛异常，不能连累轮询器起不来。
@@ -239,6 +262,12 @@ class RssBot(botpy.Client):
         self.morning.stop()
         if self._morning_task is not None:
             self._morning_task.cancel()
+        self.birthday.stop()
+        if self._birthday_task is not None:
+            self._birthday_task.cancel()
+        self.birthday_art.stop()
+        if self._birthday_art_task is not None:
+            self._birthday_art_task.cancel()
         await self.rss_http.aclose()
         await self.media_http.aclose()
         self.db.close()

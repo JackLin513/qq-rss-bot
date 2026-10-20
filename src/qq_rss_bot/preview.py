@@ -336,7 +336,8 @@ async def _lookup_twitter(
             author_line = name or (f"@{handle}" if handle else "")
 
         # 正文：`text` 是给展示用的（已经有 t.co 展开），`raw_text` 是原始的。
-        text = str(tweet.get("text") or tweet.get("raw_text") or "").strip()
+        # ⚠️ 别写成 `str(text or raw_text or "")` —— 见 `_tweet_text`。
+        text = _tweet_text(tweet)
         stats = [
             _count_line("点赞", tweet.get("likes")),
             _count_line("转发", tweet.get("retweets")),
@@ -490,6 +491,48 @@ def _count_line(label: str, value: object) -> str:
     except (TypeError, ValueError):
         return ""
     return f"{label} {fmt_count(n)}" if n >= 0 else ""
+
+
+# 「整段只有 t.co 链接」—— 纯图推的 raw_text 长这样，显示出来毫无意义。
+_TCO_ONLY_RE = re.compile(r"^(?:https?://t\.co/\w+\s*)+$")
+
+
+def _raw_text(tweet: dict) -> str:
+    """`raw_text` **两种形态都要吃**：老版 API 是字符串，新版是对象
+    `{"text": ..., "display_text_range": [...], "facets": [...]}`。"""
+    raw = tweet.get("raw_text")
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        inner = raw.get("text")
+        return inner if isinstance(inner, str) else ""
+    return ""
+
+
+def _tweet_text(tweet: dict) -> str:
+    """推文正文（展示用）。拿不到就返回空串。
+
+    ⚠️⚠️ **`raw_text` 是新版 fxtwitter 的**对象**，不是字符串。**
+    老代码是 `str(tweet.get("text") or tweet.get("raw_text") or "")` ——
+    正文非空时走不到那个回退，所以**平时完全看不出来**；但**纯图片推的
+    `text` 是空串**，一落到回退就把整个 dict `str()` 出来，群里收到的是
+    Python 的 repr：
+
+        {'text': 'https://t.co/61cVhplQpn', 'display_text_range': [0, 0],
+         'facets': [{'type': 'media', ...}]}
+
+    实测 2026-10-20 `@latiechi` 那条纯图推（9913 赞、一张图）就是这个症状。
+
+    纯图推的 `raw_text.text` 就是那个 t.co 图片链接，显示出来一样难看，
+    所以「整段只是一串 t.co」也当没有正文 —— 卡片退化成
+    「作者 + 数据 + 链接」，**图照发**（图走 `media`，和正文无关）。
+    """
+    for cand in (tweet.get("text"), _raw_text(tweet)):
+        if isinstance(cand, str):
+            text = cand.strip()
+            if text and not _TCO_ONLY_RE.match(text):
+                return text
+    return ""
 
 
 def _trim(text: str, limit: int = _MAX_TWEET_CHARS) -> str:

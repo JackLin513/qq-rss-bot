@@ -2584,6 +2584,32 @@ _FX_OK = {
 # 同一条的「无图」版本
 _FX_NO_PHOTO = {**_FX_OK, "tweet": {**_FX_OK["tweet"], "media": None}}
 
+# ★ **纯图推**（没有正文）。抄的是 2026-10-20 群里那条 @latiechi（9913 赞）。
+#   ⚠️ 新版 fxtwitter 的 `raw_text` 是**对象**不是字符串，而纯图推的 `text`
+#   是**空串** —— 老代码的回退 `str(text or raw_text or "")` 会把整个 dict
+#   `str()` 出来，群里收到的是 Python 的 repr。见 `preview._tweet_text`。
+_FX_NO_TEXT = {
+    **_FX_OK,
+    "tweet": {
+        **_FX_OK["tweet"],
+        "text": "",
+        "raw_text": {
+            "text": "https://t.co/61cVhplQpn",
+            "display_text_range": [0, 0],
+            "facets": [
+                {
+                    "type": "media",
+                    "indices": [0, 23],
+                    "id": "2112154440102981632",
+                    "display": "pic.x.com/61cVhplQpn",
+                    "original": "https://t.co/61cVhplQpn",
+                    "replacement": "https://x.com/latiechi/status/2112154450785886658/photo/1",
+                }
+            ],
+        },
+    },
+}
+
 # 三张配图的推文 —— 多图那条路的主力 fixture
 _FX_MULTI = {
     **_FX_OK,
@@ -2863,6 +2889,37 @@ async def _check_media_preview_inner() -> None:
     check("★ 无图时 msg_type=2（markdown）", sent.get("msg_type") == 2, repr(sent))
     check("markdown 是外层 content 包裹", "content" in (sent.get("markdown") or {}), repr(sent))
     check("markdown 里没有 media", "media" not in sent, repr(list(sent)))
+
+    # --- ★★ 纯图推（没有正文）：绝不能把 raw_text 那个 dict 打出来 ---
+    # 实测 2026-10-20 群里 @latiechi 那条（9913 赞、一张图）就是被这个坑到的：
+    # 卡片第一行是
+    #   {'text': 'https://t.co/61cVhplQpn', 'display_text_range': [0, 0], 'facets': [...]}
+    check("★ 纯图推：_tweet_text 拿不到正文就返回空串，**不是 dict 的 repr**",
+          _pv._tweet_text(_FX_NO_TEXT["tweet"]) == "",
+          repr(_pv._tweet_text(_FX_NO_TEXT["tweet"])))
+    check("★ 正文非空时照常取 text（回退根本不该走到）",
+          _pv._tweet_text(_FX_OK["tweet"]).startswith("No one is born"))
+    check("老版 API 的 raw_text 是字符串，也要吃",
+          _pv._tweet_text({"raw_text": "老版正文"}) == "老版正文")
+    check("text 缺失但 raw_text 是对象时，取里面的 text",
+          _pv._tweet_text({"raw_text": {"text": "对象里的正文"}}) == "对象里的正文")
+    check("★ 整段只有 t.co 链接 → 当没有正文（纯图推的 raw_text 就是它）",
+          _pv._tweet_text({"raw_text": {"text": "https://t.co/abc123"}}) == "")
+    check("★ raw_text 是 null / 缺字段 / 数字 都不炸",
+          [_pv._tweet_text({"raw_text": v}) for v in (None, 42, [], {})] == ["", "", "", ""])
+
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_TEXT, image=b"\xff\xd8t"), api)
+    check("纯图推也返回「回了」（图照发）", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    body = (api.sent[0].get("content") or "")
+    check("★ 卡片正文里没有 `{`（dict 的痕迹）", "{" not in body, repr(body))
+    check("★ 也没有 `raw_text` / `display_text_range` / `facets` 这些字段名",
+          not any(k in body for k in ("raw_text", "display_text_range", "facets")), repr(body))
+    check("★ 正文退化成「作者 + 数据 + 链接」，图还在",
+          "Barack Obama (@BarackObama)" in body and "点赞" in body
+          and body.rstrip().endswith("status/896523232098078720"),
+          repr(body))
+    check("★ 纯图推的图还是照传（图走 media，和正文无关）", len(api.uploaded) == 1)
 
     # --- QQ 的 5M 直传上限 ---
     # 官方对 `file_data` 的原话是「直接上传二进制有大小限制，需要在 5M 以内」，
@@ -5713,25 +5770,72 @@ class _MorningDb:
 
 
 class _MorningSender:
-    """假 sender。`fail` 里的群发语音抛异常（验逐群隔离）。"""
+    """假 sender。`fail` 里的群发语音抛异常、`fail_image` 里的发图抛异常。
 
-    def __init__(self, fail: set[str] | None = None) -> None:
+    `send_local_image` 是 2026-10-20 加早安卡片之后才被用到的 ——
+    在此之前 `MorningPoller` 只会调 `send_voice`，所以这个假类**曾经没有它**，
+    于是 1299 项里**没有一条**走过「头像+文字」那条路（缺方法会 AttributeError，
+    但那时所有用例的 `avatar` 都是 None，根本走不到）。加卡片必须补上这个假方法。
+    """
+
+    def __init__(
+        self, fail: set[str] | None = None, fail_image: set[str] | None = None,
+    ) -> None:
         self.voices: list[tuple[str, str]] = []
-        self.attempts: list[tuple[str, str]] = []   # 含失败的
+        self.images: list[tuple[str, str, str]] = []   # (群, 文字, 图片路径)
+        self.attempts: list[tuple[str, str]] = []      # 含失败的语音
+        self.events: list[tuple[str, str]] = []        # **真正到达的顺序**
         self.fail = fail or set()
+        self.fail_image = fail_image or set()
 
     async def send_voice(self, group: str, path) -> None:
         self.attempts.append((group, str(path)))
         if group in self.fail:
             raise RuntimeError("模拟发送失败")
         self.voices.append((group, str(path)))
+        self.events.append(("voice", group))
+
+    async def send_local_image(self, group: str, content: str, path) -> None:
+        if group in self.fail_image:
+            raise RuntimeError("模拟发图失败")
+        self.images.append((group, content, str(path)))
+        self.events.append(("image", group))
+
+
+# 假 manifest 用的角色名。**故意让 `ja` 带 `[softly] ` 语气提示** ——
+# 「发到群里之前要把提示剥掉」这件事必须在这一层就被测到。
+_MN_NAMES = {"mano": "櫻木真乃", "hiori": "風野灯織", "meguru": "八宮めぐる"}
+_MN_JA = "おはよう、プロデューサーさん"
+# 假的 180×180 PNG 字节。假 sender 不看内容，但**真 sender 会读**
+# （`bot.send_local_image` 要 base64 它、还要量 base64 之后的长度）。
+_MN_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 512
+
+
+def _mn_write_manifest(mdir: Path, mapping: dict) -> None:
+    """往 `morning/.manifest.json` 写一份**任意**内容（覆盖）。
+
+    给边界用例用（坏 JSON、顶层是数组、记录不是对象、缺 `name`……），
+    这些形态 `_mn_dir` 的 `names=True` 造不出来。
+    """
+    import json  # noqa: PLC0415
+
+    mdir.mkdir(parents=True, exist_ok=True)
+    (mdir / ".manifest.json").write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+    )
 
 
 def _mn_dir(
     tmp: Path, *, idols: tuple[str, ...] = ("mano",), per: int = 2,
     bad_magic: bool = False, appledouble: bool = False,
+    avatars: bool = False, names: bool = False,
 ) -> Path:
-    """造一个 `morning/` 目录（只填 `audio/`）。返回值给 `morning_dir` 用。"""
+    """造一个 `morning/` 目录。**默认只填 `audio/`。**
+
+    `avatars` / `names` 要**显式打开**，这不是懒：两个开关都关着时
+    `MorningPoller` 走的是**纯语音**那条老路，而绝大多数用例要的就是那条路。
+    默认打开的话所有老用例都会变成「发图+语音」，断言全得跟着改。
+    """
     from qq_rss_bot import morning as _mn  # noqa: PLC0415
 
     d = tmp / "morning" / "audio"
@@ -5748,6 +5852,19 @@ def _mn_dir(
     if appledouble:
         # macOS 的 tar / Finder 带出来的，**同样以 .silk 结尾**
         (d / "._mano_0.silk").write_bytes(b"\x00\x05\x16\x07")
+    if avatars:
+        ad = tmp / "morning" / "avatar"
+        ad.mkdir(parents=True, exist_ok=True)
+        for iid in idols:
+            (ad / f"{iid}.png").write_bytes(_MN_PNG)
+    if names:
+        # 键就是 silk 文件名 —— 运行时手里正好有 `line.name`，不用索引换算。
+        _mn_write_manifest(
+            tmp / "morning",
+            {f"{iid}_{n}.silk": {"name": _MN_NAMES.get(iid, iid),
+                                 "ja": f"[softly] {_MN_JA}"}
+             for iid in idols for n in range(per)},
+        )
     return tmp / "morning"
 
 
@@ -5964,6 +6081,266 @@ def _check_mn_send_voice() -> None:
     asyncio.run(run())
 
 
+def _check_mn_card() -> None:
+    """早安卡片：`avatar/` + `.manifest.json` 都在时走「头像+文字」那条路。
+
+    ⚠️ **这一节是补课。** 加卡片之前 `_MorningSender` 连 `send_local_image`
+    都没有、`_mn_dir` 也不造 `avatar/`，所以那一千多项里**没有一条**走过
+    「头像+文字」—— 缺方法会 AttributeError，但那时所有用例的 `avatar`
+    都是 None，根本走不到那条分支。
+    """
+    import dataclasses  # noqa: PLC0415
+    import inspect  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+
+    from qq_rss_bot import morning as _mn  # noqa: PLC0415
+
+    # ---- 纯函数：剥 TTS 语气提示 ----
+    check("★ `[softly] ` 剥掉 —— 那是喂 TTS 的，不是给人看的",
+          _mn.strip_cue("[softly] あ……おはよう") == "あ……おはよう",
+          repr(_mn.strip_cue("[softly] あ……おはよう")))
+    check("提示里允许逗号/撇号/连字符（上游只保证这几个字符）",
+          _mn.strip_cue("[cheerfully, don't-stop] おはよう") == "おはよう",
+          repr(_mn.strip_cue("[cheerfully, don't-stop] おはよう")))
+    check("没有提示时原样返回", _mn.strip_cue("おはよう") == "おはよう")
+    check("★ 中文方括号**不是**提示（上游只认英文字母），原样留着",
+          _mn.strip_cue("[高兴] おはよう") == "[高兴] おはよう",
+          repr(_mn.strip_cue("[高兴] おはよう")))
+    check("提示后面没词时剥成空串（上游：句尾提示永远不发音）",
+          _mn.strip_cue("[softly]") == "", repr(_mn.strip_cue("[softly]")))
+
+    # ---- 纯函数：拼正文 ----
+    check("★ 正文是「角色名\\n日语原文」两行",
+          _mn.render_content({"name": "櫻木真乃", "ja": "おはよう"})
+          == "櫻木真乃\nおはよう",
+          repr(_mn.render_content({"name": "櫻木真乃", "ja": "おはよう"})))
+    check("缺角色名就少一行（不补空行）",
+          _mn.render_content({"name": "", "ja": "おはよう"}) == "おはよう")
+    check("缺原文就少一行", _mn.render_content({"name": "櫻木真乃"}) == "櫻木真乃")
+    check("★ 两行都空 → 空串（调用方据此退回纯语音）",
+          _mn.render_content({"name": "", "ja": ""}) == "")
+    check("None / 空 dict → 空串",
+          _mn.render_content(None) == "" and _mn.render_content({}) == "")
+
+    # ---- load_lines：读不到一律返回空 dict，**不抛** ----
+    with tempfile.TemporaryDirectory() as td:
+        mdir = Path(td) / "morning"
+        check("★ manifest 不存在 → `{}`（不抛，语音照发）",
+              _mn.load_lines(mdir) == {}, str(_mn.load_lines(mdir)))
+        mdir.mkdir(parents=True)
+        (mdir / ".manifest.json").write_text("{ 这不是 json")
+        check("★ JSON 坏了 → `{}`（不抛）", _mn.load_lines(mdir) == {})
+        _mn_write_manifest(mdir, ["不是对象"])
+        check("★ 顶层不是对象 → `{}`", _mn.load_lines(mdir) == {})
+        _mn_write_manifest(mdir, {"a.silk": "不是对象",
+                                  "b.silk": {"name": "B", "ja": "x"}})
+        check("★ 单条记录不是对象 → 跳过那一条，其余照收",
+              list(_mn.load_lines(mdir)) == ["b.silk"], str(_mn.load_lines(mdir)))
+        _mn_write_manifest(mdir, {"c.silk": {"ja": "おはよう"}})
+        check("缺 `name` → 空串（不是 None，也不 KeyError）",
+              _mn.load_lines(mdir)["c.silk"]["name"] == "")
+        _mn_write_manifest(mdir, {"d.silk": {"name": "D", "ja": "[softly] おはよう"}})
+        check("★ `load_lines` 就把提示剥掉了（不是发的时候才剥）",
+              _mn.load_lines(mdir)["d.silk"]["ja"] == "おはよう",
+              repr(_mn.load_lines(mdir)["d.silk"]["ja"]))
+        _mn_write_manifest(mdir, {"e.silk": {"name": None, "ja": None}})
+        check("`name` / `ja` 是 null → 空串（`or \"\"` 兜住）",
+              _mn.load_lines(mdir)["e.silk"] == {"name": "", "ja": ""},
+              str(_mn.load_lines(mdir)["e.silk"]))
+        check("★ 键**就是文件名**，不做任何索引换算",
+              list(_mn.load_lines(mdir)) == ["e.silk"], str(list(_mn.load_lines(mdir))))
+
+    # ---- 轮询器：走「头像+文字+语音」那条路 ----
+    base = dataclasses.replace(cfg_stub(), morning_time="07:30",
+                               morning_recent_days=7)
+    old_gap = _mn.MESSAGE_GAP_SEC
+    _mn.MESSAGE_GAP_SEC = 0        # 别让 smoke 真等 2 秒 × 群数
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            mdir = _mn_dir(Path(td), idols=("mano", "hiori"), per=2,
+                           avatars=True, names=True)
+            cfg = dataclasses.replace(base, morning_groups=("G1",), morning_dir=mdir)
+            db, sender = _MorningDb(), _MorningSender()
+            n = asyncio.run(_mn.MorningPoller(cfg, db, sender).poll_once(
+                now=datetime(2026, 10, 20, 7, 30)))
+
+            check("★ 一个群发**两条**：图一条、语音一条",
+                  n == 1 and len(sender.images) == 1 and len(sender.voices) == 1,
+                  f"n={n} images={sender.images} voices={sender.voices}")
+            check("★ 到达顺序是 image → voice（反了群里看着莫名其妙）",
+                  sender.events == [("image", "G1"), ("voice", "G1")],
+                  str(sender.events))
+            idol = Path(sender.images[0][2]).stem
+            check("★ 图和语音是**同一位偶像**（选人在循环外，不会错位）",
+                  Path(sender.voices[0][1]).stem.rpartition("_")[0] == idol,
+                  f"{sender.images[0][2]} vs {sender.voices[0][1]}")
+            check("★ 正文 = 角色名 + 剥过提示的原文",
+                  sender.images[0][1] == f"{_MN_NAMES[idol]}\n{_MN_JA}",
+                  repr(sender.images[0][1]))
+            check("头像按 id 取 `avatar/<偶像 id>.png`",
+                  Path(sender.images[0][2]).parent.name == "avatar"
+                  and Path(sender.images[0][2]).name == f"{idol}.png",
+                  sender.images[0][2])
+            check("记账记的是 **silk 文件名**，不是索引",
+                  db.rows[0][3] == Path(sender.voices[0][1]).name, str(db.rows))
+
+            s2 = _MorningSender()
+            n2 = asyncio.run(_mn.MorningPoller(cfg, db, s2).poll_once(
+                now=datetime(2026, 10, 20, 7, 30)))
+            check("同一 slot 第二次 → 0 条，且**一条消息都没发**",
+                  n2 == 0 and not s2.images and not s2.voices, f"n={n2}")
+
+        # ---- 失败语义（两条路的处理**故意不一样**）----
+        with tempfile.TemporaryDirectory() as td:
+            mdir = _mn_dir(Path(td), idols=("mano",), per=1,
+                           avatars=True, names=True)
+            cfg = dataclasses.replace(base, morning_groups=("G1", "G2", "G3"),
+                                      morning_dir=mdir)
+            slot_key = "2026-10-20T07:30"
+            now = datetime(2026, 10, 20, 7, 30)
+
+            # ① 发图挂了 → 整轮不算数：不记账，窗口内下一拍重试
+            db1, s1 = _MorningDb(), _MorningSender(fail_image={"G2"})
+            n1 = asyncio.run(_mn.MorningPoller(cfg, db1, s1).poll_once(now=now))
+            check("★ 发图失败 → 那个群**不记账**（窗口内下一拍会重试）",
+                  n1 == 2 and db1.morning_posted(slot_key) == {"G1", "G3"},
+                  f"n={n1} posted={db1.morning_posted(slot_key)}")
+            check("★ 发图失败的群**连语音都没发**（不能只发半条）",
+                  {g for g, _ in s1.voices} == {"G1", "G3"}, str(s1.voices))
+
+            # ② 语音挂了 → 只记 WARNING，**照样记账**（图已经发出去了）
+            db2, s2 = _MorningDb(), _MorningSender(fail={"G2"})
+            n2 = asyncio.run(_mn.MorningPoller(cfg, db2, s2).poll_once(now=now))
+            check("★ 语音失败 → **仍然记账**（图已发，再退一次就是重复刷屏）",
+                  n2 == 3 and db2.morning_posted(slot_key) == {"G1", "G2", "G3"},
+                  f"n={n2} posted={db2.morning_posted(slot_key)}")
+            check("语音失败的那个群**图照样发出去了**",
+                  {g for g, _, _ in s2.images} == {"G1", "G2", "G3"}, str(s2.images))
+            check("★ 一个群失败不连累别的群（三群各自独立）",
+                  s1.events == [("image", "G1"), ("voice", "G1"),
+                                ("image", "G3"), ("voice", "G3")],
+                  str(s1.events))
+
+        # ---- 缺材料 → 退回**纯语音**（= 加这个功能之前的行为）----
+        for label, kw in (("缺头像", {"avatars": False, "names": True}),
+                          ("缺台词表", {"avatars": True, "names": False}),
+                          ("两个都缺", {"avatars": False, "names": False})):
+            with tempfile.TemporaryDirectory() as td:
+                mdir = _mn_dir(Path(td), idols=("mano",), per=1, **kw)
+                cfg = dataclasses.replace(base, morning_groups=("G1",),
+                                          morning_dir=mdir)
+                s = _MorningSender()
+                n = asyncio.run(_mn.MorningPoller(cfg, _MorningDb(), s).poll_once(
+                    now=datetime(2026, 10, 20, 7, 30)))
+                check(f"★ {label} → 退回**纯语音**（不是发一条光秃秃的图，也不是不发）",
+                      n == 1 and not s.images and len(s.voices) == 1,
+                      f"n={n} images={s.images} voices={s.voices}")
+    finally:
+        _mn.MESSAGE_GAP_SEC = old_gap
+
+    # ---- 源码钉子 ----
+    src = inspect.getsource(_mn.MorningPoller.poll_once)
+    check("★ 间隔读的是**模块全局** `MESSAGE_GAP_SEC`（不是构造时捕获的副本，"
+          "否则上面那些 patch 全是假的）",
+          "asyncio.sleep(MESSAGE_GAP_SEC)" in src,
+          str([ln.strip() for ln in src.splitlines() if "sleep" in ln]))
+    check("默认间隔是 2.0 秒（2026-10-20 手工实测用的就是这个）",
+          _mn.MESSAGE_GAP_SEC == 2.0, str(_mn.MESSAGE_GAP_SEC))
+    check("两条消息之间**只有一次** sleep（多发一次就是白等）",
+          src.count("asyncio.sleep") == 1, str(src.count("asyncio.sleep")))
+    check("★ 头像**按 id 取文件，不扫目录**（源码里没有 glob）",
+          "avatar_dir /" in src and "glob" not in src, "")
+
+
+def _check_mn_send_local_image() -> None:
+    """`bot.send_local_image` —— 「文字 + 本地图片」那条路（`file_type=1`）。"""
+    import base64  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import preview as _pv  # noqa: PLC0415
+    from qq_rss_bot.bot import RssBot as _RB  # noqa: PLC0415
+
+    class Stub:
+        send_local_image = _RB.send_local_image
+
+        def __init__(self, api) -> None:
+            self.api = api
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            png = Path(td) / "mano.png"
+            png.write_bytes(_MN_PNG)
+
+            api = _MondayApi()
+            await Stub(api).send_local_image("G1", "櫻木真乃\nおはよう", png)
+            check("★ 上传走 file_type=1（图片）",
+                  api.uploads and api.uploads[0]["file_type"] == 1, str(api.uploads))
+            check("上传带的是 file_data（base64），不是 url",
+                  "file_data" in api.uploads[0] and "url" not in api.uploads[0],
+                  str(list(api.uploads[0])))
+            check("srv_send_msg=False（先传后发，两步）",
+                  api.uploads[0]["srv_send_msg"] is False, str(api.uploads[0]))
+            check("★ base64 的**是文件字节**（不是路径、不是空）",
+                  base64.b64decode(api.uploads[0]["file_data"]) == _MN_PNG)
+            check("★ 正文走 msg_type=7（富媒体）",
+                  api.sent and api.sent[0]["msg_type"] == 7, str(api.sent))
+            check("media 里带上传拿到的 file_info",
+                  api.sent[0]["media"] == {"file_info": "FI-123"}, str(api.sent))
+            check("★ **content 是渲染的** —— 文字就搭在图上（和视频那条正好相反）",
+                  api.sent[0]["content"] == "櫻木真乃\nおはよう",
+                  repr(api.sent[0]["content"]))
+            check("★ 签名里有 content 形参（文字只能从这儿进去）",
+                  "content" in _RB.send_local_image.__code__.co_varnames,
+                  str(_RB.send_local_image.__code__.co_varnames))
+            check("对照：`send_video` 签名里**没有** content（视频的 content 会被丢掉）",
+                  "content" not in _RB.send_video.__code__.co_varnames,
+                  str(_RB.send_video.__code__.co_varnames))
+
+            # 上传没拿到 file_info → 抛，且**一条消息都不发**
+            api2 = _MondayApi()
+            api2.no_file_info = True
+            try:
+                await Stub(api2).send_local_image("G1", "x", png)
+                r2 = False
+            except RuntimeError:
+                r2 = True
+            check("★ 上传没拿到 file_info → 抛 RuntimeError", r2)
+            check("★ 那时**一条消息都没发**（不发空图）",
+                  not api2.sent, str(api2.sent))
+
+            # 200 带业务错误码也算失败
+            api3 = _MondayApi()
+            api3.fail_send = 40093011
+            try:
+                await Stub(api3).send_local_image("G1", "x", png)
+                r3 = False
+            except RuntimeError:
+                r3 = True
+            check("200 带 code 也算失败（不静默当成发送成功）", r3)
+
+            # base64 之后超限 → **一个请求都不发**
+            api4 = _MondayApi()
+            old = _pv.MAX_FILE_DATA_BYTES
+            _pv.MAX_FILE_DATA_BYTES = 16
+            try:
+                try:
+                    await Stub(api4).send_local_image("G1", "x", png)
+                    r4 = False
+                except RuntimeError:
+                    r4 = True
+            finally:
+                _pv.MAX_FILE_DATA_BYTES = old
+            check("★ base64 后超 5 MiB → 抛 RuntimeError（**限的是 base64，不是原始字节**）",
+                  r4)
+            check("★ 超限时**一个请求都没发出去**",
+                  not api4.uploads and not api4.sent, f"{api4.uploads} {api4.sent}")
+            check("对照：`MAX_FILE_DATA_BYTES` 是 5 MiB（= 原图 3.75 MiB 余量）",
+                  old == 5 * 1024 * 1024, str(old))
+
+    asyncio.run(run())
+
+
 def _check_mn_lines_table() -> None:
     """台词表本身的校验 —— 有 `data/morning/lines.toml` 才跑（`data/` 不进 git）。"""
     import sys as _sys  # noqa: PLC0415
@@ -6016,7 +6393,1055 @@ _check_mn_parts()
 _check_mn_list_voices()
 _check_mn_poller()
 _check_mn_send_voice()
+_check_mn_card()
+_check_mn_send_local_image()
 _check_mn_lines_table()
+
+# ---------------------------------------------------------------------------
+# 偶像生日推送
+# ---------------------------------------------------------------------------
+
+print("[4.96] 偶像生日推送（全离线）")
+
+from datetime import date  # noqa: E402
+
+
+def _bd_html() -> str:
+    """一份形似 x.com 时间线的片段（**结构照着 2026-10-19 抓的真实页面写**）。
+
+    三个条目：当天的生日推（带图）、前一天那条（该被日期判据排掉）、
+    以及一条**被引用成卡片**的同一条生日推（该被 id 去重排掉）。
+    """
+    def entry(tid: str, ts: str, text: str, media: str = "") -> str:
+        img = f'<img src="https://pbs.twimg.com/media/{media}?format=jpg&amp;name=900x900">' if media else ""
+        return (
+            f'<li><div><a data-href="/imas_ch/status/{tid}" href="/imas_ch/status/{tid}">'
+            f'<time datetime="x"><script>{{"timestamp":{ts}}}</script></time>'
+            f'<div class="css-1 whitespace-pre-wrap break-words dir="auto">{text}</div>'
+            f'{img}</a></div></li>'
+        )
+
+    return (
+        "<html><body><ol>"
+        + entry("2111834690130674164", "1792335600000",
+                "10/19 杜野凛世さん お誕生日おめでとうございます🎂", "HTnBd4ebEAAEJjB")
+        + entry("2111472303410217188", "1792249201000",
+                "10/18 小早川紗枝さん 水本ゆかりさん お誕生日おめでとうございます🎂",
+                "HTnBd4ebEAAEJjA")
+        # 同一条又被引用了一次 —— 不去重的话图片会发两张
+        + entry("2111834690130674164", "1792335600000",
+                "10/19 杜野凛世さん お誕生日おめでとうございます🎂", "HTnBd4ebEAAEJjB")
+        # 非生日推（同一天的配信通知），日期对不上也不该被挑中
+        + entry("2110659129304047706", "1792084125000", "10月メンバー限定配信のお知らせ")
+        + "</ol></body></html>"
+    )
+
+
+class _BdDb:
+    """只实现 `BirthdayPoller` 用到的那两个方法。"""
+
+    def __init__(self) -> None:
+        self.posted: dict[str, set[str]] = {}
+        self.rows: list[tuple[str, str, str]] = []   # (day, group, tweet)
+
+    def birthday_posted(self, day: str) -> set[str]:
+        return set(self.posted.get(day, ()))
+
+    def mark_birthday_posted(self, day: str, group: str, tweet: str) -> None:
+        self.posted.setdefault(day, set()).add(group)
+        self.rows.append((day, group, tweet))
+
+
+class _BdSender:
+    """假 sender。`fail` 里的群发图片抛异常（验逐群隔离）。"""
+
+    def __init__(self, fail: set[str] | None = None) -> None:
+        self.images: list[tuple[str, str, bytes]] = []
+        self.texts: list[tuple[str, str]] = []
+        self.fail = fail or set()
+
+    async def send_text(self, group: str, content: str) -> None:
+        self.texts.append((group, content))
+
+    async def send_local_image(self, group: str, content: str, path) -> None:
+        if group in self.fail:
+            raise RuntimeError("模拟发送失败")
+        self.images.append((group, content, Path(path).read_bytes()))
+
+
+class _BdResp:
+    def __init__(self, text: str, blob: bytes = b"") -> None:
+        self.text = text
+        self.content = blob
+
+    def raise_for_status(self) -> None:
+        pass
+
+
+class _BdHttp:
+    """假客户端 —— **记录请求过哪些 URL**，好钉住「走的是 media_http 那条路」。"""
+
+    def __init__(self, page: str, blob: bytes = b"\xff\xd8JPEG") -> None:
+        self.page = page
+        self.blob = blob
+        self.urls: list[str] = []
+
+    async def get(self, url, **kw):
+        self.urls.append(url)
+        # ⚠️ 图片那条要把字节放进 **content**（`preview.fetch_image` 读的是它），
+        # 塞进 text 的话 `content` 是空的，会被当成「下载失败」。
+        if "pbs.twimg.com" in url:
+            return _BdResp("", self.blob)
+        return _BdResp(self.page)
+
+
+def _bd_cal(tmp: Path) -> Path:
+    """造一份小冷数据（**不读真实的 `data/birthday/`**，那份在下面单独验）。"""
+    d = tmp / "birthday"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "birthdays.toml").write_text(
+        'source = "https://imas-db.jp/calendar/birthdays.html"\n'
+        "[brands]\nshinycolors = \"シャイニーカラーズ\"\nsidem = \"SideM\"\n"
+        '[[days]]\ndate = "10-19"\n'
+        'idols = [ { name = "杜野凛世", brand = "shinycolors" } ]\n'
+        'people = [ { name = "榎木淳弥", role = "舞田類", brand = "sidem" },'
+        ' { name = "無役さん", brand = "sidem" } ]\n'
+        '[[days]]\ndate = "10-20"\n',   # ⚠️ 没人过生日的那天**没有 idols/people 键**
+        encoding="utf-8",
+    )
+    return d
+
+
+def _check_bd_parts() -> None:
+    from datetime import datetime  # noqa: PLC0415
+
+    from qq_rss_bot import birthday as _bd  # noqa: PLC0415
+
+    check("★ 默认推送时间是 23:05（用户定的）",
+          _bd.DEFAULT_TIME == "23:05", _bd.DEFAULT_TIME)
+    check("cfg_stub 的 birthday_time 就是那个默认值",
+          cfg_stub().birthday_time == _bd.DEFAULT_TIME, cfg_stub().birthday_time)
+    check("cfg_stub 的 birthday_window_sec 就是那个默认值",
+          cfg_stub().birthday_window_sec == _bd.DEFAULT_WINDOW_SEC)
+    check("窗口比早安那条长（要留抓图重试的时间）",
+          _bd.DEFAULT_WINDOW_SEC > 180, str(_bd.DEFAULT_WINDOW_SEC))
+
+    at = _bd.parse_time("23:05")
+    check("23:04 → 昨天 23:05",
+          _bd.slot_for(datetime(2026, 10, 18, 23, 4), at) == datetime(2026, 10, 17, 23, 5),
+          str(_bd.slot_for(datetime(2026, 10, 18, 23, 4), at)))
+    check("★ 正好 23:05 → **今天** 23:05（含边界）",
+          _bd.slot_for(datetime(2026, 10, 18, 23, 5), at) == datetime(2026, 10, 18, 23, 5),
+          str(_bd.slot_for(datetime(2026, 10, 18, 23, 5), at)))
+    check("23:06 → 今天 23:05",
+          _bd.slot_for(datetime(2026, 10, 18, 23, 6), at) == datetime(2026, 10, 18, 23, 5),
+          str(_bd.slot_for(datetime(2026, 10, 18, 23, 6), at)))
+
+    # ★★ 整个功能最容易写错的一行
+    check("★★ 23:05 的 slot 祝福的是**第二天**（10-18 推 10-19）",
+          _bd.birthday_date(datetime(2026, 10, 18, 23, 5)) == date(2026, 10, 19),
+          str(_bd.birthday_date(datetime(2026, 10, 18, 23, 5))))
+    check("★★ 跨月也对（10-31 推 11-01）",
+          _bd.birthday_date(datetime(2026, 10, 31, 23, 5)) == date(2026, 11, 1),
+          str(_bd.birthday_date(datetime(2026, 10, 31, 23, 5))))
+    check("★★ 跨年也对（12-31 推 01-01）",
+          _bd.birthday_date(datetime(2026, 12, 31, 23, 5)) == date(2027, 1, 1),
+          str(_bd.birthday_date(datetime(2026, 12, 31, 23, 5))))
+    check("★★ 闰日也对（02-28 推 02-29）",
+          _bd.birthday_date(datetime(2028, 2, 28, 23, 5)) == date(2028, 2, 29),
+          str(_bd.birthday_date(datetime(2028, 2, 28, 23, 5))))
+
+    # ---- 文案 ----
+    day = _bd.Day(
+        idols=(_bd.Person("杜野凛世", "shinycolors"),),
+        people=(_bd.Person("榎木淳弥", "sidem", "舞田類"), _bd.Person("無役さん", "sidem")),
+    )
+    text = _bd.render(date(2026, 10, 19), day)
+    check("★ 文案逐字等于用户给的样例（偶像在前、声优在后、带 役）",
+          text == "🎂 2026/10/19 本日のお誕生日:\n杜野凛世\n榎木淳弥 (舞田類役)\n無役さん",
+          repr(text))
+    check("声优没有角色时不硬拼括号", "(役)" not in text.splitlines()[-1], text)
+    check("空名单渲染出来只有一行标题", _bd.render(date(2026, 10, 19), _bd.Day()).count("\n") == 0)
+
+
+def _check_bd_calendar() -> None:
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import birthday as _bd  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as td:
+        cal = _bd.load_calendar(_bd_cal(Path(td)) / "birthdays.toml")
+        check("读到两天", set(cal.days) == {"10-19", "10-20"}, str(sorted(cal.days)))
+        check("品牌表读进来", cal.brands.get("shinycolors") == "シャイニーカラーズ", str(cal.brands))
+        d19 = cal.for_date(date(2026, 10, 19))
+        check("10-19 有 1 位偶像 + 2 位声优", len(d19.idols) == 1 and len(d19.people) == 2, str(d19))
+        check("声优带角色", d19.people[0].role == "舞田類", str(d19.people))
+        check("空的那天不是错（total=0）", cal.for_date(date(2026, 10, 20)).empty)
+        check("查不到的日子返回空 Day，不抛", cal.for_date(date(2026, 5, 1)).empty)
+        # ⚠️ 没人过生日的那天**根本没有 idols/people 键**（真实数据就是这样），
+        # 读取端必须 .get —— 写成 entry["idols"] 会 KeyError
+        check("★ 没人过生日的那天没有 idols/people 键，也能读",
+              cal.days["10-20"].idols == () and cal.days["10-20"].people == ())
+        try:
+            _bd.load_calendar(Path(td) / "nope.toml")
+            raised = False
+        except Exception:
+            raised = True
+        check("★ 冷数据读不了就抛（上层记 ERROR 并关掉功能，绝不静默当成「今天没人过生日」）",
+              raised)
+
+
+def _check_bd_timeline() -> None:
+    from qq_rss_bot import birthday as _bd  # noqa: PLC0415
+
+    tweets = _bd.parse_timeline(_bd_html())
+    check("解析出 3 条（4 个 <li>，被引用的那条去重掉一个）",
+          len(tweets) == 3, str([t.id for t in tweets]))
+    check("★ 被引用成卡片的同一条**去重**（不去重会发两张一样的图）",
+          [t.id for t in tweets].count("2111834690130674164") == 1,
+          str([t.id for t in tweets]))
+    first = tweets[0]
+    check("正文取出来了", "杜野凛世" in first.text and "お誕生日おめでとう" in first.text,
+          repr(first.text))
+    check("配图 id 取出来了", first.images == ("HTnBd4ebEAAEJjB",), str(first.images))
+    check("时间戳换成了本地 datetime",
+          first.posted_at is not None and first.posted_at.year == 2026, str(first.posted_at))
+    check("★ 图 URL 强制 `name=orig`（原图，产品明确要求）",
+          first.image_url().endswith("?format=jpg&name=orig"), first.image_url())
+    check("结构不认识时返回空表（上层按「没抓到图」发纯文字）",
+          _bd.parse_timeline("<html>什么都没有</html>") == [])
+
+    hits = _bd.pick_birthday_tweets(tweets, date(2026, 10, 19))
+    check("★ 挑当天的生日推（按**正文日期 + 祝福语**，不是「最新一条」）",
+          [t.id for t in hits] == ["2111834690130674164"], str([t.id for t in hits]))
+    check("日期对不上的不挑", _bd.pick_birthday_tweets(tweets, date(2026, 10, 15)) == [])
+    check("只有祝福语没有日期的不挑（非生日推）",
+          _bd.pick_birthday_tweets(tweets, date(2026, 10, 10)) == [])
+    check("11/1 不会被 1/1 之类的前缀误匹配",
+          _bd.pick_birthday_tweets(
+              [_bd.Tweet("1", None, "11/1 お誕生日おめでとう", ())], date(2026, 1, 1)) == [])
+
+
+def _check_bd_poller() -> None:
+    import dataclasses  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+
+    from qq_rss_bot import birthday as _bd  # noqa: PLC0415
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bdir = _bd_cal(Path(td))
+            cfg = dataclasses.replace(
+                cfg_stub(), birthday_groups=("G1", "G2"),
+                birthday_dir=bdir, birthday_time="23:05", birthday_window_sec=300,
+            )
+            page = _bd_html()
+            tweets = _bd.parse_timeline(page)
+            at_slot = datetime(2026, 10, 18, 23, 5)
+
+            # ---- 抓图那拍：发图文，两个群同一条 ----
+            db, sender, http = _BdDb(), _BdSender(), _BdHttp(page)
+            p = _bd.BirthdayPoller(cfg, db, sender, http)
+            n = await p.poll_once(now=at_slot)
+            check("★ 23:05 准点抓到图，发给两个群", n == 2, str(n))
+            check("★ 两个群拿到**同一份文案和同一张图**（多群不会精神分裂）",
+                  len({i[1] for i in sender.images}) == 1
+                  and len({i[2] for i in sender.images}) == 1, str(sender.images))
+            check("发的是**图文**（`send_local_image`），不是纯文字",
+                  not sender.texts and len(sender.images) == 2, f"{sender.images} {sender.texts}")
+            check("★ 文案就是渲染出来的那份",
+                  sender.images[0][1].startswith("🎂 2026/10/19"), sender.images[0][1])
+            check("★ 落库的键是**被祝福的那天**（10-19），不是推送那天（10-18）",
+                  db.birthday_posted("2026-10-19") == {"G1", "G2"} and not db.birthday_posted("2026-10-18"),
+                  str(db.posted))
+            check("落库记了推文 id", all(r[2] == "2111834690130674164" for r in db.rows), str(db.rows))
+            check("★ 时间线走的是**传进来的那个 http**（线上是带代理的 media_http）",
+                  http.urls and http.urls[0] == _bd.X_PROFILE_URL, str(http.urls))
+            check("★ 抓的是 imas_ch 那条推的图，且 `name=orig`",
+                  any("pbs.twimg.com/media/HTnBd4ebEAAEJjB" in u and "name=orig" in u
+                      for u in http.urls), str(http.urls))
+
+            n2 = await p.poll_once(now=datetime(2026, 10, 18, 23, 7))
+            check("★ 同一天再跑不会重发（幂等靠库，不靠内存）", n2 == 0, str(n2))
+
+            # ---- 没抓到图：还早 → 留着下一拍重试 ----
+            db2, snd2 = _BdDb(), _BdSender()
+            p2 = _bd.BirthdayPoller(cfg, db2, snd2, _BdHttp("<html>空</html>"))
+            n3 = await p2.poll_once(now=at_slot)
+            check("★ 没抓到图 + 还在窗口前段 → **不发**，留着下一拍重试",
+                  n3 == 0 and not snd2.images and not snd2.texts, f"{n3}")
+            check("没发就**不记账**", not db2.rows, str(db2.rows))
+
+            # ---- 没抓到图：到窗口末尾 → 发纯文字 ----
+            n4 = await p2.poll_once(now=datetime(2026, 10, 18, 23, 9))
+            check("★ 窗口末尾还没图 → **发纯文字**（名单从不依赖推文）",
+                  n4 == 2 and len(snd2.texts) == 2 and not snd2.images, str(n4))
+            check("纯文字也带完整名单",
+                  "杜野凛世" in snd2.texts[0][1] and "榎木淳弥 (舞田類役)" in snd2.texts[0][1],
+                  snd2.texts[0][1])
+            check("★ 没图时记账写**空串**（能分清「当时没图」和「当时没记」）",
+                  all(r[2] == "" for r in db2.rows), str(db2.rows))
+
+            # ---- 窗口外不补发 ----
+            db3, snd3 = _BdDb(), _BdSender()
+            p3 = _bd.BirthdayPoller(cfg, db3, snd3, _BdHttp(page))
+            n5 = await p3.poll_once(now=datetime(2026, 10, 18, 23, 20))
+            check("★ 窗口外（23:20）不发", n5 == 0 and not snd3.images and not snd3.texts, str(n5))
+
+            # ---- 那天没人过生日 ----
+            db4, snd4 = _BdDb(), _BdSender()
+            p4 = _bd.BirthdayPoller(cfg, db4, snd4, _BdHttp(page))
+            n6 = await p4.poll_once(now=datetime(2026, 10, 19, 23, 5))   # → 祝福 10-20
+            check("★ 那天没人过生日 → 静默跳过、不记账、不报错",
+                  n6 == 0 and not db4.rows and not snd4.images, f"{n6} {db4.rows}")
+
+            # ---- 一个群挂了不连累别的 ----
+            db5, snd5 = _BdDb(), _BdSender(fail={"G1"})
+            p5 = _bd.BirthdayPoller(cfg, db5, snd5, _BdHttp(page))
+            n7 = await p5.poll_once(now=at_slot)
+            check("★ 一个群发不出去，其余群照发",
+                  n7 == 1 and db5.birthday_posted("2026-10-19") == {"G2"}, f"{n7} {db5.posted}")
+
+            # ---- 冷数据缺失 / 未配置群 ----
+            cfg6 = dataclasses.replace(cfg, birthday_dir=Path(td) / "nope")
+            snd6 = _BdSender()
+            n8 = await _bd.BirthdayPoller(cfg6, _BdDb(), snd6, _BdHttp(page)).poll_once(now=at_slot)
+            check("★ 冷数据不存在 → 返回 0、**不抛**（不能连累机器人起不来）",
+                  n8 == 0 and not snd6.images, str(n8))
+
+            cfg7 = dataclasses.replace(cfg, birthday_groups=())
+            snd7 = _BdSender()
+            n9 = await _bd.BirthdayPoller(cfg7, _BdDb(), snd7, _BdHttp(page)).poll_once(now=at_slot)
+            check("BIRTHDAY_GROUPS 空 → 整个功能关闭（返回 0）",
+                  n9 == 0 and not snd7.images, str(n9))
+
+            # ---- 抓时间线炸了 → 当成没图，到窗口末尾发纯文字 ----
+            class _BoomHttp:
+                async def get(self, url, **kw):
+                    raise RuntimeError("模拟 SSL 超时")
+
+            db8, snd8 = _BdDb(), _BdSender()
+            p8 = _bd.BirthdayPoller(cfg, db8, snd8, _BoomHttp())
+            n10 = await p8.poll_once(now=at_slot)
+            n11 = await p8.poll_once(now=datetime(2026, 10, 18, 23, 9))
+            check("★ 抓推文抛异常也不炸：窗口末尾照样发纯文字",
+                  n10 == 0 and n11 == 2 and len(snd8.texts) == 2, f"{n10} {n11}")
+
+    asyncio.run(run())
+
+
+def _check_bd_real_table() -> None:
+    """真实冷数据 —— 有 `data/birthday/birthdays.toml` 才跑（`data/` 不进 git）。"""
+    from qq_rss_bot import birthday as _bd  # noqa: PLC0415
+
+    table = _MN_ROOT / "data" / "birthday" / "birthdays.toml"
+    if not table.is_file():
+        print("  SKIP  没有 data/birthday/birthdays.toml（data/ 不进 git）")
+        return
+    cal = _bd.load_calendar(table)
+    check("★ 真实冷数据：366 天", len(cal.days) == 366, str(len(cal.days)))
+    check("★ 02-29 在里面（闰年才查得到）", "02-29" in cal.days)
+    d = cal.for_date(date(2026, 10, 19))
+    check("★ 2026-10-19 的名单逐字等于用户给的样例",
+          _bd.render(date(2026, 10, 19), d) == (
+              "🎂 2026/10/19 本日のお誕生日:\n杜野凛世\n"
+              "榎木淳弥 (舞田類役)\n大塚剛央 (眉見鋭心役)\n土屋翔 (舞台SideM 伊瀬谷四季役)"
+          ),
+          repr(_bd.render(date(2026, 10, 19), d)))
+    check("★ 不过滤品牌：961pro / xenoglossia / others 都在名单里",
+          {"961pro", "xenoglossia", "others"} <= {
+              p.brand for day in cal.days.values() for p in day.idols + day.people
+          },
+          str(sorted(cal.brands)))
+    check("有人的天数和空的天数加起来等于 366",
+          sum(1 for x in cal.days.values() if not x.empty)
+          + sum(1 for x in cal.days.values() if x.empty) == 366)
+
+
+def _check_bd_wiring() -> None:
+    """接线钉子。这三条都是**只看源码**的 —— 但改错了后果很隐蔽。
+
+    尤其第一条：把 `media_http` 换成 `rss_http` 之后代码照样跑、日志照样正常，
+    只是容器里永远抓不到推文，症状是「每天都没配图」。
+    """
+    import inspect  # noqa: PLC0415
+
+    from qq_rss_bot.bot import RssBot  # noqa: PLC0415
+
+    init = inspect.getsource(RssBot.__init__)
+    line = next((ln for ln in init.splitlines() if "BirthdayPoller(" in ln), "")
+    check("★ 生日轮询器接的是 **media_http**（带代理的那个）",
+          "self.media_http" in line and "rss_http" not in line, line.strip())
+    check("挂的是 self.birthday / self._birthday_task",
+          "self.birthday = BirthdayPoller" in init and "self._birthday_task" in init)
+    check("on_ready 里起了这个 task",
+          "self.birthday.run()" in inspect.getsource(RssBot.on_ready))
+    check("close() 里停了它（否则停机要等满窗口）",
+          "self.birthday.stop()" in inspect.getsource(RssBot.close))
+
+    from qq_rss_bot import quota as _q  # noqa: PLC0415
+
+    check("Pusher 协议里有 send_text / send_local_image（生日两条路都用到）",
+          hasattr(_q.Pusher, "send_text") and hasattr(_q.Pusher, "send_local_image"))
+
+
+_check_bd_parts()
+_check_bd_calendar()
+_check_bd_timeline()
+_check_bd_poller()
+_check_bd_real_table()
+_check_bd_wiring()
+
+print("[4.97] 誕生祭 贺图聚合（全离线）")
+
+
+def _ba_db():
+    class _Db:
+        """只实现 `BirthdayArtPoller` 用到的那两个方法。"""
+
+        def __init__(self) -> None:
+            self.posted: dict[str, set[str]] = {}
+            self.rows: list[tuple[str, str, int, str]] = []
+
+        def birthday_art_posted(self, day: str) -> set[str]:
+            return set(self.posted.get(day, ()))
+
+        def mark_birthday_art(self, day, group, sent, tweets) -> None:
+            self.posted.setdefault(day, set()).add(group)
+            self.rows.append((day, group, sent, tweets))
+
+        def clear_birthday_art(self, day: str, group: str) -> bool:
+            had = group in self.posted.get(day, set())
+            self.posted.get(day, set()).discard(group)
+            return had
+
+    return _Db()
+
+
+class _BaSender:
+    """假 sender。`fail_first` 里的群**第一张**就抛；`fail_at` 精确到 (群, 第几个)。"""
+
+    def __init__(self, fail_first=(), fail_at=()) -> None:
+        self.sent: list[tuple[str, str, bytes]] = []
+        self.fail_first = set(fail_first)
+        self.fail_at = set(fail_at)
+        self._n: dict[str, int] = {}
+
+    async def send_local_image(self, group: str, content: str, path) -> None:
+        i = self._n.get(group, 0)
+        self._n[group] = i + 1
+        if group in self.fail_first and i == 0:
+            raise RuntimeError("模拟首图失败")
+        if (group, i) in self.fail_at:
+            raise RuntimeError("模拟中间某张失败")
+        self.sent.append((group, content, Path(path).read_bytes()))
+
+
+class _BaResp:
+    def __init__(self, blob: bytes) -> None:
+        self.content = blob
+        self.text = ""
+
+    def raise_for_status(self) -> None:
+        pass
+
+
+class _BaHttp:
+    """假客户端。`dead` 里的 URL 抛错（模拟下不动 / 原图过大）。"""
+
+    def __init__(self, blob: bytes = b"\xff\xd8JPEG-ba", dead: set[str] | None = None) -> None:
+        self.blob = blob
+        self.dead = dead or set()
+        self.urls: list[str] = []
+
+    async def get(self, url, **kw):
+        self.urls.append(url)
+        if any(d in url for d in self.dead):
+            raise httpx.HTTPError("模拟下载失败")
+        return _BaResp(self.blob)
+
+
+def _ba_cfg(tmp: Path, **over):
+    import dataclasses as _dc  # noqa: PLC0415
+
+    base = _dc.replace(
+        cfg_stub(),
+        birthday_dir=tmp / "birthday",
+        birthday_art_groups=("G1",),
+        x_auth_token="a" * 40,
+        x_ct0="c" * 160,
+    )
+    return _dc.replace(base, **over) if over else base
+
+
+def _ba_art(
+    i: int, *, likes: int, idol="杜野凛世", author=None, name=None, image=True, sensitive=False
+):
+    from qq_rss_bot.birthday_art import Art  # noqa: PLC0415
+
+    return Art(
+        id=str(2111000000000000000 + i),
+        idol=idol,
+        author=author or f"artist{i}",
+        author_name=name or f"画师{i}",
+        likes=likes,
+        posted_at=datetime(2026, 10, 19, 12, 0, tzinfo=ba.JST),
+        image=f"https://pbs.twimg.com/media/IMG{i}.jpg?name=orig" if image else "",
+        sensitive=sensitive,
+    )
+
+
+def _ba_parts() -> None:
+    from datetime import time as _t  # noqa: PLC0415
+
+    check("★ 默认时刻是 22:30（不是用户原来说的 12:00）", ba.DEFAULT_TIME == "22:30")
+    check("四个 tag 顺序：带年份的在前面",
+          ba.tags_for("杜野凛世", 2026) == [
+              "#杜野凛世誕生祭2026", "#杜野凛世生誕祭2026",
+              "#杜野凛世誕生祭", "#杜野凛世生誕祭"],
+          str(ba.tags_for("杜野凛世", 2026)))
+    check("is_yearful 判得对",
+          ba.is_yearful("#杜野凛世誕生祭2026", 2026)
+          and not ba.is_yearful("#杜野凛世誕生祭", 2026))
+    check("parse_time 收 HH:MM", ba.parse_time("22:30") == _t(22, 30))
+    try:
+        ba.parse_time("22.30")
+        check("parse_time 写错要 SystemExit", False)
+    except SystemExit:
+        check("parse_time 写错要 SystemExit", True)
+
+    # ★ 「被庆祝的那天」= slot **当天**，和 birthday.birthday_date 差一天
+    for iso, want in [("2026-10-19T22:30", "2026-10-19"),
+                      ("2026-12-31T22:30", "2026-12-31"),
+                      ("2026-11-01T22:30", "2026-11-01"),
+                      ("2028-02-29T22:30", "2028-02-29")]:
+        got = ba.art_date(datetime.fromisoformat(iso)).isoformat()
+        check(f"★ art_date({iso}) = {want}（slot 当天，不是 +1）", got == want, got)
+    check("★ 和 birthday.birthday_date 确实差一天",
+          ba.art_date(datetime(2026, 10, 19, 22, 30))
+          != birthday.birthday_date(datetime(2026, 10, 19, 22, 30)))
+
+    # slot_for
+    check("22:29 → 昨天 22:30",
+          ba.slot_for(datetime(2026, 10, 19, 22, 29), _t(22, 30))
+          == datetime(2026, 10, 18, 22, 30))
+    check("正好 22:30 → 当天（不是昨天）",
+          ba.slot_for(datetime(2026, 10, 19, 22, 30), _t(22, 30))
+          == datetime(2026, 10, 19, 22, 30))
+
+    # 时间窗用 JST 判
+    d = date(2026, 10, 19)
+    lo, hi = ba.window_bounds(d)
+    check("时间窗是 [D-1, D+2) 的 JST 零点",
+          (lo, hi) == (datetime(2026, 10, 18, tzinfo=ba.JST),
+                       datetime(2026, 10, 21, tzinfo=ba.JST)))
+    check("D-1 那天的在窗内（提前画好的）",
+          ba.in_window(datetime(2026, 10, 18, 5, 0, tzinfo=ba.JST), d))
+    check("D+1 那天的在窗内（迟到的）",
+          ba.in_window(datetime(2026, 10, 20, 23, 0, tzinfo=ba.JST), d))
+    check("★ 去年的同类 tag 结果被排掉（不带年份的 tag 会搜到往年作品）",
+          not ba.in_window(datetime(2025, 10, 19, 12, 0, tzinfo=ba.JST), d))
+    check("D+2 之后排掉", not ba.in_window(datetime(2026, 10, 21, 0, 0, tzinfo=ba.JST), d))
+
+    # 图片 URL
+    check("_orig 补 ?name=orig", ba._orig("https://pbs.twimg.com/media/X.jpg")
+          == "https://pbs.twimg.com/media/X.jpg?name=orig")
+    check("_orig 已有 name= 就不动",
+          ba._orig("https://pbs.twimg.com/media/X.jpg?name=small")
+          == "https://pbs.twimg.com/media/X.jpg?name=small")
+    check("_with_name 换档",
+          ba._with_name("https://pbs.twimg.com/media/X.jpg?name=orig", "large")
+          == "https://pbs.twimg.com/media/X.jpg?name=large")
+
+    # 点赞格式化
+    check("_likes：999 原样", ba._likes(999) == "999")
+    check("_likes：1000 → 1k", ba._likes(1000) == "1k")
+    check("_likes：3200 → 3.2k", ba._likes(3200) == "3.2k")
+    check("_likes：12000 → 12k", ba._likes(12000) == "12k")
+
+
+def _ba_queryid() -> None:
+    # ★ 真实踩过的坑：松匹配会抓到 BookmarkSearchTimeline 的 id，然后 404
+    js = ('x={queryId:"VxJMx0-NXe-GO_4jC1lNhw",operationName:"BookmarkSearchTimeline",'
+          'operationType:"query"},y={queryId:"irezafrnzav4Ulf1vDkEBg",'
+          'operationName:"SearchTimeline",operationType:"query"}')
+    got = ba.extract_query_id(js)
+    check("★ 从 bundle 里抠出 SearchTimeline 的 queryId", got == "irezafrnzav4Ulf1vDkEBg", str(got))
+    check("★ 没有抓成紧邻的 BookmarkSearchTimeline", got != "VxJMx0-NXe-GO_4jC1lNhw")
+    check("bundle 里没有那个操作时返回 None",
+          ba.extract_query_id("nothing here") is None)
+
+
+def _ba_parse() -> None:
+    def tweet(tid="2112190149820121424", likes=100, media=True, sens=False, wrap=False):
+        leg = {
+            "id_str": tid, "favorite_count": likes,
+            "created_at": "Mon Oct 19 14:32:28 +0000 2026",
+            "full_text": "贺图 #杜野凛世誕生祭2026",
+            "possibly_sensitive": sens,
+        }
+        if media:
+            leg["extended_entities"] = {"media": [
+                {"type": "photo", "media_url_https": "https://pbs.twimg.com/media/HVA.jpg"},
+                {"type": "video", "media_url_https": "https://pbs.twimg.com/ext_tw_video_thumb/X.jpg"},
+            ]}
+        t = {
+            "rest_id": tid, "legacy": leg,
+            "core": {"user_results": {"result": {"core": {
+                "screen_name": "fakecolor_mono", "name": "ふぇいく"}}}},
+        }
+        return {"__typename": "TweetWithVisibilityResults", "tweet": t} if wrap else t
+
+    a = ba.parse_tweet(tweet(), "杜野凛世")
+    check("parse_tweet 正常解出", a is not None and a.id == "2112190149820121424")
+    check("作者从 core 里取（新版结构）", a.author == "fakecolor_mono" and a.author_name == "ふぇいく")
+    check("★ 图只取 photo，跳过 video 缩略图", a.image == "https://pbs.twimg.com/media/HVA.jpg?name=orig", a.image)
+    check("时间解出来了且带时区", a.posted_at.year == 2026 and a.posted_at.tzinfo is not None)
+    check("原推链接拼得对", a.url == "https://x.com/fakecolor_mono/status/2112190149820121424")
+
+    check("★ TweetWithVisibilityResults 要拆一层", ba.parse_tweet(tweet(wrap=True), "X").id == "2112190149820121424")
+    check("没有 media 的推文被丢掉", ba.parse_tweet(tweet(media=False), "X") is None)
+    check("tombstone（空 dict）被丢掉", ba.parse_tweet({}, "X") is None)
+    check("没有 created_at 被丢掉", ba.parse_tweet({"legacy": {}}, "X") is None)
+    s = ba.parse_tweet(tweet(sens=True), "X")
+    check("possibly_sensitive 带出来了", s.sensitive is True)
+
+    payload = {"data": {"search_by_raw_query": {"search_timeline": {"timeline": {"instructions": [
+        {"entries": [
+            {"content": {"itemContent": {"tweet_results": {"result": tweet("1")}}}},
+            {"content": {"itemContent": {"tweet_results": {"result": tweet("2")}}}},
+            {"content": {"cursorType": "Bottom", "value": "CUR123"}},
+            {"content": {"cursorType": "Top", "value": "CUR0"}},
+        ]},
+    ]}}}}}
+    arts, cur = ba.parse_search(payload, "杜野凛世")
+    check("parse_search 出两条", len(arts) == 2, str(len(arts)))
+    check("★ 游标只取 Bottom（Top 会绕回开头，翻页死循环）", cur == "CUR123", str(cur))
+    check("idol 名被带上（多偶像那天要分开保底）", arts[0].idol == "杜野凛世")
+
+
+def _ba_product() -> None:
+    """★ `product` 必须是 **Top**。这个 bug 不报错，只是**静默变差**。
+
+    第一版写的是 `"Latest"`（时间栏），于是带年份的 tag 只捞得到深夜新发的
+    小号，当天最高才 464 赞，我据此把用户「2k 以上」的判断当成了错的。
+    实测同一 tag 同一时刻：Top 有 6~8 条 ≥2000 赞，Latest **一条都没有**。
+    """
+    import inspect as _inspect  # noqa: PLC0415
+
+    sig = _inspect.signature(ba.XSearch.search_page)
+    check("★ search_page 的 product 默认是 **Top**（写成 Latest 不报错，只是全变低赞）",
+          sig.parameters["product"].default == "Top", str(sig.parameters["product"].default))
+    check("★ PAGE_PLAN_YEARFUL 第一页是 Top", ba.PAGE_PLAN_YEARFUL[0] == "Top",
+          str(ba.PAGE_PLAN_YEARFUL))
+    check("PAGE_PLAN_BARE 只用 Latest（不带年份的 Top 全是往年，实测窗口内 0 条）",
+          ba.PAGE_PLAN_BARE == ("Latest",), str(ba.PAGE_PLAN_BARE))
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self.content = b"{}"
+            self._p = payload
+
+        def json(self):
+            return self._p
+
+    class _Rec:
+        """记下每次 POST 的 (product, cursor)，并回一个**按栏递增**的游标。"""
+
+        def __init__(self):
+            self.calls: list[tuple[str, str | None]] = []
+            self.n: dict[str, int] = {}
+
+        async def post(self, url, params=None, headers=None, timeout=None):
+            import json as _json  # noqa: PLC0415
+
+            v = _json.loads(params["variables"])
+            prod, cur = v["product"], v.get("cursor")
+            self.calls.append((prod, cur))
+            self.n[prod] = self.n.get(prod, 0) + 1
+            nxt = f"{prod}-cur-{self.n[prod]}"
+            payload = {"data": {"search_by_raw_query": {"search_timeline": {
+                "timeline": {"instructions": [{"entries": [
+                    {"content": {"itemContent": {"tweet_results": {"result": {
+                        "rest_id": "1", "legacy": {
+                            "favorite_count": 100,
+                            "created_at": "Mon Oct 19 14:32:28 +0000 2026",
+                            "extended_entities": {"media": [
+                                {"type": "photo",
+                                 "media_url_https": "https://pbs.twimg.com/media/HVA.jpg"}]},
+                        },
+                        "core": {"user_results": {"result": {"core": {
+                            "screen_name": "a", "name": "A"}}}},
+                    }}}}},
+                    {"content": {"cursorType": "Bottom", "value": nxt}},
+                ]}]}}}}}
+            return _Resp(payload)
+
+    rec = _Rec()
+    x = ba.XSearch(rec, "a" * 40, "c" * 160)
+    x._query_id = "QID"  # 跳过 /home + bundle 那条发现链路
+    old_gap = ba.SEARCH_GAP_SEC
+    ba.SEARCH_GAP_SEC = 0
+    try:
+        asyncio.run(x.search_tag("#杜野凛世誕生祭2026", "杜野凛世",
+                                 __import__("datetime").date(2026, 10, 19)))
+    finally:
+        ba.SEARCH_GAP_SEC = old_gap
+
+    check("★ 带年份的 tag 按 Top → Top → Latest 各发一次",
+          [c[0] for c in rec.calls] == ["Top", "Top", "Latest"], str(rec.calls))
+    check("★ **游标按栏分开存**（Top 的游标喂给 Latest 是未定义行为）",
+          rec.calls == [("Top", None), ("Top", "Top-cur-1"), ("Latest", None)],
+          str(rec.calls))
+
+
+def _ba_official() -> None:
+    """★ 官方号不占名额。用户 2026-10-20 点名要求排掉。"""
+    # 真实那一行（实测 2026-10-19 排第一，8596 赞）
+    off = _ba_art(1, likes=8596, author="imassc_official",
+                  name="アイドルマスター シャイニーカラーズ公式")
+    check("★ 官方号认出来了（handle 表 + 名字里的「公式」）", ba.is_official(off))
+    # 只靠名字也要认得出 —— 官方号会新增，handle 表追不上
+    check("★ 换个没见过的 handle，名字带「公式」照样认出来",
+          ba.is_official(_ba_art(2, likes=1, author="brand_new_official",
+                                 name="アイドルマスター ミリオンライブ！公式")))
+    check("只靠 handle 表也认得出（名字里没「公式」的那种官方号）",
+          ba.is_official(_ba_art(3, likes=1, author="imas_ch", name="アイマスch")))
+    check("普通画师不误伤", not ba.is_official(_ba_art(4, likes=1, author="KiouRi_39", name="KiouRi")))
+    check("名字里带「公式」的也认（大小写 / 前后缀无关）",
+          ba.is_official(_ba_art(5, likes=1, author="x", name="なんとか公式")))
+    check("★ handle 比较不分大小写", ba.is_official(_ba_art(6, likes=1, author="IMASSC_Official")))
+    check("★ BIRTHDAY_ART_EXCLUDE 能补，且容忍 @ 前缀 / 大小写",
+          ba.is_official(_ba_art(7, likes=1, author="SomeBrand", name="ブランド"),
+                         exclude=("@somebrand",))
+          and not ba.is_official(_ba_art(8, likes=1, author="SomeBrand", name="ブランド")))
+
+    # ★ 行为钉子：真实那天的前几名喂进去，第一名应该是画师而不是官方
+    arts = [
+        off,
+        _ba_art(10, likes=7878, author="BossMonkey0112", name="ボスモンキー"),
+        _ba_art(11, likes=6195, author="eluthel1", name="アイルル"),
+    ]
+    got = ba.rank_art(arts, ["杜野凛世"], min_likes=50)
+    check("★ 排掉官方号之后，第一名是画师 @BossMonkey0112（不是那个 8596 赞的官推）",
+          [a.author for a in got] == ["BossMonkey0112", "eluthel1"],
+          str([a.author for a in got]))
+    got2 = ba.rank_art(arts, ["杜野凛世"], min_likes=50, skip_official=False)
+    check("★ skip_official=False 就放回来（这个开关真起作用，不是摆设）",
+          got2[0].author == "imassc_official", str([a.author for a in got2]))
+
+
+def _ba_rank() -> None:
+    from qq_rss_bot.birthday_art import rank_art  # noqa: PLC0415
+
+    arts = [_ba_art(1, likes=10), _ba_art(2, likes=500), _ba_art(3, likes=300)]
+    got = rank_art(arts, ["杜野凛世"], min_likes=50)
+    check("★ 按点赞降序", [a.likes for a in got] == [500, 300], str([a.likes for a in got]))
+    check("低于下限的被排掉", all(a.likes >= 50 for a in got))
+
+    # 同分按 id → 结果确定（可复现、能写测试）
+    tie = [_ba_art(9, likes=100), _ba_art(4, likes=100), _ba_art(7, likes=100)]
+    got = rank_art(tie, ["杜野凛世"], min_likes=0)
+    check("★ 同分按 id 定序（不然每次顺序都可能不一样）",
+          [a.id for a in got] == sorted(a.id for a in tie), str([a.id for a in got]))
+
+    # 每位画师最多 1 张
+    same = [_ba_art(1, likes=900, author="prolific"), _ba_art(2, likes=800, author="prolific"),
+            _ba_art(3, likes=100, author="other")]
+    got = rank_art(same, ["杜野凛世"], min_likes=0)
+    check("★ 同一位画师只留一张（不然一个高产画师吃掉全部名额）",
+          [a.author for a in got] == ["prolific", "other"], str([a.author for a in got]))
+
+    # 每位偶像保底一张
+    mixed = [_ba_art(1, likes=900, idol="A"), _ba_art(2, likes=800, idol="A"),
+             _ba_art(3, likes=700, idol="A"), _ba_art(4, likes=5, idol="B")]
+    got = rank_art(mixed, ["A", "B"], min_likes=0)
+    check("★ 冷门偶像也保底一张（否则最火的那位把名额吃光）",
+          any(a.idol == "B" for a in got), str([(a.idol, a.likes) for a in got]))
+    check("保底那张排在最前面", got[0].idol == "B", str(got[0].idol))
+
+    check("敏感的排掉", not rank_art([_ba_art(1, likes=900, sensitive=True)], ["X"], min_likes=0))
+    check("没图的排掉", not rank_art([_ba_art(1, likes=900, image=False)], ["X"], min_likes=0))
+    dup = [_ba_art(1, likes=900), _ba_art(1, likes=900)]
+    check("同一条推文只留一次", len(rank_art(dup, ["X"], min_likes=0)) == 1)
+
+    # 排序本身**不截断** —— 截多少由「下载成功了几张」决定
+    many = [_ba_art(i, likes=i * 10) for i in range(1, 20)]
+    check("rank_art 不截断（截断交给下载那一步）",
+          len(rank_art(many, ["杜野凛世"], min_likes=0)) == 19)
+
+
+def _ba_render() -> None:
+    a = _ba_art(1, likes=3200, author="fakecolor_mono")
+    got = ba.render(a, 2, 6, 2026)
+    check("★ 文案逐字（三行：标题 / 点赞+署名 / 原推链接）",
+          got == ("🎨 杜野凛世 誕生祭 2026（2/6）\n"
+                  "♥ 3.2k · 画师 @fakecolor_mono\n"
+                  f"{a.url}"), repr(got))
+    check("文案里带原推链接（署名是礼节也是实用）", "/status/" in got)
+    check("_id_of 能从文案里取回推文 id", ba._id_of(got) == a.id, ba._id_of(got))
+    check("_id_of 取不到时给空串", ba._id_of("没有链接") == "")
+
+
+async def _ba_poller() -> None:
+    import tempfile as _tf  # noqa: PLC0415
+
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _bd_cal(tmp)  # 复用 4.96 造的那份小冷数据（10-19 杜野凛世 / 10-20 空）
+
+        # ---- enabled 要三样都齐 ----
+        cfg = _ba_cfg(tmp)
+        p = ba.BirthdayArtPoller(cfg, _ba_db(), _BaSender(), _BaHttp())
+        check("三样齐了才 enabled", p.enabled)
+        for over, why in [({"birthday_art_enabled": False}, "开关关了"),
+                          ({"birthday_art_groups": ()}, "没有目标群"),
+                          ({"x_auth_token": ""}, "缺 auth_token"),
+                          ({"x_ct0": ""}, "缺 ct0")]:
+            q = ba.BirthdayArtPoller(
+                _ba_cfg(tmp, **over), _ba_db(), _BaSender(), _BaHttp())
+            check(f"★ {why} → 功能关闭", not q.enabled)
+            n = await q.poll_once(now=datetime(2026, 10, 19, 22, 30, 30), arts=[_ba_art(1, likes=900)])
+            check(f"  {why}时不发也不炸", n == 0)
+
+        # ---- 正常一轮 ----
+        db, sender = _ba_db(), _BaSender()
+        p = ba.BirthdayArtPoller(_ba_cfg(tmp), db, sender, _BaHttp())
+        now = datetime(2026, 10, 19, 22, 30, 30)
+        arts = [_ba_art(i, likes=1000 - i * 10) for i in range(1, 4)]
+        n = await p.poll_once(now=now, arts=arts)
+        check("★ 一轮发出去的条数 = 挑中的张数", n == 3, str(n))
+        check("★ 一条一张（消息条数 == 图片张数）", len(sender.sent) == 3, str(len(sender.sent)))
+        check("文案编号是 (i/N)", "（1/3）" in sender.sent[0][1] and "（3/3）" in sender.sent[2][1])
+        check("图片字节真的传进去了", sender.sent[0][2].startswith(b"\xff\xd8"))
+        check("落库了，记了条数和推文 id",
+              db.rows and db.rows[0][2] == 3 and len(db.rows[0][3].split(",")) == 3, str(db.rows))
+
+        # ---- 幂等 ----
+        n = await p.poll_once(now=now, arts=arts)
+        check("★ 同一个 slot 再跑一次，一条都不发", n == 0 and len(sender.sent) == 3)
+
+        # ---- 清账之后能重发（探针 --reset 走的就是这条路）----
+        # 实测踩过：改完挑选规则想拿同一天重测，忘了清账 → 永远「发出去 0 条」，
+        # 看起来像坏了，其实是幂等在挡。
+        check("★ clear_birthday_art 说「原来有一行」", db.clear_birthday_art("2026-10-19", "G1") is True)
+        check("清完就不在「已发」里了", db.birthday_art_posted("2026-10-19") == set())
+        n = await p.poll_once(now=now, arts=arts)
+        check("★ 清账之后同一天能重发（否则重测永远是 0 条）", n == 3, str(n))
+        check("重发之后又记上了", db.birthday_art_posted("2026-10-19") == {"G1"})
+        check("★ 清一行不存在的，返回 False（不会谎报）",
+              db.clear_birthday_art("2026-10-19", "没这个群") is False)
+
+        # ---- 窗口外不发 ----
+        q = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), _BaHttp())
+        n = await q.poll_once(now=datetime(2026, 10, 19, 23, 30), arts=arts)
+        check("窗口外（超 300s）不发", n == 0)
+
+        # ---- 没人过生日的那天 ----
+        q = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), _BaHttp())
+        n = await q.poll_once(now=datetime(2026, 10, 20, 22, 30, 30), arts=arts)
+        check("★ 那天没有偶像过生日 → 不发、不记账、不打日志刷屏", n == 0)
+
+        # ---- 候选为空 / 全不过下限 ----
+        q, s2 = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), _BaHttp()), _BaSender()
+        q = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), s2, _BaHttp())
+        check("没有候选 → 不发", await q.poll_once(now=now, arts=[]) == 0)
+        check("★ 全不过下限 → 不发（**不退回纯文字**）",
+              await q.poll_once(now=now, arts=[_ba_art(1, likes=1, author="a1")]) == 0)
+        check("  ……而且一条消息都没发", not s2.sent)
+
+        # ---- 首图挂 → 整批放弃、不记账（下一拍重试）----
+        db3 = _ba_db()
+        p3 = ba.BirthdayArtPoller(_ba_cfg(tmp), db3, _BaSender(fail_first={"G1"}), _BaHttp())
+        n = await p3.poll_once(now=now, arts=arts)
+        check("★ 首图发不出去 → 不记账（窗口内下一拍会重试）", n == 0 and not db3.rows, str(db3.rows))
+
+        # ---- 中间某张挂 → 照记账，sent 反映真实条数 ----
+        db4 = _ba_db()
+        p4 = ba.BirthdayArtPoller(_ba_cfg(tmp), db4, _BaSender(fail_at={("G1", 1)}), _BaHttp())
+        n = await p4.poll_once(now=now, arts=arts)
+        check("★ 中间某张挂 → 仍记账，且记的是**真的发出去了几张**",
+              n == 2 and db4.rows[0][2] == 2, str(db4.rows))
+        check("  ……记的 id 也是真发出去的那几条（不是前 N 个）",
+              ",".join(a.id for a in arts[:1] + arts[2:3]) == db4.rows[0][3], db4.rows[0][3])
+
+        # ---- 逐群隔离 ----
+        db5 = _ba_db()
+        cfg5 = _ba_cfg(tmp, birthday_art_groups=("G1", "G2"))
+        p5 = ba.BirthdayArtPoller(cfg5, db5, _BaSender(fail_first={"G1"}), _BaHttp())
+        n = await p5.poll_once(now=now, arts=arts)
+        check("★ 一个群发失败不连累别的群", n == 3 and db5.posted.get("2026-10-19") == {"G2"},
+              str(db5.posted))
+
+        # ---- 一张图都下不下来 → 这拍不发、不记账 ----
+        db6 = _ba_db()
+        p6 = ba.BirthdayArtPoller(_ba_cfg(tmp), db6, _BaSender(),
+                                  _BaHttp(dead={"name=orig", "name=large"}))
+        n = await p6.poll_once(now=now, arts=arts)
+        check("★ 图一张都下不来 → 不记账，留窗口内重试", n == 0 and not db6.rows)
+
+
+async def _ba_fetch_fallback() -> None:
+    import tempfile as _tf  # noqa: PLC0415
+
+    with _tf.TemporaryDirectory() as td:
+        tmp = Path(td)
+        _bd_cal(tmp)
+        art = _ba_art(1, likes=900)
+
+        # 原图下得动 → 用原图
+        http = _BaHttp()
+        p = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), http)
+        got = await p._download([art], 1)
+        check("原图能下就直接用", len(got) == 1 and any("name=orig" in u for u in http.urls))
+
+        # ★ 原图下不动（多半是超过 3.5MB 的直传上限）→ 退到 large
+        http = _BaHttp(dead={"name=orig"})
+        p = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), http)
+        got = await p._download([art], 1)
+        check("★ 原图下不动时退到 large（实测 5 张里有 1 张原图超限）",
+              len(got) == 1 and any("name=large" in u for u in http.urls), str(http.urls))
+
+        # 两档都下不动 → 跳过，往后补位
+        arts = [_ba_art(i, likes=900 - i) for i in range(1, 5)]
+        http = _BaHttp(dead={"IMG1"})
+        p = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), http)
+        got = await p._download(arts, 2)
+        check("★ 下不动的往后补位，凑满想要的张数",
+              len(got) == 2 and all(a.id != arts[0].id for a, _ in got),
+              str([a.id for a, _ in got]))
+
+
+def _ba_real_table() -> None:
+    from qq_rss_bot.db import Database  # noqa: PLC0415
+    import tempfile as _tf  # noqa: PLC0415
+
+    with _tf.TemporaryDirectory() as td:
+        db = Database(Path(td) / "t.db")
+        check("birthday_art_posted 空库返回空集", db.birthday_art_posted("2026-10-19") == set())
+        db.mark_birthday_art("2026-10-19", "G1", 6, "1,2,3,4,5,6")
+        check("★ 落库后查得到", db.birthday_art_posted("2026-10-19") == {"G1"})
+        db.mark_birthday_art("2026-10-19", "G1", 3, "1,2,3")
+        check("重复标记不炸（PRIMARY KEY 是 day+群）",
+              db.birthday_art_posted("2026-10-19") == {"G1"})
+        row = db._conn.execute(
+            "SELECT sent, tweets FROM birthday_art_posts WHERE day = ?", ("2026-10-19",)
+        ).fetchone()
+        check("★ 重复标记是**覆盖**（sent 反映最后一次的真实条数）",
+              row["sent"] == 3 and row["tweets"] == "1,2,3", str(dict(row)))
+        # ★ 真库上的 clear（探针 --reset 用的就是它）
+        check("★ 真库 clear 说「原来有」", db.clear_birthday_art("2026-10-19", "G1") is True)
+        check("★ 真库 clear 之后查不到了", db.birthday_art_posted("2026-10-19") == set())
+        check("★ 再 clear 一次返回 False（幂等，不炸）",
+              db.clear_birthday_art("2026-10-19", "G1") is False)
+        check("★ clear 只删指定群，别的群不受影响",
+              (db.mark_birthday_art("2026-10-19", "G1", 1, "1"),
+               db.mark_birthday_art("2026-10-19", "G2", 1, "2"),
+               db.clear_birthday_art("2026-10-19", "G1"),
+               db.birthday_art_posted("2026-10-19"))[3] == {"G2"})
+        db.close()
+        # 真实冷数据的分布（只在文件在的时候跑）
+        path = Path(__file__).resolve().parents[1] / "data" / "birthday" / "birthdays.toml"
+        if path.exists():
+            cal = birthday.load_calendar(path)
+            day = cal.for_date(date(2026, 10, 19))
+            check("★ 真实冷数据里 10-19 是杜野凛世",
+                  [i.name for i in day.idols] == ["杜野凛世"], str([i.name for i in day.idols]))
+            n_idol = sum(1 for d in cal.days.values() if d.idols)
+            check("真实冷数据 366 天里有偶像的天数 = 245", n_idol == 245, str(n_idol))
+
+
+def _ba_wiring() -> None:
+    import inspect  # noqa: PLC0415
+
+    from qq_rss_bot.bot import RssBot  # noqa: PLC0415
+
+    init = inspect.getsource(RssBot.__init__)
+    # 构造是跨行的，得取匹配行**往后的几行**，只看那一行会漏掉参数
+    lines = init.splitlines()
+    i = next((n for n, ln in enumerate(lines) if "BirthdayArtPoller(" in ln), -1)
+    call = " ".join(ln.strip() for ln in lines[i : i + 4]) if i >= 0 else ""
+    check("★ 贺图轮询器接的是 **media_http**（带代理那个），不是 rss_http",
+          "self.media_http" in call and "rss_http" not in call, call)
+    check("★ 传了 notifier（cookie 失效要靠它私聊告警）", "notifier=self.notifier" in call, call)
+    check("挂的是 self.birthday_art / self._birthday_art_task",
+          "self.birthday_art = BirthdayArtPoller" in init and "self._birthday_art_task" in init)
+    check("on_ready 里起了这个 task",
+          "self.birthday_art.run()" in inspect.getsource(RssBot.on_ready))
+    check("close() 里停了它", "self.birthday_art.stop()" in inspect.getsource(RssBot.close))
+
+    # ★ cookie 绝不进日志
+    src = Path(ba.__file__).read_text()
+    log_src = "\n".join(ln for ln in src.splitlines() if "_log." in ln)
+    check("★ 日志里只出现长度，不出现 cookie 内容",
+          "x_auth_token" not in log_src and "x_ct0" not in log_src and "_auth" not in log_src)
+    # ★ 请求计数器必须每轮清零 —— 否则跑几天就撞上限、永远不再搜
+    p = ba.BirthdayArtPoller(_ba_cfg(Path("/tmp")), _ba_db(), _BaSender(), _BaHttp())
+    p.x._requests = ba.MAX_REQUESTS - 1
+    p.x.cookie_dead = True
+    p.x.reset()
+    check("★ XSearch.reset() 把请求计数和 cookie_dead 都清零（每轮一次，不是进程一次）",
+          p.x.requests_made == 0 and p.x.cookie_dead is False)
+    import inspect as _insp  # noqa: PLC0415
+    check("★ _collect 每轮开头调了 reset()",
+          "self.x.reset()" in _insp.getsource(ba.BirthdayArtPoller._collect))
+
+    check("★ 两个凭据字段都没被写进任何一条日志",
+          "auth_token=%s" not in src and "ct0=%s" not in src)
+
+    c = cfg_stub()
+    check("cfg_stub 带上贺图字段了（默认值和模块常量一致）",
+          c.birthday_art_time == ba.DEFAULT_TIME
+          and c.birthday_art_max == ba.DEFAULT_MAX
+          and c.birthday_art_min_likes == ba.DEFAULT_MIN_LIKES
+          and c.birthday_art_groups == ()
+          and c.x_auth_token == "")
+
+    # ★ --send 必须**在 httpx 客户端的 with 里**。第一版写在 with 外面，
+    #   而 poll_once 会再搜一次、再下一次图 —— 客户端已经关了，
+    #   必崩 `RuntimeError: Cannot send a request, as the client has been closed`。
+    #   这个 bug 只有真按 --send 才会现形（离线 smoke 和 --search 都照不出来），
+    #   所以在这儿用源码缩进把它钉死。
+    probe = (Path(__file__).resolve().parents[1] / "scripts" / "probe_birthday_art.py").read_text()
+    plines = probe.splitlines()
+    iw = next((n for n, ln in enumerate(plines) if "async with preview.make_client" in ln), -1)
+    ip = next((n for n, ln in enumerate(plines) if "await poller.poll_once(" in ln), -1)
+    # ⚠️ **只比缩进是不够的** —— 错版里 `if do_send:` 在 4、它的 body 在 8，
+    #    while with 的 body 也在 8，缩进看着「在里面」。要比的是**块的结束位置**：
+    #    with 之后第一条缩进回到 with 那一档（或更浅）的非空行，就是块外了。
+    base = len(plines[iw]) - len(plines[iw].lstrip()) if iw >= 0 else -1
+    iend = next(
+        (
+            n
+            for n in range(iw + 1, len(plines))
+            if plines[n].strip() and len(plines[n]) - len(plines[n].lstrip()) <= base
+        ),
+        len(plines),
+    )
+    inside = iw >= 0 and iw < ip < iend
+    check("★ --send 的 poll_once 在 make_client 的 with **里面**（写在外面必崩）", inside,
+          f"with@{iw}..{iend} poll_once@{ip}")
+    check("★ 收尾的 sender.close() 在 with 外面（关客户端不能漏掉关 sender）",
+          "await sender.close()" in probe and ip < next(
+              (n for n, ln in enumerate(plines) if "await sender.close()" in ln), -1))
+
+
+from qq_rss_bot import birthday  # noqa: E402
+from qq_rss_bot import birthday_art as ba  # noqa: E402
+
+_ba_parts()
+_ba_queryid()
+_ba_parse()
+_ba_product()
+_ba_official()
+_ba_rank()
+_ba_render()
+asyncio.run(_ba_poller())
+asyncio.run(_ba_fetch_fallback())
+_ba_real_table()
+_ba_wiring()
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 
 # 默认值只在 ai.py 里写一份，免得两边漂
 from . import ai as ai_module
+# 同上：生日推送的时刻 / 窗口只在 birthday.py 里写一份
+from . import birthday as birthday_module
+# 同上：诞生祭贺图的时刻 / 窗口 / 张数 / 下限只在 birthday_art.py 里写一份
+from . import birthday_art as birthday_art_module
 # 同上：「月曜が近いよ」的时段 / 上限只在 monday.py 里写一份
 from . import monday as monday_module
 from . import morning as morning_module
@@ -225,6 +229,63 @@ class Config:
     # 多久之内不重复同一位偶像。28 位轮一圈约一个月，7 天足够。
     morning_recent_days: int = morning_module.DEFAULT_RECENT_DAYS
 
+    # ===== 偶像生日推送（见 birthday.py 的模块说明）=====
+    #
+    # 每天 23:05（北京时间）推**第二天**的生日 —— 那正好是日本时间的当天 0 点，
+    # 也是 imas_ch 发出当天祝贺图之后。所以 10-18 晚上推的是 10-19 的生日。
+    #
+    # 名单是**冷数据**（`data/birthday/birthdays.toml`，见
+    # scripts/fetch_birthday_source.py），配图每天实时抓 —— 两条链路互相独立，
+    # **抓不到图照样发名单**。
+    birthday_enabled: bool = True
+    # 推到哪些群。**空 = 整个功能关闭。**
+    birthday_groups: tuple[str, ...] = ()
+    # 冷数据目录。**留空就跟着 DB_PATH 走**（本地 `data/birthday`、容器
+    # `/app/data/birthday`），正常情况下不用配。
+    birthday_dir: Path = Path("data/birthday")
+    # 几点发，`HH:MM`，**本地时间**。用户定的是 23:05。
+    birthday_time: str = birthday_module.DEFAULT_TIME
+    # 窗口。⚠️ **和早安那个 180 秒不是一个意思**：早安是纯本地文件，窗口只覆盖
+    # 调度抖动；这里要实时抓推文，所以窗口同时是**抓图的补发窗口** ——
+    # 窗口内每拍重试，到窗口末尾还没抓到就发纯文字。
+    birthday_window_sec: int = birthday_module.DEFAULT_WINDOW_SEC
+
+    # ===== 誕生祭 贺图聚合（见 birthday_art.py 的模块说明）=====
+    #
+    # 每天 22:30（北京时间）搜推特上带生日 tag 的贺图，**一张一条**发到群里
+    # （最多 6 条）。冷数据和上面那条生日推送**共用一份** birthdays.toml。
+    #
+    # ⚠️ 收的是**当天**的贺图 —— 和上面那条生日推送**差一天**（那个 23:05 推的是
+    # **第二天**的名单）。见 birthday_art.art_date() 的说明，写错是整体错位一天。
+    #
+    # ⚠️ 用户原本定的是 12:00，改成了 22:30：贺图的发布高峰是**日本时间当天的
+    # 傍晚到深夜**（= 北京 17:00–23:00），中午去搜只捞得到当天上午那批。
+    # 22:30 北京 = 23:30 JST，当天基本收尾。想改回去改这一个变量就行。
+    birthday_art_enabled: bool = True
+    # 发到哪些群。**空 = 整个功能关闭。**
+    birthday_art_groups: tuple[str, ...] = ()
+    # 几点收，`HH:MM`，本地时间。
+    birthday_art_time: str = birthday_art_module.DEFAULT_TIME
+    # 重试窗口 —— 搜索失败（网络抖 / 被限流）时窗口内每拍重试。
+    # **不是补发窗口**：贺图早就躺在那儿了，纯粹是重试。
+    birthday_art_window_sec: int = birthday_art_module.DEFAULT_WINDOW_SEC
+    # 一天最多发几张（一条一张）。
+    birthday_art_max: int = birthday_art_module.DEFAULT_MAX
+    # 点赞软下限。用户原话是「点赞超过 2k」，但实测当天最高也就 464、
+    # **按 2k 筛一条都不剩**，所以真正起作用的是「按点赞取前 N」，这个数只是
+    # 「别发一堆 0 赞垃圾」的兜底。想让冷门偶像一张都不发就往上调。
+    birthday_art_min_likes: int = birthday_art_module.DEFAULT_MIN_LIKES
+    birthday_art_exclude: tuple[str, ...] = ()
+    birthday_art_skip_official: bool = True
+
+    # ===== X 搜索凭据（誕生祭 贺图用）=====
+    # ⚠️ **真实凭据**：只从 `.env` / 环境变量读，**绝不打印**（日志里只出现长度）、
+    # **绝不提交**（仓库是公开的）。拿账号 cookie 做自动化访问**违反 X 的条款**，
+    # 有被封的风险 —— **用小号**。
+    # 拿法：浏览器登录 x.com → DevTools → Application → Cookies → x.com。
+    x_auth_token: str = ""
+    x_ct0: str = ""
+
     # ===== AI 摘要（抓正文 + DeepSeek 翻译/精简）=====
     # 按源开关，默认所有源都是关的（`subscriptions.ai_enabled`）。
     # key 留空 = 整个功能关掉，不报错。
@@ -319,6 +380,24 @@ def load_config() -> Config:
     if morning_recent_days < 0:
         raise SystemExit(f"MORNING_RECENT_DAYS 不能是负数：{morning_recent_days}")
 
+    # 生日冷数据目录：和上面两条一字不差的推导 —— 留空就跟着 DB_PATH 走，
+    # 容器里 DB_PATH=/app/data/bot.db，所以默认 /app/data/birthday。
+    birthday_dir_raw = _env_str("BIRTHDAY_DIR", "")
+    birthday_dir = (
+        Path(birthday_dir_raw) if birthday_dir_raw else db_path.parent / "birthday"
+    )
+    if not birthday_dir.is_absolute():
+        birthday_dir = PROJECT_ROOT / birthday_dir
+    # 时间同样在启动时校验。写错要等到 23:05 那一拍才炸 —— 而那正好是唯一
+    # 该发消息的时刻。**注意这里只校验格式，文件存不存在在轮询器里判**
+    # （冷数据是 gitignore 的，全新部署本来就没有，不该连累机器人起不来）。
+    birthday_time = _env_str("BIRTHDAY_TIME", birthday_module.DEFAULT_TIME)
+    birthday_module.parse_time(birthday_time)
+
+    # 贺图的时刻同样在启动时校验（理由同上：写错要等到该发的那一刻才炸）。
+    birthday_art_time = _env_str("BIRTHDAY_ART_TIME", birthday_art_module.DEFAULT_TIME)
+    birthday_art_module.parse_time(birthday_art_time)
+
     return Config(
         appid=appid,
         secret=secret,
@@ -377,6 +456,27 @@ def load_config() -> Config:
             "MORNING_WINDOW_SEC", morning_module.DEFAULT_WINDOW_SEC
         ),
         morning_recent_days=morning_recent_days,
+        birthday_enabled=_env_bool("BIRTHDAY_ENABLED", True),
+        birthday_groups=_env_list("BIRTHDAY_GROUPS"),
+        birthday_dir=birthday_dir,
+        birthday_time=birthday_time,
+        birthday_window_sec=_env_int(
+            "BIRTHDAY_WINDOW_SEC", birthday_module.DEFAULT_WINDOW_SEC
+        ),
+        birthday_art_enabled=_env_bool("BIRTHDAY_ART_ENABLED", True),
+        birthday_art_groups=_env_list("BIRTHDAY_ART_GROUPS"),
+        birthday_art_time=birthday_art_time,
+        birthday_art_window_sec=_env_int(
+            "BIRTHDAY_ART_WINDOW_SEC", birthday_art_module.DEFAULT_WINDOW_SEC
+        ),
+        birthday_art_max=_env_int("BIRTHDAY_ART_MAX", birthday_art_module.DEFAULT_MAX),
+        birthday_art_min_likes=_env_int(
+            "BIRTHDAY_ART_MIN_LIKES", birthday_art_module.DEFAULT_MIN_LIKES
+        ),
+        birthday_art_exclude=_env_list("BIRTHDAY_ART_EXCLUDE"),
+        birthday_art_skip_official=_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", True),
+        x_auth_token=_env_str("auth_token", ""),
+        x_ct0=_env_str("ct0", ""),
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),
         ai_base_url=_env_str("DEEPSEEK_BASE_URL", ai_module.DEFAULT_BASE_URL),
         ai_model=_env_str("DEEPSEEK_MODEL", ai_module.DEFAULT_MODEL),

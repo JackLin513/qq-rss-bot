@@ -1035,11 +1035,17 @@ uv run python scripts/probe_monday.py --group <openid> --send   # 才真发
 ## 小偶像的每日早安语音
 
 每天早上 **07:30**（北京时间）随机挑一位《偶像大师 闪耀色彩》的偶像，
-用她的声线说一句**带她口癖**的日语早上好。**只发语音气泡，没有字幕。**
+发**两条**消息：一张头像 + 「角色名 / 日语原文」，然后一条 2~4 秒的语音。
 
 ```
+🖼  [头像]  櫻木真乃
+            おはよう、プロデューサーさん
 🔊  （一条 2~4 秒的语音，点开就播）
 ```
+
+（原先只发语音，但**群里没人点开听**，所以 2026-10-20 加了头像和文字。
+`msg_type=7` 一条消息只能带一个媒体，所以必然是两条。
+缺头像或缺文字时**退回纯语音**，不会发一条光秃秃的图。）
 
 差别靠**自称 / 对制作人的称呼 / 句尾口癖 / 语气**拉开 ——
 真乃的「ほわっ」、摩美美的拖长音、恋鐘的佐世保方言「〜ばい」、
@@ -1058,8 +1064,14 @@ uv venv /tmp/silkvenv && uv pip install --python /tmp/silkvenv/bin/python silk-p
 uv run python scripts/make_morning.py --only mano     # 先做一位试听
 uv run python scripts/make_morning.py                 # 全量（缺什么补什么）
 
-# ④ 同步到 NAS（**只要 audio/**，别把 source/ 和 lines.toml 传上去）
-rsync -av data/morning/audio/ nas:/volume1/docker/qq-rss-bot/data/morning/audio/
+# ④ 裁头像（Mac 上离线跑，用 ffmpeg；源图不在就 --fetch 现下）
+uv run python scripts/crop_morning_avatar.py --fetch
+
+# ⑤ 同步到 NAS —— **audio/ + .manifest.json + avatar/ 三样缺一不可**
+#    漏了 manifest 的症状是「早安的文字静默消失」；别把 source/ 和 lines.toml
+#    传上去，那两个运行时用不上（lines.toml 是离线的台词表，建议自己另存一份）
+rsync -av data/morning/audio data/morning/avatar data/morning/.manifest.json \
+      nas:/volume1/docker/qq-rss-bot/data/morning/
 ```
 
 **为什么不在容器里合成**：那样就得把 `pysilk` 装进镜像、把 Fish Audio 的 key
@@ -1155,6 +1167,184 @@ uv run python scripts/probe_morning_all.py --group <openid> --send
 
 **`data/morning/` 整个不进 git**（`data/` 已在 `.gitignore` 里）——
 这既是版权要求，也顺带保证抓来的第三方资料不会进这个公开仓库。
+
+## 偶像生日推送
+
+每天 **23:05**（北京时间）一条：当天过生日的**偶像 + 声优**名单，配一张
+imas_ch 发的祝贺图（多个偶像合并在一张图里，所以**只发一条**）。
+
+```
+🎂 2026/10/19 本日のお誕生日:
+杜野凛世
+榎木淳弥 (舞田類役)
+大塚剛央 (眉見鋭心役)
+土屋翔 (舞台SideM 伊瀬谷四季役)
+```
+
+**名单一位不落** —— 961プロ、Xenoglossia、その他 全都发，不做任何品牌过滤。
+
+### ⚠️ 23:05 推的是**第二天**的生日
+
+生日推送的正日子是**日本时间当天 0 点** —— imas_ch 正好在北京时间 **23:00**
+（= 日本 0 点）发那条祝贺推。所以 **10-18 晚上 23:05 收到的是 10-19 的生日**，
+库里也按被祝福的那天（`2026-10-19`）记，不按推送那天。
+
+### 名单是冷数据，配图每天抓
+
+| | 来源 | 什么时候取 |
+|---|---|---|
+| **名单** | `data/birthday/birthdays.toml` | 扒一次存着，运行时只读本地文件 |
+| **配图** | `https://x.com/imas_ch` 当天那条推 | 每天实时抓 |
+
+两条链路**互相独立**：名单是角色设定、不会变，所以不用每天依赖 imas-db；
+抓不到图只是少一张图，**名单照样发**（窗口末尾 5 分钟后退化成纯文字）。
+
+```bash
+# 扒冷数据（要挂代理；产出 366 天 / 382 位偶像 / 313 位声优）
+uv run python scripts/fetch_birthday_source.py
+#   → data/birthday/birthdays.toml（data/ 不进 git，同步到 NAS 时手动传）
+
+# 离线看：冷数据统计、被祝福的那天、渲染出来的原文、库里发过哪些群
+uv run python scripts/probe_birthday.py
+uv run python scripts/probe_birthday.py --now 2026-10-18T23:05
+uv run python scripts/probe_birthday.py --fetch                 # 真去抓一次推文
+uv run python scripts/probe_birthday.py --group <openid> --send # 才真发（只发测试群）
+```
+
+### 为什么配图要我们自己下载
+
+`pbs.twimg.com` 的图**不能交给 QQ 去抓** —— QQ 的服务器在国内，够不到
+Twitter 的图床（和 `i.ytimg.com` 是同一个问题）。所以我们下字节 → base64 →
+`post_group_file`。容器直连 `x.com` / `pbs.twimg.com` 也全不通，必须走
+`MEDIA_PROXY`。
+
+## 誕生祭 贺图聚合
+
+偶像生日那天，粉丝和画师会带 `#杜野凛世誕生祭2026` 这样的 tag 发贺图。
+每天 **22:30**（北京时间）搜这个话题，把点赞高的挑出来，**一张一条**发到群里
+（最多 6 条）：
+
+```
+🎨 杜野凛世 誕生祭 2026（1/5）
+♥ 500 · 画师 @fakecolor_mono
+https://x.com/fakecolor_mono/status/2112169814378856902
+```
+
+**署名和原推链接是必须的** —— 群里看到喜欢的那张能直接找到画师。
+
+### 需要什么
+
+| 项 | 说明 |
+|---|---|
+| `BIRTHDAY_ART_GROUPS` | 发到哪些群（group_openid）。**留空 = 功能关闭** |
+| `auth_token` / `ct0` | **一个 X 小号**的 cookie。⚠️ 用小号，拿 cookie 做自动化访问违反 X 的条款 |
+| `MEDIA_PROXY` | 和生日推送共用。容器直连 x.com 是登录墙 + SSL 超时 |
+
+三样缺一不可，缺哪样启动日志都会写清楚。
+
+### ⚠️ 数据源只有一条路：带 cookie **POST** X 的 GraphQL
+
+实测四条路只有一条通：
+
+| 传输 | 结果 |
+|---|---|
+| `GET x.com/search?q=…&f=live`（未登录） | ❌ 307 → 登录引导页 |
+| `GET x.com/search?q=…&f=live`（**带 cookie**） | ⚠️ 200 / 307 KB，但 **HTML 里一条推文都没有**（登录态只有 JS 壳） |
+| `GET …/graphql/<id>/SearchTimeline`（带 cookie） | ❌ **404 空响应** |
+| **`POST` 同一个地址** | ✅ **200**，20 条推文 + 点赞数 + 图 |
+
+决定成败的是 **POST**，不是那几个头 —— GET 加什么头都是 404，POST 用最朴素的
+头就通（网上流传的示例几乎清一色是 GET，照抄就是 404）。
+
+`queryId` 会随 X 前端发版轮换，所以是**从 JS bundle 里现抠**的，不写死。
+
+### ⚠️ 搜索必须走「Top」（热度）栏，不能走「最新」栏
+
+这是这个功能最大的一个坑，而且**不报错，只是结果静默变差**。
+
+2026-10-19 `杜野凛世` 当天实测（同一个 cookie、同一个 queryId）：
+
+| 查询 | 条数 | 中位赞 | 最高赞 | ≥2000 |
+|---|---|---|---|---|
+| `#杜野凛世誕生祭2026` **Top** | 39 | 459 | **8591** | **6 条** |
+| `#杜野凛世誕生祭2026` Latest | 34 | 11 | 1119 | 0 条 |
+| `#杜野凛世生誕祭2026` **Top** | 38 | 782 | **8591** | **8 条** |
+| `#杜野凛世生誕祭2026` Latest | 35 | 5 | 240 | 0 条 |
+
+「最新」是**按时间倒序**的最新 60 条。生日当天有成百上千条推，最新那批全是
+深夜发的小号；而点赞最高的那批大多发在 **00:00 JST**（生日刚开始那一刻），
+按时间倒序要翻一整天的量才够得着。
+
+> 第一版就是走的「最新」，于是得出「当天最高才 464 赞、2k 门槛会筛成空」的
+> 错误结论 —— 用户说的「2k 以上」是对的。现在已经改成
+> `PAGE_PLAN_YEARFUL = ("Top", "Top", "Latest")`。
+
+### 官方号不占名额
+
+官方号发的是告知、不是粉丝贺图，而且赞数最高 —— 不排就永远占着第 1 名。
+默认排掉（`BIRTHDAY_ART_SKIP_OFFICIAL=true`），两条规则：
+
+- **显示名里带「公式」** ← 主力。官方号会新增、会改 handle，但名字里那句
+  「公式」跑不掉（实测 `@imassc_official` 的名字就是
+  「アイドルマスター シャイニーカラーズ公式」，8596 赞排第一）。
+- **写死的 handle 表**（`imassc_official` / `imas_official` / `imas_ch`）——
+  兜住名字里不带「公式」的那种。
+
+漏网的可以用 `BIRTHDAY_ART_EXCLUDE=` 补（逗号分隔，不用写 `@`）。
+
+### 点赞门槛：起作用的是排序，不是门槛
+
+真正的机制是「**按点赞排序取前 6**」；`BIRTHDAY_ART_MIN_LIKES` 默认 50 只是
+「别发一堆 0 赞垃圾」的兜底（热度栏第二页实测能到 0 赞）。
+
+所以实际规则是「**按点赞排序取前 6**」，`BIRTHDAY_ART_MIN_LIKES`（默认 50）
+只是一个「别发一堆 0 赞垃圾」的软下限。另外：
+
+- **每位画师最多 1 张**（防止高产画师刷屏）
+- **每位偶像至少保 1 张**（一天最多 6 位偶像，不保底的话最火的那位会把名额吃光）
+- **两种 tag 写法都搜**（`誕生祭` / `生誕祭` 实测只重叠 8/40，各是一批人）
+- 转推、敏感内容、没有图的，一律跳过
+
+### ⚠️ 22:30 而不是 12:00
+
+贺图的发布高峰是**日本时间当天的傍晚到深夜**（= 北京 17:00–23:00）。
+北京中午去搜只捞得到当天上午那批，画师还没画完。22:30 北京 = **23:30 JST**，
+生日当天基本收尾。想改回去改 `BIRTHDAY_ART_TIME` 一个变量就行。
+
+### ⚠️ 和生日推送**差一天**
+
+| | 推/收哪天 |
+|---|---|
+| 生日推送（23:05） | **第二天**的名单 |
+| 誕生祭贺图（22:30） | **当天**的图 |
+
+所以同一个晚上会先后收到「今天的贺图」和「明天的生日预告」，各说各的事。
+
+### cookie 失效在群里是看不见的
+
+症状就是「今天没图」—— 和「今天真没人画」一模一样。所以识别到登录墙时会
+**私聊告警**（复用现有的 `C2CNotifier`，自带 30 分钟冷却）。
+
+```bash
+# 传输诊断（X 改版导致功能挂掉时先跑这个）
+uv run python scripts/probe_x_search.py --tag '#杜野凛世誕生祭2026'
+
+# 离线看这一拍会收什么（默认一条不发、一次网都不上）
+uv run python scripts/probe_birthday_art.py
+uv run python scripts/probe_birthday_art.py --now 2026-10-19T22:30
+uv run python scripts/probe_birthday_art.py --search            # 真搜，只打印不发
+uv run python scripts/probe_birthday_art.py --search --download # 顺带验图能不能下来
+uv run python scripts/probe_birthday_art.py --group <openid> --send  # 才真发（只发测试群）
+uv run python scripts/probe_birthday_art.py --group <openid> --reset # 先清账（重测同一天用）
+```
+
+> ⚠️ `--send` 跑第二次会「发出去 0 条」—— 那是**幂等**（同一天同一个群不重复
+> 发），不是坏了。想拿同一天重测要先清账：`--group <openid> --reset --send`。
+
+### 版权
+
+贺图是画师的作品，发到粉丝群里属于自用性质 —— **署名 + 原推链接是必须的**。
+图片落临时目录、用完就删，**不落盘、不进 git**。
 
 ## 推送配图
 
@@ -1306,6 +1496,8 @@ src/qq_rss_bot/
   tickets.py     ASOBI TICKET 抽票提醒（含 slug=品牌 的判据和三个反例）
   monday.py      月曜が近いよ 每周播报（含视频 10 MiB 上限的实测表）
   morning.py     小偶像每日早安语音（含「语音上传不校验格式」的实测结论）
+  birthday.py    偶像生日推送（含「23:05 推的是第二天」和推文解析的死路清单）
+  birthday_art.py 誕生祭贺图聚合（含「只有 POST 通」和点赞分布的实测数据）
   bot.py         botpy 客户端，事件 → 指令/轮询
 scripts/
   smoke.py            离线逻辑 + 真实抓取
@@ -1317,6 +1509,13 @@ scripts/
   probe_monday.py     看月曜播报会挑哪个视频、slot 对不对（默认不发消息）
   fetch_morning_source.py  抓小偶像的人设/档案/读音表（GitHub 直连，不进 git）
   make_morning.py          离线合成早安语音（Fish Audio + pysilk + 代理，只在 Mac 跑）
+  crop_morning_avatar.py   从官方立绘大图裁 28 张头像（ffmpeg，只在 Mac 跑）
+  backfill_morning_names.py 给已有的 manifest 补 `name` 字段（**不用重跑 TTS**）
   probe_morning.py         看早安会挑谁和哪一条、哪些文件被跳过（默认不发消息）
   probe_morning_all.py     把 audio/ 里 196 条**全部**发一遍试听（默认只列清单）
+  probe_morning_card.py    试「头像+文字」那两条消息的真发效果（默认不发消息）
+  fetch_birthday_source.py 扒偶像生日冷数据（imas-db.jp，要挂代理，不进 git）
+  probe_birthday.py        看生日会推什么、图抓不抓得到（默认不发消息、不上网）
+  probe_birthday_art.py    看贺图会收什么、排名和文案（默认不发消息、不上网）
+  probe_x_search.py        X 搜索的传输诊断（cookie / SSR / queryId / POST）
 ```
