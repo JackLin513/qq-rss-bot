@@ -289,3 +289,4 @@ sudo docker compose up -d --force-recreate bot
 | 偶像生日推送（23:05） | `birthday.py` | [`docs/birthday.md`](docs/birthday.md) |
 | 誕生祭 贺图聚合（22:30） | `birthday_art.py` | [`docs/birthday-art.md`](docs/birthday-art.md) |
 | 限流、配额与出错通知 | `quota.py` `notify.py` | [`docs/quota-notify.md`](docs/quota-notify.md) |
+| 群复读机（连着两个人发同样的话就跟一句） | `repeat.py` | [`docs/repeat.md`](docs/repeat.md) |

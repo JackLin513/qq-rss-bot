@@ -7,6 +7,7 @@ import base64
 import itertools
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ import botpy
 import httpx
 from botpy.message import GroupMessage
 
-from . import ai, bilibili, preview
+from . import ai, bilibili, preview, repeat
 from .autosub import AutoSubscriber
 from .commands import (
     ADMIN_ROLES,
@@ -132,6 +133,15 @@ class RssBot(botpy.Client):
             cfg, self.db, self.sender, self.media_http, notifier=self.notifier
         )
         self._birthday_art_task: Any = None
+        # 群复读机：连着两个人发同样的话，跟着复读一句。**没有 task** ——
+        # 它挂在 `on_group_message_create` 那条路上，每条非 @ 群消息都会喂进来
+        # 一次（`consider` 有副作用，不能只在「看起来像复读」时才调）。
+        # `REPEAT_ENABLED=false` 或 `REPEAT_GROUPS` 留空都等于关闭。
+        self.repeater = repeat.Repeater(
+            cfg.repeat_groups if cfg.repeat_enabled else (),
+            max_len=cfg.repeat_max_len,
+            gap_sec=cfg.repeat_gap_sec,
+        )
 
     # ---------- 生命周期 ----------
 
@@ -319,14 +329,18 @@ class RssBot(botpy.Client):
         """
         bot_name = getattr(self.robot, "name", None)
         if not is_bot_mentioned(message.content, message.mentions, bot_name):
-            # 只有真的没做任何事才记「忽略」——这行日志是当初发现
-            # 「平台在推全量群消息」的线索，语义别改。
             # 依次问两个预览。bilibili 在前 —— 它有四种分享形态（含没有链接
             # 的小程序卡片），而 YouTube/X 只认纯文本里的链接，顺序不影响结果。
-            if not (
+            previewed = (
                 await self._preview_bilibili(message)
                 or await self._preview_media(message)
-            ):
+            )
+            # 复读机**每条都要喂**（`consider` 有副作用，只在「看起来像复读」
+            # 时才调的话状态里的「上一条」会错位）。预览处理过的传 skip=True。
+            repeated = await self._maybe_repeat(message, skip=previewed)
+            # 只有真的没做任何事才记「忽略」——这行日志是当初发现
+            # 「平台在推全量群消息」的线索，语义别改。
+            if not (previewed or repeated):
                 _log.debug("忽略非 @ 消息: %r", message.content)
             return
         await self._handle_group_message(message)
@@ -393,6 +407,40 @@ class RssBot(botpy.Client):
         await self.commands.handle(ctx, text)
 
     # ---------- 内部工具 ----------
+
+    async def _maybe_repeat(self, message: GroupMessage, *, skip: bool) -> bool:
+        """群复读机：连着两个人发同样的话，跟着复读一句。返回是否**真跟了**。
+
+        走**被动回复**（和预览同一条路）—— 不占主动消息配额，也不需要群里开
+        「机器人主动在群聊内发言」。代价是客户端会把它渲染成**引用回复**，
+        而不是一条光秃秃的复读。想改成普通消息就换 `self.sender.send_text`。
+
+        ⚠️ 这里**新建**了一个 `_make_repliers`，`msg_seq` 从 1 开始。这只有在
+        `skip=False`（没有任何预览回过这条消息）时才安全 —— 否则会和预览撞
+        seq，后发的那条被**静默丢弃**。所以**别在 skip=True 的分支里发东西**。
+        """
+        if not self.repeater.enabled:
+            return False
+        sender = getattr(getattr(message, "author", None), "member_openid", "") or ""
+        body = self.repeater.consider(
+            message.group_openid,
+            message.content or "",
+            sender,
+            now=time.monotonic(),
+            skip=skip,
+        )
+        if body is None:
+            return False
+        reply, _, _ = self._make_repliers(message)
+        try:
+            await reply(body)
+        except Exception as exc:  # noqa: BLE001
+            # 复读失败**只记日志**，不往上抛 —— 它是个锦上添花的群功能，
+            # 而这条路上还跑着预览和指令，不能因为复读发不出去就影响它们。
+            _log.warning("复读：%s 发送失败：%s", message.group_openid[:8], exc)
+            return False
+        _log.info("复读：%s → %r", message.group_openid[:8], body[:30])
+        return True
 
     async def _preview_bilibili(self, message: GroupMessage) -> bool:
         """非 @ 的群消息里如果有 bilibili 链接，回一张带封面和数据的卡片。

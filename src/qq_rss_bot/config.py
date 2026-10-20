@@ -18,6 +18,8 @@ from . import birthday_art as birthday_art_module
 # 同上：「月曜が近いよ」的时段 / 上限只在 monday.py 里写一份
 from . import monday as monday_module
 from . import morning as morning_module
+# 同上：复读机的长度上限和冷却只在 repeat.py 里写一份
+from . import repeat as repeat_module
 # 同上：抽票的品牌白名单和接口地址只在 tickets.py 里写一份
 from . import tickets as tickets_module
 
@@ -54,6 +56,18 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise SystemExit(f"环境变量 {name} 必须是整数，当前值：{raw!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    """浮点环境变量。**空串按「没配」处理** —— 和 `_env_str` 同一个口径，
+    `.env.example` 里留空的那行复制过来不该变成 `float("")` 崩掉。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise SystemExit(f"环境变量 {name} 必须是数字，当前值：{raw!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -209,6 +223,19 @@ class Config:
     # 容忍多久的调度抖动。**这不是补发窗口** —— 用户明确选了「不补发」，
     # 所以它只该覆盖 tick 间隔（60 秒），别调成几小时。
     monday_window_sec: int = monday_module.DEFAULT_WINDOW_SEC
+
+    # ===== 群复读机（见 repeat.py 的模块说明）=====
+    #
+    # 连着**两个人**发同样的话，机器人跟着复读一句。用户 2026-10-20 定的规则。
+    # ⚠️ 这个功能和别的不同：**每条群消息都可能触发**，不是定时任务。
+    repeat_enabled: bool = True
+    # 跟到哪些群。**空 = 整个功能关闭。** 先只填两个测试群 —— 正式群里
+    # 复读频率合不合适还没验证过。
+    repeat_groups: tuple[str, ...] = ()
+    # 超过这个长度就不跟（复读长文像刷屏）。
+    repeat_max_len: int = repeat_module.DEFAULT_MAX_LEN
+    # 同一个群两次复读之间的最小间隔（秒）。防的是「一群人反复刷同一句」。
+    repeat_gap_sec: float = repeat_module.DEFAULT_GAP_SEC
 
     # ===== 小偶像的每日早安语音（见 morning.py 的模块说明）=====
     #
@@ -448,6 +475,10 @@ def load_config() -> Config:
         monday_weekday=monday_weekday,
         monday_time=monday_time,
         monday_window_sec=_env_int("MONDAY_WINDOW_SEC", monday_module.DEFAULT_WINDOW_SEC),
+        repeat_enabled=_env_bool("REPEAT_ENABLED", True),
+        repeat_groups=_env_list("REPEAT_GROUPS"),
+        repeat_max_len=_env_int("REPEAT_MAX_LEN", repeat_module.DEFAULT_MAX_LEN),
+        repeat_gap_sec=_env_float("REPEAT_GAP_SEC", repeat_module.DEFAULT_GAP_SEC),
         morning_enabled=_env_bool("MORNING_ENABLED", True),
         morning_groups=_env_list("MORNING_GROUPS"),
         morning_dir=morning_dir,

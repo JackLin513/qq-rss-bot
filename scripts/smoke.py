@@ -7443,6 +7443,234 @@ asyncio.run(_ba_fetch_fallback())
 _ba_real_table()
 _ba_wiring()
 
+# ---------------------------------------------------------------------------
+# 群复读机
+# ---------------------------------------------------------------------------
+
+print("[4.98] 群复读机（全离线）")
+
+
+def _rp_parts() -> None:
+    """归一化 + 开关。"""
+    from qq_rss_bot import repeat as _rp  # noqa: PLC0415
+
+    check("默认长度上限 200 / 冷却 20 秒（config 的默认值从这里取）",
+          _rp.DEFAULT_MAX_LEN == 200 and _rp.DEFAULT_GAP_SEC == 20.0,
+          f"{_rp.DEFAULT_MAX_LEN} / {_rp.DEFAULT_GAP_SEC}")
+
+    check("★ 剥 `<@OPENID>` 占位符（**指令面板按钮补的就是这种**）",
+          _rp.normalize("<@C371C51BA906A22E> 今天好累啊") == "今天好累啊",
+          repr(_rp.normalize("<@C371C51BA906A22E> 今天好累啊")))
+    check("剥 `@显示名`（手工 @ 的那种）",
+          _rp.normalize("@猪排爱好者 今天好累啊") == "今天好累啊",
+          repr(_rp.normalize("@猪排爱好者 今天好累啊")))
+    check("★ 两个人 @ 了**不同的人**、说同一句话 → 归一化后相等（这才算复读）",
+          _rp.normalize("<@AAAA> 哈哈") == _rp.normalize("@张三 哈哈"),
+          repr(_rp.normalize("<@AAAA> 哈哈")))
+    check("连续空白压成一个空格",
+          _rp.normalize("今天   好累\t啊") == "今天 好累 啊",
+          repr(_rp.normalize("今天   好累\t啊")))
+    check("空 / None → 空串",
+          _rp.normalize("") == "" and _rp.normalize(None) == "")
+
+    check("★ `REPEAT_GROUPS` 留空 = 整个功能关闭", _rp.Repeater([]).enabled is False)
+    check("配了群才 enabled", _rp.Repeater(["G1"]).enabled is True)
+    check("★ 不在名单里的群一条都不跟（而且不推进状态）",
+          _rp.Repeater(["OTHER"]).consider("G1", "X", "A", now=0) is None)
+
+
+def _rp_trigger() -> None:
+    """触发条件：五条全中才跟。"""
+    from qq_rss_bot import repeat as _rp  # noqa: PLC0415
+
+    r = _rp.Repeater(["G1"])
+    check("★ 第 1 个人发 → **不跟**（机器人不自己起头）",
+          r.consider("G1", "今天好累啊", "A", now=0) is None)
+    check("★★ 第 2 个人发同样的话 → 跟，返回那句原文",
+          r.consider("G1", "今天好累啊", "B", now=1) == "今天好累啊")
+    check("★ 第 3 个人发 → **不跟**（跟完就清了状态）",
+          r.consider("G1", "今天好累啊", "C", now=2) is None)
+
+    r2 = _rp.Repeater(["G1"])
+    r2.consider("G1", "X", "A", now=0)
+    check("★ 同一个人连发两遍 → **不跟**（那不是复读）",
+          r2.consider("G1", "X", "A", now=1) is None)
+    check("  但他发第三遍时另一个人跟上了 → 跟",
+          r2.consider("G1", "X", "B", now=2) == "X")
+
+    # ⚠️ 这里必须把冷却关掉（gap_sec=0），否则**冷却会先一步挡住**，
+    # 于是「跟过就不再跟」那条刹车坏掉了也测不出来 —— 变异测试验过。
+    r3 = _rp.Repeater(["G1"], gap_sec=0)
+    r3.consider("G1", "X", "A", now=0)
+    r3.consider("G1", "X", "B", now=0)
+    check("★ 同一句跟过一次之后再来两个人也不跟（**防自激循环的刹车**）",
+          r3.consider("G1", "X", "A", now=0) is None
+          and r3.consider("G1", "X", "B", now=0) is None)
+    r3.consider("G1", "别的话", "A", now=0)
+    check("★ 群里出现别的文本之后，那句又能跟了",
+          r3.consider("G1", "别的话", "B", now=0) == "别的话")
+
+    r4 = _rp.Repeater(["G1"], gap_sec=20)
+    r4.consider("G1", "P", "A", now=0)
+    check("冷却默认值下第 2 个人照跟（`now` 从 0 起算也一样）",
+          r4.consider("G1", "P", "B", now=1) == "P")
+    r4.consider("G1", "Q", "A", now=2)
+    check("★ 冷却窗口内换个句子也不跟",
+          r4.consider("G1", "Q", "B", now=5) is None)
+    check("★ 冷却过了就恢复（`_at` 记的是上次**复读**的时刻，不是上次消息）",
+          r4.consider("G1", "Q", "A", now=30) == "Q")
+
+    r5 = _rp.Repeater(["G1", "G2"])
+    r5.consider("G1", "X", "A", now=0)
+    r5.consider("G2", "Y", "A", now=0)
+    check("★ 两个群的状态互不干扰",
+          r5.consider("G2", "Y", "B", now=1) == "Y"
+          and r5.consider("G1", "X", "B", now=1) == "X")
+
+
+def _rp_skip() -> None:
+    """不跟的东西 + 预览跳过。"""
+    from qq_rss_bot import repeat as _rp  # noqa: PLC0415
+
+    r = _rp.Repeater(["G1"])
+    for label, text in (("空消息", ""), ("纯空白", "   "),
+                        ("指令（`/` 开头）", "/list"),
+                        ("超长文本", "长" * 201)):
+        r.consider("G1", text, "A", now=0)
+        r.consider("G1", text, "B", now=1)
+        check(f"★ {label} → 不跟（而且不留在状态里）",
+              r.consider("G1", text, "A", now=2) is None)
+
+    r6 = _rp.Repeater(["G1"], max_len=300)
+    check("长度上限可以调（同样 201 字：默认 200 不跟，调到 300 就正常跟）",
+          _rp.Repeater(["G1"]).consider("G1", "长" * 201, "A", now=0) is None
+          and _rp.Repeater(["G1"]).consider("G1", "长" * 201, "B", now=1) is None
+          and r6.consider("G1", "长" * 201, "A", now=0) is None
+          and r6.consider("G1", "长" * 201, "B", now=1) is not None)
+
+    r2 = _rp.Repeater(["G1"])
+    r2.consider("G1", "分享的链接", "A", now=0)
+    check("★ `skip=True`（预览回过了）→ 不跟",
+          r2.consider("G1", "分享的链接", "B", now=1, skip=True) is None)
+    check("★ 而且它**不能留在状态里** —— 否则下一条正常消息会拿它当「上一条」",
+          r2.consider("G1", "正常的话", "C", now=2) is None
+          and r2.consider("G1", "正常的话", "D", now=3) == "正常的话")
+
+
+def _rp_wiring() -> None:
+    """接线：bot.py 真的挂上了、走的是被动回复、config 字段对得上。"""
+    import dataclasses  # noqa: PLC0415
+    import inspect  # noqa: PLC0415
+
+    from qq_rss_bot import repeat as _rp  # noqa: PLC0415
+    from qq_rss_bot.bot import RssBot as _RB  # noqa: PLC0415
+
+    init = inspect.getsource(_RB.__init__)
+    check("★ `RssBot.__init__` 里建了 self.repeater",
+          "self.repeater = repeat.Repeater(" in init)
+    check("★ `REPEAT_ENABLED=false` 时传空元组（= 关闭）",
+          "cfg.repeat_groups if cfg.repeat_enabled else ()" in init, "")
+
+    raw = inspect.getsource(_RB._maybe_repeat)
+    # 只查**代码**，不查 docstring —— 说明里正好提到了 `self.sender.send_text`
+    # 这条替代方案，不剥掉的话会把注释当成实现来判。
+    _, _, after = raw.partition('"""')
+    _, _, code = after.partition('"""')
+    check("★ 走**被动回复**（`_make_repliers`），不是主动消息",
+          "_make_repliers" in code and "self.sender" not in code,
+          str([ln.strip() for ln in code.splitlines() if "sender" in ln]))
+    check("  而且确实是 `await reply(...)` 发出去的", "await reply(" in code)
+    check("★ 发送失败**只记日志**，不往上抛（这条路上还跑着预览和指令）",
+          "except Exception" in code and "_log.warning" in code)
+    check("★ 复读前先看 `repeater.enabled`（没配群就一次都不进状态机）",
+          "if not self.repeater.enabled" in code)
+
+    hook = inspect.getsource(_RB.on_group_message_create)
+    check("★ 非 @ 那条路上真的调了 `_maybe_repeat`",
+          "_maybe_repeat" in hook)
+    check("★ 传了 `skip=previewed`（预览回过的分享不参与复读）",
+          "skip=previewed" in hook, "")
+    check("★ 「忽略非 @ 消息」那行日志的语义没变（只在**真的什么都没做**时才记）",
+          "if not (previewed or repeated):" in hook, "")
+
+    cfg = cfg_stub()
+    check("cfg_stub 带上复读字段了（默认值和模块常量一致）",
+          cfg.repeat_max_len == _rp.DEFAULT_MAX_LEN
+          and cfg.repeat_gap_sec == _rp.DEFAULT_GAP_SEC
+          and cfg.repeat_enabled is True and cfg.repeat_groups == (),
+          f"{cfg.repeat_max_len} {cfg.repeat_gap_sec} {cfg.repeat_groups}")
+
+
+def _rp_end_to_end() -> None:
+    """拿真的 `RssBot._maybe_repeat` 跑一遍（假 message + 假 replier）。"""
+    from qq_rss_bot import repeat as _rp  # noqa: PLC0415
+    from qq_rss_bot.bot import RssBot as _RB  # noqa: PLC0415
+
+    class _Author:
+        def __init__(self, oid: str) -> None:
+            self.member_openid = oid
+
+    class _Msg:
+        def __init__(self, text: str, sender: str) -> None:
+            self.group_openid = "G1"
+            self.content = text
+            self.id = "MSG-1"
+            self.author = _Author(sender)
+
+    class _Stub:
+        _maybe_repeat = _RB._maybe_repeat
+
+        def __init__(self, repeater) -> None:
+            self.repeater = repeater
+            self.replied: list[str] = []
+            self.seqs: list[int] = []
+
+        def _make_repliers(self, message):
+            async def reply(text: str) -> None:
+                self.replied.append(text)
+            return reply, None, None
+
+    async def run() -> None:
+        s = _Stub(_rp.Repeater(["G1"]))
+        check("第 1 个人 → `_maybe_repeat` 返回 False（没跟）",
+              await s._maybe_repeat(_Msg("今天好累啊", "A"), skip=False) is False)
+        check("★ 第 2 个人 → 返回 True，且**真的发出去了那一句**",
+              await s._maybe_repeat(_Msg("今天好累啊", "B"), skip=False) is True
+              and s.replied == ["今天好累啊"], str(s.replied))
+
+        s2 = _Stub(_rp.Repeater([]))          # 没配群
+        check("★ 没配 `REPEAT_GROUPS` 时**一次都不发**",
+              await s2._maybe_repeat(_Msg("X", "A"), skip=False) is False
+              and await s2._maybe_repeat(_Msg("X", "B"), skip=False) is False
+              and not s2.replied, str(s2.replied))
+
+        s3 = _Stub(_rp.Repeater(["G1"]))
+        await s3._maybe_repeat(_Msg("X", "A"), skip=True)     # 预览回过的
+        check("★ 预览回过的分享不参与复读",
+              await s3._maybe_repeat(_Msg("X", "B"), skip=True) is False
+              and not s3.replied, str(s3.replied))
+
+        # 发不出去也不能炸 —— 这条路上还跑着预览和指令
+        class _Boom(_Stub):
+            def _make_repliers(self, message):
+                async def reply(text: str) -> None:
+                    raise RuntimeError("模拟发送失败")
+                return reply, None, None
+
+        b = _Boom(_rp.Repeater(["G1"]))
+        await b._maybe_repeat(_Msg("X", "A"), skip=False)
+        check("★ 发送抛异常时 `_maybe_repeat` 返回 False 而不是往上抛",
+              await b._maybe_repeat(_Msg("X", "B"), skip=False) is False)
+
+    asyncio.run(run())
+
+
+_rp_parts()
+_rp_trigger()
+_rp_skip()
+_rp_wiring()
+_rp_end_to_end()
+
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()
 print(f"  rsshub = {cfg.rsshub_base}")
