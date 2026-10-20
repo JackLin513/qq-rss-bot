@@ -21,7 +21,7 @@ scripts/botctl.sh start                        # 启动（后台，日志 /tmp/q
 scripts/botctl.sh restart                      # 重启 —— **改完代码必须重启**，没有热加载
 scripts/botctl.sh status                       # 看实例（多于 1 个就是出问题了）★
 uv run qq-rss-bot                              # 前台启动（调试用，Ctrl+C 可停）
-uv run python scripts/smoke.py                 # 离线+抓取测试（当前 1299 项）
+uv run python scripts/smoke.py                 # 离线+抓取测试（当前 1449 项）
 uv run python scripts/integration.py           # 端到端（假推送，不碰 QQ）
 uv run python scripts/probe_events.py 20       # 事件探针（先停掉正式实例）
 uv run python scripts/probe_panel.py           # 指令面板 schema 探针（自建自删，可复跑）
