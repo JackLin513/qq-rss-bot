@@ -7652,6 +7652,32 @@ def _rp_parts() -> None:
     check("空 / None → 空串",
           _rp.normalize("") == "" and _rp.normalize(None) == "")
 
+    # ---- 表情：QQ 的 `content` 里是协议标记，不是给人看的 ----
+    # 2026-10-21 线上（正式群）实际发生过：两个人发了同样的表情包，复读出去的
+    # 是一串 `<faceType=6,faceId="0",ext="…">` 乱码。
+    FACE = '<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">'
+    check("★ 表情标记要剥掉 —— 原样发出去群里显示的是 `<faceType=…>` 乱码",
+          _rp.normalize(FACE) == "", repr(_rp.normalize(FACE)))
+    check("  连发两个表情也剥干净（用户报的就是这种）",
+          _rp.normalize(FACE + FACE) == "", repr(_rp.normalize(FACE + FACE)))
+    check("  自闭合写法（`/>` 收尾）也认",
+          _rp.normalize('哈哈<faceType=1,faceId="1"/>') == "哈哈",
+          repr(_rp.normalize('哈哈<faceType=1,faceId="1"/>')))
+    check("  表情夹在中间 → 两边不粘连（剥成空格，再被空白折叠收掉）",
+          _rp.normalize('哈<faceType=6,faceId="0">哈') == "哈 哈",
+          repr(_rp.normalize('哈<faceType=6,faceId="0">哈')))
+
+    _rface = _rp.Repeater(["G"])
+    _rface.consider("G", FACE, "A", now=0)
+    check("★ 纯表情消息**不跟** —— 剥完是空的，我们没法把表情包发回去",
+          _rface.consider("G", FACE, "B", now=1) is None)
+
+    _rmix = _rp.Repeater(["G"])
+    _rmix.consider("G", "哈哈哈" + FACE, "A", now=0)
+    check("★ 带表情的句子：复读出去的是**剥掉标记的文字**，不是乱码",
+          _rmix.consider("G", "哈哈哈" + FACE, "B", now=1) == "哈哈哈",
+          repr(_rmix.consider("G", "哈哈哈" + FACE, "B", now=1)))
+
     check("★ 库里一个群都没开 = 整个功能关闭", _rp.Repeater([]).enabled is False)
     check("配了群才 enabled", _rp.Repeater(["G1"]).enabled is True)
     check("★ 不在名单里的群一条都不跟（而且不推进状态）",

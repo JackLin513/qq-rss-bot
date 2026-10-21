@@ -16,6 +16,8 @@
 - 空消息 / 纯空白
 - 超过 `REPEAT_MAX_LEN` 的长文 —— 复读起来像刷屏
 - 以 `/` 开头的指令（跟着复读一条指令很怪）
+- **纯表情**（表情包 / QQ 表情）：`content` 里是 `<faceType=…>` 协议标记，
+  剥完就空了。我们没法把表情包发回去 —— 硬发就是一串乱码，2026-10-21 踩过
 - **预览已经处理过的**：分享的 bilibili / YouTube 链接，机器人已经回过卡片了，
   再复读一遍很傻。由调用方传 `skip=True`。
 
@@ -52,6 +54,19 @@ DEFAULT_GAP_SEC = 20.0
 _PLACEHOLDER = re.compile(r"<@!?[0-9A-Za-z_-]+>")
 _AT_NAME = re.compile(r"@\S+\s*")
 
+# QQ 的**内联表情**在 `content` 里是协议标记，不是给人看的：
+#
+#     <faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">
+#     <faceType=1,faceId="1"/>                    ← 表情包等还有 `/>` 收尾的写法
+#
+# `faceType=6` 是表情包，`ext` 是 base64 的 JSON。**原样发回去，群里看到的
+# 就是这一整串标记** —— 2026-10-21 在正式群真的复读过一条（日志：
+# `复读：C35D236D → '<faceType=6,faceId="0",ext="ey'`）。
+#
+# 剥成**空格**而不是直接删：`哈<face>哈` 删掉会粘成 `哈哈`。空格会被下面
+# 的 `split()` 收掉，所以 `哈哈哈<face>` 照样只剩 `哈哈哈`。
+_FACE = re.compile(r"<faceType=[^>]*>")
+
 
 def normalize(text: str) -> str:
     """判「是不是同一句」用的归一化：剥掉 @、把连续空白压成一个空格。
@@ -61,6 +76,7 @@ def normalize(text: str) -> str:
     群里看起来就是在复读。
     """
     body = _PLACEHOLDER.sub("", text or "")
+    body = _FACE.sub(" ", body)
     body = _AT_NAME.sub("", body)
     return " ".join(body.split())
 
