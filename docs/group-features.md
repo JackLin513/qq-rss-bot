@@ -122,12 +122,46 @@ def groups(self) -> tuple[str, ...]:
 `_env_list("*_GROUPS")`、`.env.example` 里不许有 `*_GROUPS=`、5 个 poller 里
 不许有 `self.cfg.X_groups`）。有人加回去的话 smoke 会红。
 
-## `/set`（**还没实现**）
+## `/set` —— 本群的功能开关
 
-- `features.render_settings()` / `resolve_feature()` / `parse_bool()` 已经写好并测过了
-- 指令本身还没接进 `commands.py`
+```
+/set                    面板（六个功能的按钮）
+/set <编号 1-6> on|off  开 / 关
+/set morning off        英文名也认
+```
 
-那之前只能手工改库：
+- **受限指令**（和 `/sub` 同一类）——它改的是**全群**收不收某个推送。
+  面板上按钮谁都能点，真执行时还是走 `_is_admin`。
+- **中文功能名不认**：`render_data.label` ≤10 显示宽度，面板和按钮都放不下
+  全名，与其做半套不如只留两种能写全的形态（编号 / 英文名）。
+  `features.resolve_feature()` 不认中文是**故意的**，smoke 钉了。
+- 改完立刻重画面板，`notice` 那行写「✅ 早安语音：本群已关闭」。
+- 面板文案里明写「**按发送**才生效」—— 见下面那条平台限制。
+
+### ⚠️ 按钮 label 只能放「编号 + 两字简称 + 开/关」
+
+`render_data.label` ≤ **10 显示宽度**（中文按 2）。`1 生日推送 关` 宽 14，超限。
+所以 label 是 `1 生日 关`（宽 9），全名放正文（正文就在按钮上方）。
+两字简称在 `features.SHORT_NAMES`，**和 `FEATURES` 一一对应**（漏一个就 KeyError）。
+
+⚠️ **超宽的 label 不会被平台拒绝，而是被 `menu.clamp_label()` 静默截断成
+`1 生日推…`** —— `validate_keyboard` 那条因此**不会红**。所以另有一条钉子：
+label 结尾不许出现 `…`。判据只能是这个：`_cmd_button` 里的 label 已经过了一道
+clamp，拿渲染出来的值再 clamp 一次是**幂等**的，等于没测（第一版就这么写的）。
+
+### ⚠️ 按钮做的是「相反的动作」
+
+现在开着 → 按钮是「关」，插 `/set N off`；关着 → 按钮是「开」。
+按钮和状态**同向**的话，用户点「关」结果开了，而且界面上看不出来。
+smoke 用 64 种开关组合（2^6）逐个断言：按钮 data 解析回来必须正好是相反的那个状态。
+
+### 「开了也不会生效」必须写在面板上
+
+`/set` 面板会检查 `repeat`：库里开着、但总开关 `REPEAT_ENABLED=false` 时，
+面板上会多一行警告。**不警告就是「用户按了开关、群里没反应、日志还一切正常」** ——
+这个项目被这种形态咬过好几次。
+
+### 手工改库（没有群可发 / 要批量改时）
 
 ```bash
 sqlite3 data/bot.db \
@@ -137,6 +171,11 @@ sqlite3 data/bot.db \
 ```
 
 ⚠️ **别 DELETE**（见上）。改完**不用重启**，下一拍就生效。
+
+### 指令面板也加了 `/set` 入口
+
+`scripts/setup_panel.py` 的 `PANEL_ITEMS` 里加了 `set`（紧挨 `rss`）。
+⚠️ 改完必须 `--update <panel_id>` 推到线上，**代码改了面板不会自己变**。
 
 ### ⚠️ 群里的按钮不能直接触发动作
 

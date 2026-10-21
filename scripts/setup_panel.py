@@ -70,6 +70,8 @@ DESC_LIMIT = 30
 PANEL_ITEMS = [
     {"name": "rss", "desc": "RSS 订阅设置，点开是按钮菜单", "type": "command",
      "only_admin": False},
+    {"name": "set", "desc": "本群的功能开关（按钮面板）",
+     "type": "command", "only_admin": False},
     {"name": "new", "desc": "读最新几条新闻，可指定数量", "type": "command",
      "only_admin": False},
     {"name": "抽选", "desc": "看哪些抽选正在受付中", "type": "command",

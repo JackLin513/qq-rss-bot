@@ -56,6 +56,31 @@ NAMES: dict[str, str] = {
 }
 
 
+# 功能名 → **两个字**的简称。`/set` 的按钮 label 用。
+#
+# 为什么不用全名：`render_data.label` ≤ **10 显示宽度**（中文按 2），
+# 而 label 里还得塞编号和「开/关」两个字 —— `1 生日推送 关` 宽 14，直接超限。
+# 全名放正文（正文就在按钮上方），label 只留够认出来的信息。
+SHORT_NAMES: dict[str, str] = {
+    "morning": "早安",
+    "monday": "月曜",
+    "tickets": "抽票",
+    "birthday": "生日",
+    "birthday_art": "贺图",
+    "repeat": "复读",
+}
+
+
+def states(db, group_openid: str) -> dict[str, bool]:
+    """这个群每个功能开没开，`{功能: 开没开}`，**六个键一个不少**（没记录的算关）。
+
+    一次查完所有群再取自己那一份 —— `/set` 每点一次都要重画面板，
+    逐功能查就是 6 次 SQL。
+    """
+    raw = db.all_group_features().get(group_openid, {})
+    return {f: bool(raw.get(f)) for f in FEATURES}
+
+
 def check_feature(feature: str) -> str:
     """功能名不合法就抛。**别静默** —— 拼错了会变成「这个功能一个群都不发」，
     而症状是「今天没推」，从日志上看和「这个群关了」一模一样。"""
@@ -86,18 +111,21 @@ def summarize(db) -> str:
     return "；".join(f"{NAMES[f]} {describe(db, f)}" for f in FEATURES)
 
 
-def render_settings(db, group_openid: str) -> str:
-    """`/set` 的纯文本形态：这个群每个功能开没开。
-
-    拿不到卡片通道时退回它（和 `menu.build_rss_text()` 同一个口径）。
+def render_settings_dict(states_map: dict[str, bool]) -> str:
+    """`/set` 的纯文本形态。拿不到卡片通道时退回它
+    （和 `menu.build_rss_text()` 同一个口径）。
     """
-    state = db.all_group_features().get(group_openid, {})
     lines = ["本群的功能开关：", ""]
     for i, feature in enumerate(FEATURES, 1):
-        mark = "✅ 开" if state.get(feature) else "⬜ 关"
+        mark = "✅ 开" if states_map.get(feature) else "⬜ 关"
         lines.append(f"{i}. {mark}  {NAMES[feature]}")
     lines += ["", "改：/set <编号> on|off（例：/set 1 off）"]
     return "\n".join(lines)
+
+
+def render_settings(db, group_openid: str) -> str:
+    """查库版。给「只有 db 没有 ctx」的场合用（探针脚本、测试）。"""
+    return render_settings_dict(states(db, group_openid))
 
 
 def resolve_feature(token: str) -> str | None:

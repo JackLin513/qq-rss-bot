@@ -617,7 +617,7 @@ check("当前 PANEL_ITEMS 通过官方限制", _problems == [], str(_problems))
 # 上限是 20 个元素，别把它当指令全集用。
 check("面板入口就是这几个（顺序即显示顺序）",
       [i["name"] for i in setup_panel.PANEL_ITEMS]
-      == ["rss", "new", "抽选", "当落", "help"],
+      == ["rss", "set", "new", "抽选", "当落", "help"],
       str([i["name"] for i in setup_panel.PANEL_ITEMS]))
 # ★ 面板里的每个名字都必须是**真的能执行的指令**，否则用户点了没反应。
 check("★ 面板里的名字在 COMMAND_ALIASES 里都认",
@@ -8057,10 +8057,208 @@ def _gf_poller_respects_db() -> None:
 
 _gf_basics()
 _gf_parse()
+def _gf_set() -> None:
+    """`/set` 指令和它的按钮面板。
+
+    ⚠️ 这个功能的失败模式全是**静默**的：按钮 label 超宽会被平台丢掉
+    （HTTP 200、消息照发、按钮没了）、data 指向不存在的指令会「点了没反应」、
+    面板显示的状态和库里不一致会让人按反 —— 所以下面既有行为断言，
+    也有 64 种开关组合的属性断言。
+    """
+    import dataclasses  # noqa: PLC0415
+    import itertools  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from qq_rss_bot import features as _F  # noqa: PLC0415
+    from qq_rss_bot import menu as _M  # noqa: PLC0415
+    from qq_rss_bot.commands import (  # noqa: PLC0415
+        COMMAND_TOKENS,
+        HELP_TEXT,
+        RESTRICTED_CANONICAL,
+        CommandContext,
+        CommandHandler,
+    )
+    from qq_rss_bot.db import Database  # noqa: PLC0415
+
+    # ---- 纯属性：64 种开关组合下键盘都合法、且按钮语义和状态一致 ----
+    check("★ `SHORT_NAMES` 和 `FEATURES` 一一对应（漏一个按钮就 KeyError）",
+          set(_F.SHORT_NAMES) == set(_F.FEATURES), str(sorted(_F.SHORT_NAMES)))
+    check("★ 每个简称宽 ≤4（label 要塞「编号 简称 开/关」，总上限 10）",
+          all(_M.display_width(v) <= 4 for v in _F.SHORT_NAMES.values()),
+          str({k: _M.display_width(v) for k, v in _F.SHORT_NAMES.items()}))
+
+    def _buttons(kb: dict) -> list[dict]:
+        return [b for row in kb["content"]["rows"] for b in row["buttons"]]
+
+    bad_kb, bad_sem = [], []
+    for combo in itertools.product([False, True], repeat=len(_F.FEATURES)):
+        st = dict(zip(_F.FEATURES, combo))
+        kb = _M.build_set_keyboard(st)
+        probs = _M.validate_keyboard(kb, known_tokens=COMMAND_TOKENS)
+        if probs:
+            bad_kb.append((combo, probs[:2]))
+        btns = _buttons(kb)
+        if len(btns) != len(_F.FEATURES):
+            bad_sem.append((combo, f"按钮 {len(btns)} 个"))
+            continue
+        for i, (feature, btn) in enumerate(zip(_F.FEATURES, btns), 1):
+            data = btn["action"]["data"]
+            parts = data.split()
+            # 按钮做的是**相反的动作**：现在开着 → 按钮是「关」
+            want = not st[feature]
+            if (
+                parts[0] != "/set"
+                or _F.resolve_feature(parts[1]) != feature
+                or _F.parse_bool(parts[2]) is not want
+            ):
+                bad_sem.append((combo, f"{feature} → {data!r}（应为 {want}）"))
+            lbl = btn["render_data"]["label"]
+            if f"{i}" not in lbl:
+                bad_sem.append((combo, f"label 里没有编号：{lbl!r}"))
+            # ⚠️ `clamp_label` 会把超宽的 label **静默截断**成 `1 生日推…` ——
+            # 平台不会丢按钮（所以 validate_keyboard 那条不会红），但用户看到的
+            # 是一排认不出是什么的按钮。**截断本身就是失败**，别让 clamp 兜住它。
+            #
+            # 判据只能是「结尾有没有 `…`」：`_cmd_button` 里 label 已经过了一道
+            # clamp，拿渲染出来的值再 clamp 一次是**幂等**的，等于没测（写错过）。
+            if lbl.endswith("…"):
+                bad_sem.append((combo, f"label 被截断了：{lbl!r}"))
+    check(f"★ {2 ** len(_F.FEATURES)} 种开关组合下键盘全部合法"
+          f"（label 宽度 / content 外层 / data 指向已知指令）",
+          not bad_kb, str(bad_kb[:2]))
+    check("★ 每个按钮插的指令，解析回来正好是「相反的那个动作」"
+          "（错了就是点「关」结果开了，而且看不出来）",
+          not bad_sem, str(bad_sem[:2]))
+
+    check("★ `set` 是受限指令（它改的是**全群**收不收推送，和 /sub 同类）",
+          "set" in RESTRICTED_CANONICAL)
+    check("`/set` 在 HELP_TEXT 里（面板和帮助都得能看到）", "/set" in HELP_TEXT)
+
+    # ---- 行为 ----
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "set.db")
+        G = "GSET"
+        h = CommandHandler(cfg_stub(), db, None)
+        texts: list[str] = []
+        cards: list[tuple[str, dict | None]] = []
+
+        async def reply(text: str) -> None:
+            texts.append(text)
+
+        async def reply_card(md: str, kb: dict | None = None) -> None:
+            cards.append((md, kb))
+
+        def ctx(role: str = "owner", *, card: bool = True) -> CommandContext:
+            return CommandContext(G, reply, role, reply_card if card else None)
+
+        def run(line: str, *, role: str = "owner", card: bool = True) -> None:
+            texts.clear()
+            cards.clear()
+            asyncio.run(h.handle(ctx(role, card=card), line))
+
+        run("/set")
+        check("★ `/set` 出一条带按钮的卡片", len(cards) == 1 and cards[0][1] is not None,
+              str(cards)[:80])
+        md0, kb0 = cards[0]
+        check("  空库 → 六个功能全显示为关，且都列了出来",
+              md0.count("⬜ 关") == len(_F.FEATURES)
+              and all(_F.NAMES[f] in md0 for f in _F.FEATURES), md0)
+        check("★ 面板上写明了「按发送」—— 群按钮只能把指令填进输入框，"
+              "不写清楚用户点完看没反应会以为按钮坏了",
+              "按发送" in md0, "")
+        check("  按钮数 = 功能数，且 id 不重复",
+              len(_buttons(kb0)) == len(_F.FEATURES)
+              and len({b["id"] for b in _buttons(kb0)}) == len(_F.FEATURES))
+        check("  全关时每个按钮都是「开」+ `/set N on`",
+              all(b["action"]["data"].endswith(" on") for b in _buttons(kb0)),
+              str([b["action"]["data"] for b in _buttons(kb0)]))
+
+        run("/set 1 on")
+        check("★ `/set 1 on` 真写进库了",
+              _F.groups_for(db, _F.FEATURES[0]) == (G,),
+              str(_F.groups_for(db, _F.FEATURES[0])))
+        check("  回的面板**立刻**反映新状态（第 1 个按钮翻成「关」）",
+              cards[0][1]["content"]["rows"][0]["buttons"][0]["action"]["data"]
+              == "/set 1 off",
+              cards[0][1]["content"]["rows"][0]["buttons"][0]["action"]["data"])
+        check("  正文里有「已打开」这句反馈", "已打开" in cards[0][0], "")
+
+        run("/set morning off")
+        check("  英文名也能改", _F.groups_for(db, _F.FEATURES[0]) == ())
+
+        # ---- 不改库的几条 ----
+        before = _F.states(db, G)
+        run("/set 1")
+        check("★ `/set 1`（只有编号）**不猜**开还是关，只回用法",
+              any("用法" in t for t in texts) and _F.states(db, G) == before,
+              str(texts)[:80])
+        run("/set 1 x")
+        check("★ `/set 1 x` 认不出 on/off → 只回用法，库不动",
+              any("on|off" in t for t in texts) and _F.states(db, G) == before)
+        run("/set 99 on")
+        check("★ 越界编号 → 认不出，库不动",
+              any("认不出" in t for t in texts) and _F.states(db, G) == before)
+        run("/set 早安 on")
+        check("  中文功能名**不认**（面板和按钮都放不下，只留编号和英文名）",
+              any("认不出" in t for t in texts) and _F.states(db, G) == before)
+
+        # ---- 权限：面板谁都能点，执行时拦 ----
+        run("/set 2 on", role="member")
+        check("★ 普通成员发 `/set 2 on` 被拒，**而且库没变**",
+              any("只允许群主" in t for t in texts)
+              and _F.groups_for(db, _F.FEATURES[1]) == (),
+              str(texts)[:80])
+
+        # ---- 兜底 ----
+        run("/set", card=False)
+        check("拿不到卡片通道 → 退回纯文本，内容必须等价（不是一句「出错了」）",
+              len(texts) == 1 and all(_F.NAMES[f] in texts[0] for f in _F.FEATURES),
+              str(texts)[:60])
+
+        async def boom(md: str, kb: dict | None = None) -> None:
+            raise RuntimeError("卡片通道挂了")
+
+        texts.clear()
+        asyncio.run(h.handle(CommandContext(G, reply, "owner", boom), "/set"))
+        check("卡片发不出去（网络层抛）→ 退回纯文本，不整个失效",
+              len(texts) == 1 and "本群的功能开关" in texts[0], str(texts)[:60])
+
+        # ---- 「开了也不生效」的警告 ----
+        db.set_group_feature(G, "repeat", True)
+        cards.clear()
+        h_off = CommandHandler(
+            dataclasses.replace(cfg_stub(), repeat_enabled=False), db, None
+        )
+        asyncio.run(h_off.handle(ctx(), "/set"))
+        check("★ 复读在库里开着、但总开关 REPEAT_ENABLED=false → 面板必须警告"
+              "（不警告就是「按了没反应、日志还一切正常」）",
+              "REPEAT_ENABLED" in cards[0][0], cards[0][0][-120:])
+
+        cards.clear()
+        asyncio.run(h.handle(ctx(), "/set"))
+        check("  总开关是 true 时不该有这条警告（否则就是狼来了）",
+              "REPEAT_ENABLED" not in cards[0][0])
+
+        # ---- 面板状态和库一致（改完再开面板看的是新状态）----
+        cards.clear()
+        asyncio.run(h.handle(ctx(), "/set"))
+        md_now = cards[0][0]
+        check("★ 面板上「N/6 开」的计数和库里一致",
+              f"{len(_F.groups_for(db, 'repeat')) + 0}/{len(_F.FEATURES)} 开"
+              in md_now.replace("（", "").replace("）", "").replace(" ", "")
+              or f"{sum(1 for f in _F.FEATURES if _F.states(db, G)[f])}/6" in md_now,
+              md_now.splitlines()[0])
+
+        db.close()
+
+
+_gf_set()
+
 _gf_repeater_dynamic()
 _gf_wiring()
 _gf_poller_respects_db()
 _gf_run_never_dies()
+_gf_set()
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

@@ -14,7 +14,7 @@ from typing import Protocol
 
 import httpx
 
-from . import ai, idolmaster, tickets as tickets_module
+from . import ai, features, idolmaster, tickets as tickets_module
 from .config import Config
 from .db import Database, Subscription
 from .menu import (
@@ -22,6 +22,9 @@ from .menu import (
     build_rss_keyboard,
     build_rss_markdown,
     build_rss_text,
+    build_set_keyboard,
+    build_set_markdown,
+    build_set_text,
     build_unsub_keyboard,
     build_unsub_markdown,
     format_subscription_list,
@@ -126,13 +129,15 @@ HELP_TEXT = """RSS 订阅机器人
 /resume <编号>                     恢复暂停的订阅
 /interval <编号> <分钟>            改抓取间隔，不用退订重订
 /ai <编号> on|off                  给某个源开/关 AI 摘要（抓正文 + 翻译/精简）
+/set                               本群的功能开关（按钮面板）
+/set <编号> on|off                 开/关某个推送功能，例：/set 1 off
 /ping                              存活检测
 /help                              本说明
 /抽选                              偶像大师各场 live 现在正在受付中的抽选
 /当落                              待当落 + 入金中的抽选（中了不付款会作废）
 
 订阅是按群共享的：群里任何人订阅，全群都会收到推送。
-/sub /unsub /pause /resume /interval /ai 仅群主和管理员可用。
+/sub /unsub /pause /resume /interval /ai /set 仅群主和管理员可用。
 
 例：/sub /36kr/newsflashes 30
     /sub /hackernews/best 60 --ai    订阅并打开 AI 摘要
@@ -181,6 +186,9 @@ COMMAND_ALIASES = {
     "rss": "rss",
     "菜单": "rss",
     "menu": "rss",
+    "set": "set",
+    "开关": "set",
+    "功能": "set",
 }
 
 COMMAND_TOKENS = frozenset(COMMAND_ALIASES)
@@ -202,12 +210,15 @@ COMMAND_METHODS = {
     "ticket": "_ticket",
     "result": "_result",
     "rss": "_rss",
+    "set": "_set",
 }
 
 # 只有群主/管理员能用的指令。**从别名表派生**，加别名不会漏 ——
 # 曾经是手工列 {"sub","subscribe","订阅",...}，漏一个中文别名就等于没限制。
 RESTRICTED_CANONICAL = frozenset(
-    {"sub", "unsub", "pause", "resume", "interval", "ai"}
+    # ⚠️ `set` 在里面：它改的是**全群**收不收某个推送，和 `/sub` 同一类，
+    # 不是个人偏好。普通成员点按钮会被拒，拒绝日志里带角色。
+    {"sub", "unsub", "pause", "resume", "interval", "ai", "set"}
 )
 RESTRICTED_TOKENS = frozenset(
     token
@@ -403,6 +414,94 @@ class CommandHandler:
                 _log.warning("发送 /rss 按钮卡片失败，退回纯文本", exc_info=True)
         # 拿不到卡片通道（老协议路径 / 测试里的假实现）也走这里
         await ctx.reply(build_rss_text(subs))
+
+    async def _set(self, ctx: CommandContext, args: list[str]) -> None:
+        """本群的功能开关。**不带参数 = 出按钮面板。**
+
+        改的是**全群**收不收某个推送（和 `/sub` 同一类），所以是受限指令 ——
+        面板上的按钮谁都能点，但真执行时还是走 `_is_admin`。
+
+        ⚠️ 群里的按钮**只能把指令填进输入框**（`action.type=2`；`enter: true`
+        自动发送仅单聊可用），所以每个按钮插的都是**完整可发**的
+        `/set <编号> on|off`，正文里也明写了要按发送。
+        """
+        states = features.states(self.db, ctx.group_openid)
+
+        if not args:
+            await self._send_set_panel(ctx, states)
+            return
+
+        feature = features.resolve_feature(args[0])
+        if feature is None:
+            n = len(features.FEATURES)
+            await ctx.reply(
+                f"认不出「{args[0]}」。用法：/set <编号 1-{n}> on|off"
+                f"（也可以写英文名，如 /set morning off）。\n发 /set 看面板。"
+            )
+            return
+        if len(args) < 2:
+            # 只给编号时**不猜**「是想开还是想关」—— 猜错就是一次静默的群级变更
+            await ctx.reply(
+                f"用法：/set {args[0]} on|off\n"
+                f"（{features.NAMES[feature]} 现在"
+                f"{'开着' if states[feature] else '关着'}）"
+            )
+            return
+        want = features.parse_bool(args[1])
+        if want is None:
+            await ctx.reply(f"on/off 认不出「{args[1]}」。用法：/set {args[0]} on|off")
+            return
+
+        self.db.set_group_feature(ctx.group_openid, feature, want)
+        states[feature] = want
+        _log.info(
+            "功能开关：群 %s 的 %s → %s（角色=%r）",
+            ctx.group_openid,
+            feature,
+            "开" if want else "关",
+            ctx.member_role,
+        )
+        await self._send_set_panel(
+            ctx,
+            states,
+            notice=f"✅ {features.NAMES[feature]}：本群已{'打开' if want else '关闭'}",
+        )
+
+    def _set_warnings(self, states: dict[str, bool]) -> list[str]:
+        """「开关开了、但功能还是不会响」那几种情况，**必须写在面板上**。
+
+        这是这个项目被咬过好几次的形态：用户按面板打开了，群里没反应，
+        而日志上一切正常 —— 因为卡在**另一个**开关上。
+        """
+        out: list[str] = []
+        if states.get("repeat") and not self.cfg.repeat_enabled:
+            out.append(
+                "复读的总开关 REPEAT_ENABLED=false（在 .env 里），这里开着也不会跟。"
+                "改 .env 要 `docker compose up -d` 重建容器，`restart` 不重读。"
+            )
+        return out
+
+    async def _send_set_panel(
+        self,
+        ctx: CommandContext,
+        states: dict[str, bool],
+        *,
+        notice: str = "",
+    ) -> None:
+        """面板 + 按钮。卡片发不出去就退回纯文本（和 /rss 同一条路）。"""
+        warnings = self._set_warnings(states)
+        if ctx.reply_card is not None:
+            try:
+                await ctx.reply_card(
+                    build_set_markdown(states, notice=notice, warnings=warnings),
+                    build_set_keyboard(states),
+                )
+                return
+            except Exception:  # noqa: BLE001 —— 网络层什么都可能抛
+                _log.warning("发送 /set 按钮卡片失败，退回纯文本", exc_info=True)
+        await ctx.reply(
+            build_set_text(states, notice=notice, warnings=warnings)
+        )
 
     async def _sub(self, ctx: CommandContext, args: list[str]) -> None:
         # `--ai` 可以在任意位置，先摘出去 —— 剩下的才是位置参数

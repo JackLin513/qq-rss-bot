@@ -31,6 +31,7 @@ from __future__ import annotations
 import unicodedata
 from collections.abc import Sequence
 
+from . import features
 from .db import Subscription
 
 # render_data.label 的显示宽度上限。官方口径是「10 字符，中文按 2 算」，
@@ -41,6 +42,9 @@ LABEL_LIMIT = 10
 MAX_INLINE_UNSUB = 4
 # 二级卡片的退订按钮每行几个。label 短（`退订 10` 宽 7），一行放得下 3 个。
 UNSUB_PER_ROW = 3
+# `/set` 的功能开关每行几个。label 是 `1 早安 关`（宽 9），一行两个刚好，
+# 六个功能三行 —— 一行一个的话是六行，手机上一屏放不下。
+SET_PER_ROW = 2
 # 固定文案，别让它成为第二个宽度风险
 VISITED_LABEL = "已插入"
 UNSUPPORT_TIPS = "当前 QQ 版本不支持按钮，请直接发送上面的指令"
@@ -275,4 +279,74 @@ def build_unsub_keyboard(subs: Sequence[Subscription]) -> dict:
     ]
     rows = [btns[i : i + UNSUB_PER_ROW] for i in range(0, len(btns), UNSUB_PER_ROW)]
     rows.append([_cmd_button("back", "返回菜单", "/rss")])
+    return keyboard(rows)
+
+
+# ---------- /set（本群的功能开关）----------
+
+# 按钮被平台丢掉时正文得能单独用，所以指令原样写出来
+_SET_COMMAND_REF = "手打也行：/set <编号> on|off（例：/set 1 off）"
+# ⚠️ 这句必须留着：群里的按钮**只能把指令填进输入框**，不会自动发送
+# （`enter: true` 仅单聊可用）。不写清楚的话，用户点完按钮看没反应，
+# 会以为按钮坏了 —— 这个坑在 /rss 那边已经踩过一次。
+_SET_BUTTON_HINT = "点按钮 → 指令会填进输入框 → **按发送**才生效（群里不能点一下就执行）"
+
+
+def build_set_markdown(
+    states: dict[str, bool],
+    *,
+    notice: str = "",
+    warnings: Sequence[str] = (),
+) -> str:
+    """`/set` 的正文。开关状态 + 用法。
+
+    `notice` 是刚改完那一句（`✅ 早安语音：本群已关`），
+    `warnings` 是「开了也不会生效」那类提醒（见 `_set_warnings`）。
+    """
+    lines = [f"### ⚙️ 本群的功能开关（{sum(1 for f in features.FEATURES if states.get(f))}"
+             f"/{len(features.FEATURES)} 开）", ""]
+    for i, feature in enumerate(features.FEATURES, 1):
+        mark = "✅ 开" if states.get(feature) else "⬜ 关"
+        lines.append(f"{i}. {mark}　{features.NAMES[feature]}")
+    if notice:
+        lines += ["", notice]
+    for w in warnings:
+        lines += ["", f"⚠️ {w}"]
+    lines += ["", _SET_BUTTON_HINT, _SET_COMMAND_REF]
+    return "\n".join(lines)
+
+
+def build_set_text(
+    states: dict[str, bool], *, notice: str = "", warnings: Sequence[str] = ()
+) -> str:
+    """纯文本兜底（卡片发不出去时）。和 `features.render_settings` 同一个口径，
+    多一行刚改完的提示和那几条「开了也不生效」的提醒。
+    """
+    body = features.render_settings_dict(states)
+    head = f"{notice}\n\n" if notice else ""
+    tail = "".join(f"\n\n⚠️ {w}" for w in warnings)
+    return head + body + tail
+
+
+def build_set_keyboard(states: dict[str, bool]) -> dict:
+    """每个功能一个按钮，**做的是「相反的那个动作」**。
+
+    现在开着 → 按钮是「关」，插 `/set N off`；现在关着 → 按钮是「开」。
+    当前状态看正文（`✅ 开` / `⬜ 关`），label 只放编号 + 两字简称 + 动作 ——
+    `render_data.label` ≤10 显示宽度，塞不下全名（见 features.SHORT_NAMES）。
+    """
+    btns = []
+    for i, feature in enumerate(features.FEATURES, 1):
+        on = bool(states.get(feature))
+        label = f"{i} {features.SHORT_NAMES[feature]} {'关' if on else '开'}"
+        data = f"/set {i} {'off' if on else 'on'}"
+        btns.append(
+            _cmd_button(
+                f"set_{feature}",
+                label,
+                data,
+                style=_STYLE_DANGER if on else _STYLE_DEFAULT,
+            )
+        )
+    rows = [btns[i : i + SET_PER_ROW] for i in range(0, len(btns), SET_PER_ROW)]
     return keyboard(rows)
