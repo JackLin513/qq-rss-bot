@@ -25,6 +25,11 @@ git commit / push                                               /volume1/docker/
                                                           容器里 import 挂载卷的 src/
 ```
 
+**部署有向导**：`scripts/wizard-deploy.sh` —— 在 Mac 上 `bash scripts/wizard-deploy.sh`
+跑，它会预检工作区 / ssh、问你这轮改没改 `.env`（决定 `restart` 还是 `up -d`）、
+把 sudo 命令放到你的终端里执行、最后拿启动日志**前后对比**确认真的重启了。
+之所以做成脚本：**这步只有人类能做**（sudo 要密码，Claude Code 的 `!` 没有 TTY）。
+
 三条铁律：
 
 1. **改 `src/` 或 `scripts/` 下的代码 → `restart`**（挂载卷，重启进程重新 import）。

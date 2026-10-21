@@ -29,6 +29,7 @@ uv run python scripts/check_sources.py         # 复测 RSSHub 各路由可用�
 uv run python scripts/test_push.py             # 测主动消息（不占 WS 会话，可并行）
 uv run python scripts/setup_panel.py --list    # 指令面板：查询（只读，先跑这个）
 uv run python scripts/setup_panel.py --create  # 指令面板：创建
+scripts/wizard-deploy.sh                       # ★ 部署向导：预检 → 选命令 → sudo → 验生效
 ```
 
 各功能的探针（**一律默认不发消息、`--group` 无默认值**）：
