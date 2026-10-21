@@ -9,13 +9,15 @@
 
 [meta]
 source_cv = "https://imas-db.jp/misc/cv.html"
-fetched_at = "2026-10-21T23:31:21+08:00"
+fetched_at = "2026-10-22T00:16:35+08:00"
 idols = 382
 characters = 366
 with_cv = 263
 without_cv = 103
 persons = 263
 former_cvs = 7
+character_accounts = 3
+officials = 1
 
 [persons]
 "Machico" = { "handle" = "", "source" = "auto" }
@@ -556,3 +558,17 @@ former_cvs = 7
 "三峰結華" = ["成海瑠奈"]
 "九十九一希" = ["徳武竜也"]
 "萩原雪歩" = ["長谷優里奈"]
+
+# ⚠️ 手写，脚本不生成、重跑原样保留。
+# 角色**自己**开的号（vα-liv 这类虚拟主播）—— 和 [persons]（配音的真人）
+# 是两个概念。key 是角色名，不是 handle。
+[character_accounts]
+"レトラ" = { "handle" = "UtagawaLetora", "source" = "manual" }
+"上水流宇宙" = { "handle" = "KamizuruCosmo", "source" = "manual" }
+"灯里愛夏" = { "handle" = "TomoriManaka", "source" = "manual" }
+
+# ⚠️ 手写，脚本不生成、重跑原样保留。
+# 企划 / 品牌 / 游戏的官号。last_post_at 是**事实**，只用于人工维护，
+# 运行时**不读** —— 别把它当成「活跃/不活跃」的判断。
+[officials]
+"valiv_official" = { "brand" = "valiv", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T19:00:02+09:00" }

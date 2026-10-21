@@ -48,6 +48,15 @@
 
 声优页的原始数据不落盘、不进 git（只在内存里解析）。产出只有「角色 → 姓名」
 这个结论，是公开事实。
+
+## 两个**不由这个脚本生成**的 section
+
+`[character_accounts]`（角色本人开的号，目前只有 vα-liv 三位）和
+`[officials]`（企划/品牌官号）是**手写**的：源站的声优页里没有这些角色的条目，
+也从不给 X 账号。脚本只在重跑时**原样带过去**，不会删也不会改。
+
+⚠️ 别把这三类账号混在一起：`[persons]` 是配音的真人，`[character_accounts]`
+是角色自己，`[officials]` 的账号属于企划。
 """
 
 from __future__ import annotations
@@ -71,6 +80,10 @@ CV_SOURCE = "https://imas-db.jp/misc/cv.html"
 DEFAULT_OUT = ROOT / "src" / "qq_rss_bot" / "seiyuu.toml"
 REVIEW_OUT = ROOT / "data" / "birthday" / "seiyuu-review.md"
 CST = timezone(timedelta(hours=8))
+
+# 手写、脚本不生成的 section。重跑时原样带过去 —— 不加这个，手工数据会被
+# 下一次 render 直接抹掉（render 只输出它自己知道的那几张表）。
+EXTRA_SECTIONS = ("character_accounts", "officials")
 
 ROW_RE = re.compile(r"<tr\b[^>]*>.*?</tr>", re.S)
 TD_RE = re.compile(r"<td\b[^>]*>(.*?)</td>", re.S)
@@ -166,6 +179,7 @@ def _inline(d: dict) -> str:
 
 def render(*, persons: dict[str, dict], roles: dict[str, dict],
            former_roles: dict[str, list[str]], counts: dict[str, int],
+           extra: dict[str, dict[str, dict]] | None = None,
            fetched_at: datetime) -> str:
     out = [
         "# 声优库 —— **角色 → 现任声优**。公开事实，进 git。",
@@ -192,6 +206,25 @@ def render(*, persons: dict[str, dict], roles: dict[str, dict],
     for name in sorted(former_roles):
         olds = ", ".join(_q(p) for p in former_roles[name])
         out.append(f"{_q(name)} = [{olds}]")
+    extra = extra or {}
+    out += [
+        "",
+        "# ⚠️ 手写，脚本不生成、重跑原样保留。",
+        "# 角色**自己**开的号（vα-liv 这类虚拟主播）—— 和 [persons]（配音的真人）",
+        "# 是两个概念。key 是角色名，不是 handle。",
+        "[character_accounts]",
+    ]
+    for name in sorted(extra.get("character_accounts") or {}):
+        out.append(f"{_q(name)} = {_inline(extra['character_accounts'][name])}")
+    out += [
+        "",
+        "# ⚠️ 手写，脚本不生成、重跑原样保留。",
+        "# 企划 / 品牌 / 游戏的官号。last_post_at 是**事实**，只用于人工维护，",
+        "# 运行时**不读** —— 别把它当成「活跃/不活跃」的判断。",
+        "[officials]",
+    ]
+    for handle in sorted(extra.get("officials") or {}):
+        out.append(f"{_q(handle)} = {_inline(extra['officials'][handle])}")
     out.append("")
     return "\n".join(out)
 
@@ -293,10 +326,17 @@ def main() -> int:
              "roles": {n: {"current": p, "source": "auto"}
                        for n, p in built["roles"].items()},
              "former_roles": dict(built["former_roles"])}
-    if out.exists():
-        kept = merge(tomllib.loads(out.read_text(encoding="utf-8")), fresh)
+    existing = tomllib.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
+    # ⚠️ 这两张表是手写的，脚本不生成 —— 不原样带过去的话，重跑就没了。
+    extra = {s: dict(existing.get(s) or {}) for s in EXTRA_SECTIONS}
+    if existing:
+        kept = merge(existing, fresh)
         if kept:
             print(f"  保留 {kept} 条 source=manual 的条目")
+    n_extra = sum(len(v) for v in extra.values())
+    if n_extra:
+        print(f"  原样保留手写的 "
+              + " / ".join(f"[{s}] {len(extra[s])} 条" for s in EXTRA_SECTIONS if extra[s]))
     text = render(
         persons=fresh["persons"],
         roles=fresh["roles"],
@@ -308,7 +348,10 @@ def main() -> int:
             "without_cv": n_ids - len(fresh["roles"]),
             "persons": len(fresh["persons"]),
             "former_cvs": sum(len(v) for v in fresh["former_roles"].values()),
+            "character_accounts": len(extra["character_accounts"]),
+            "officials": len(extra["officials"]),
         },
+        extra=extra,
         fetched_at=datetime.now(CST),
     )
     tmp = out.with_suffix(".toml.tmp")

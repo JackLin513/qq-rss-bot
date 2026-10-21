@@ -8548,6 +8548,23 @@ def _sy_render_merge() -> None:
     check("★ manual 的 role 也保留", fresh["roles"]["角色二"]["current"] == "人工改的")
     check(f"报告保留了 {kept} 条", kept == 2)
 
+    # ⚠️ 这两张表是手写的。render 不把它们带上，下一次重跑就**静默删掉**了。
+    text2 = fs.render(
+        persons=persons, roles=roles, former_roles=former, counts=counts,
+        extra={"character_accounts": {"某个角色": {"handle": "h1", "source": "manual"}},
+               "officials": {"some_official": {"brand": "x", "kind": "brand",
+                                               "source": "manual",
+                                               "last_post_at": "2026-10-21T19:00:02+09:00"}}},
+        fetched_at=datetime(2026, 10, 21, 23, 0, 0),
+    )
+    back2 = _tl.loads(text2)
+    check("★ 手写的 [character_accounts] 会被原样渲染（否则重跑就没了）",
+          back2.get("character_accounts", {}).get("某个角色", {}).get("handle") == "h1",
+          str(back2.get("character_accounts")))
+    check("★ 手写的 [officials] 也会（含 last_post_at）",
+          back2.get("officials", {}).get("some_official", {}).get("last_post_at")
+          == "2026-10-21T19:00:02+09:00", str(back2.get("officials")))
+
 
 def _sy_file() -> None:
     """真库文件的校验 —— 文件在才跑（它在 git 里，所以正常都在）。"""
@@ -8585,6 +8602,28 @@ def _sy_file() -> None:
           all(p.get("source") for p in persons.values())
           and all(r.get("source") for r in roles.values()))
 
+    chars = data.get("character_accounts") or {}
+    officials = data.get("officials") or {}
+    check("★ 三类账号分开存（persons / character_accounts / officials）",
+          bool(chars) and bool(officials),
+          f"{len(chars)} / {len(officials)}")
+    check("★ vα-liv 三位都收了本人账号",
+          {"上水流宇宙", "灯里愛夏", "レトラ"} <= set(chars), str(sorted(chars)))
+    check("★ 本人账号是手写的（重跑不会被源数据覆盖）",
+          all(v.get("source") == "manual" for v in chars.values()))
+    bad_ch = [v.get("handle", "") for v in chars.values()
+              if not HANDLE.match(v.get("handle", ""))]
+    check("本人账号的 handle 都合法", not bad_ch, str(bad_ch))
+    check("★ vα-liv 的专门官号在 [officials] 里",
+          "valiv_official" in officials, str(sorted(officials)))
+    check("★ last_post_at 存的是时间戳，不是 active/inactive 这种判断",
+          all("last_post_at" not in v or "T" in str(v["last_post_at"])
+              for v in officials.values()))
+    clash = ({v.get("handle", "").lower() for v in chars.values()}
+             & {p.get("handle", "").lower() for p in persons.values() if p.get("handle")})
+    check("★ 同一个 handle 不会同时在 [persons] 和 [character_accounts] 里",
+          not clash, str(clash))
+
     cal = _SY_ROOT / "data" / "birthday" / "birthdays.toml"
     if cal.exists():
         _sys = __import__("sys")
@@ -8594,6 +8633,9 @@ def _sy_file() -> None:
         stray = sorted(set(roles) - names)
         check("★ 每个 roles 的 key 都在生日表里（生日表改名会在这里红）",
               not stray, str(stray[:5]))
+        stray_ch = sorted(set(chars) - names)
+        check("★ 每个 character_accounts 的 key 也是生日表里的角色名",
+              not stray_ch, str(stray_ch[:5]))
 
 
 _sy_birthday_page()

@@ -84,6 +84,34 @@ smoke `[4.100]` 有一条钉子专门钉这个。
 的人」。他们的账号会收进 `[character_accounts]`（#5），运行时占「声优」那一格、
 标签写 `本人`。所以「没有 CV」对他们是对的，不是漏抓。
 
+## 两张**手写**的表
+
+`[character_accounts]` 和 `[officials]` **不由脚本生成** —— 源站既没有这些角色的
+声优条目，也从不给 X 账号。脚本只在重跑时**原样带过去**（`EXTRA_SECTIONS`），
+不删也不改。少了这一步，手写的数据会在下一次重跑时被静默抹掉。
+
+### `[character_accounts]` —— 角色自己开的号
+
+目前只有 vα-liv 三位（虚拟主播，**没有**「另一个配音的人」）：
+
+| 角色 | handle | 昵称（2026-10-22 核过） |
+|---|---|---|
+| 上水流宇宙 | `@KamizuruCosmo` | 上水流宇宙🈁ヴイアラ |
+| 灯里愛夏 | `@TomoriManaka` | 灯里愛夏❤️‍🔥ヴイアラ |
+| レトラ | `@UtagawaLetora` | レトラ⚡️ヴイアラ |
+
+### `[officials]` —— 企划 / 品牌官号
+
+| handle | brand | 备注 |
+|---|---|---|
+| `@valiv_official` | valiv | 昵称带「公式」，关键词兜底也能认出来 |
+
+`last_post_at` 是**事实**（从 x.com 的 `created_at_ms` 抽的），不是「活跃」判断。
+运行时**不读**它。
+
+⚠️ **三个 section 是三个概念**：`[persons]` 是配音的真人、`[character_accounts]`
+是角色自己、`[officials]` 的账号属于企划。同一个 handle 出现在两边 = 数据错了。
+
 ## 手改与重跑
 
 `source = "manual"` 的条目**重跑不会覆盖**：
