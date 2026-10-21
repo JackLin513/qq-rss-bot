@@ -206,6 +206,11 @@ NAS_DIR="${NAS_DIR:-/volume1/docker/qq-rss-bot}"
 # 服务器每次握手都往 stderr 打三行 post-quantum 警告；第 4 阶段轮询 20 次，
 # 不压掉的话能把整个屏幕刷满（真踩到过）。
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR)
+# ⚠️ 走绝对路径：`ssh 'cmd'` 跑的是**非交互 shell**，PATH 只有
+# /usr/bin:/bin:/usr/sbin:/sbin，docker 在 /usr/local/bin —— 直接写
+# `sudo docker ...` 会 `docker: command not found`（2026-10-21 实测踩到）。
+# 用独立二进制 docker-compose，连插件查找都省了。
+COMPOSE=/usr/local/bin/docker-compose
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
@@ -278,11 +283,11 @@ stage "重启容器（sudo 会在这里问你要密码）"
 say "这条命令直接在你的终端里跑，所以 sudo 能正常提示输入密码。"
 say ""
 if [[ "$MODE" == "up" ]]; then
-  printf '  %s$ ssh -t %s "cd %s && sudo docker compose up -d bot"%s\n\n' \
-    "$BLUE" "$NAS_HOST" "$NAS_DIR" "$RESET"
+  printf '  %s$ ssh -t %s "cd %s && sudo %s up -d bot"%s\n\n' \
+    "$BLUE" "$NAS_HOST" "$NAS_DIR" "$COMPOSE" "$RESET"
 else
-  printf '  %s$ ssh -t %s "cd %s && sudo docker compose restart bot"%s\n\n' \
-    "$BLUE" "$NAS_HOST" "$NAS_DIR" "$RESET"
+  printf '  %s$ ssh -t %s "cd %s && sudo %s restart bot"%s\n\n' \
+    "$BLUE" "$NAS_HOST" "$NAS_DIR" "$COMPOSE" "$RESET"
 fi
 note "  ⚠️ 输出里出现 Running 0.0s 不是「很快完成」，是「检测到无需变更，直接跳过」"
 note "  ⚠️ 改 .env 之后只 restart 是静默失败：代码是新的、变量全是默认值"
@@ -295,9 +300,9 @@ pause "按 Enter 执行（Ctrl-C 取消）"
 
 RC=0
 if [[ "$MODE" == "up" ]]; then
-  ssh -t "$NAS_HOST" "cd $NAS_DIR && sudo docker compose up -d bot" || RC=$?
+  ssh -t "$NAS_HOST" "cd $NAS_DIR && sudo $COMPOSE up -d bot" || RC=$?
 else
-  ssh -t "$NAS_HOST" "cd $NAS_DIR && sudo docker compose restart bot" || RC=$?
+  ssh -t "$NAS_HOST" "cd $NAS_DIR && sudo $COMPOSE restart bot" || RC=$?
 fi
 if (( RC != 0 )); then
   warn "命令退出码 $RC —— 先看上面的报错，别急着往下走"
@@ -325,7 +330,9 @@ if (( AFTER_COUNT > BEFORE_COUNT )); then
   step "多了一行启动记录 ✓"
 else
   if (( RC != 0 )); then
-    warn "重启命令本身就返回了 $RC —— 先解决那个（多半是 sudo 密码没输对 / 被 Ctrl-C）"
+    warn "重启命令本身就返回了 $RC —— 看上面 ssh 打回来的报错"
+    note "  docker: command not found → 就是 PATH 那个坑，见 CLAUDE.md「部署这步只能用户本人做」"
+    note "  Sorry, try again → sudo 密码不对"
   else
     warn "重启命令返回 0，但 20 秒内没有新的启动记录"
   fi

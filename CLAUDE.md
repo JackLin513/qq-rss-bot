@@ -101,14 +101,20 @@ grep "群 .* 指令" data/bot.log | tail -5
 ### 三条命令各管各的，别混
 
 ```bash
+# ⚠️ **必须写绝对路径。** `ssh 'cmd'` 跑的是**非交互 shell**，PATH 只有
+# `/usr/bin:/bin:/usr/sbin:/sbin` —— docker 在 `/usr/local/bin`，所以
+# `sudo docker ...` 会 `docker: command not found`，而 `sudo` 并不会提示这一点。
+# 交互式登录（先 ssh 进去再手打）的 PATH 里有 /usr/local/bin，所以「手打能过、
+# 脚本不过」—— 2026-10-21 就是这么卡了一下午。
+
 # 只改了 src/ 或 scripts/ 下的代码（最常见）
-sudo docker compose restart bot              # 不重建，重新起进程 → 重新 import
+sudo /usr/local/bin/docker-compose restart bot              # 不重建，重新 import
 
 # 只改了 .env（加变量 / 改值）
-sudo docker compose up -d bot                # Compose 会 hash env_file，能检测到
+sudo /usr/local/bin/docker-compose up -d bot                # Compose 会 hash env_file
 
 # 两个都改了
-sudo docker compose up -d --force-recreate bot
+sudo /usr/local/bin/docker-compose up -d --force-recreate bot
 ```
 
 - ⚠️ **`up -d` 不能替代 `restart`。** 对「已经在跑、配置没变」的容器它是**空操作**，
@@ -141,9 +147,17 @@ sudo docker compose up -d --force-recreate bot
 ### 部署这步只能用户本人做
 
 **`JackLin` 跑不了 docker，这是硬阻塞**：`/var/run/docker.sock` 是 `root:root 660`，
-而 **`administrators` 组不给 docker 权限**（DSM 上容器只认 root）。CLI 在
-`/usr/local/bin/docker`，但 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
-非 root 连命令都找不到；`sudo` 要密码。**别反复试。**
+而 **`administrators` 组不给 docker 权限**（DSM 上容器只认 root）；`sudo` 要密码。
+**别反复试。**
+
+⚠️ **两个独立的 PATH 坑，别混：**
+1. **非 root** 连命令都找不到（PATH 里没有 `/usr/local/bin`）。
+2. **`sudo` 也一样找不到** —— `ssh 'cmd'` 是非交互 shell，PATH 只有
+   `/usr/bin:/bin:/usr/sbin:/sbin`，且 DSM 上 `sudo` **不重置也不补**
+   `/usr/local/bin`。症状是 `sudo: docker: command not found`。
+   **修法：写绝对路径** `/usr/local/bin/docker-compose`（独立二进制，连插件
+   查找都省了）。交互式登录再手打是能过的 —— 那个 PATH 里有 `/usr/local/bin`，
+   所以「手打能过、脚本不过」很容易把人绕晕。
 
 - 传文件用 **`scripts/deploy.sh`（git bundle）**，不再用 tar 覆盖：tar 传过去
   **没有版本**，事后回答不了「线上是哪一版」。NAS 上 `git` 在

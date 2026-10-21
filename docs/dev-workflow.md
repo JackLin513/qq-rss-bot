@@ -199,15 +199,27 @@ smoke 绿 → commit → push → scripts/deploy.sh → 重启容器 → 测试�
   所以改 `src/` 下的文件**永远不可能**改变配置哈希、**永远触发不了重建**。
   三条命令各管各的，别混：
   ```bash
-  # 只改了 src/ 或 scripts/ 下的代码（最常见）
-  sudo docker compose restart bot              # 不重建，重新起进程 → 重新 import
-
-  # 只改了 .env（加变量 / 改值）
-  sudo docker compose up -d bot                # Compose 会 hash env_file，能检测到
-
-  # 两个都改了
-  sudo docker compose up -d --force-recreate bot
+  # ⚠️ 绝对路径不可省，见下面「非交互 shell 的 PATH」
+  sudo /usr/local/bin/docker-compose restart bot              # 不重建，重新 import
+  sudo /usr/local/bin/docker-compose up -d bot                # 改 .env 用
+  sudo /usr/local/bin/docker-compose up -d --force-recreate bot
   ```
+
+  #### ⚠️⚠️ 非交互 shell 的 PATH：`sudo: docker: command not found`
+
+  2026-10-21 卡了大半天的坑。两个 PATH 环境**完全不同**：
+
+  | 场景 | PATH | `sudo docker` |
+  |---|---|---|
+  | 先 `ssh` 进去再手打（登录 shell） | 含 `/usr/local/bin` | ✅ 能用 |
+  | `ssh host 'cmd'`（非交互） | `/usr/bin:/bin:/usr/sbin:/sbin` | ❌ command not found |
+
+  而 DSM 的 `sudo` **不重置也不补** `/usr/local/bin`，所以「非 root 找不到」
+  和「sudo 也找不到」是**两个**坑。症状极具误导性：脚本里一直失败，
+  手动敲一遍却好的。
+
+  **修法**：一律写绝对路径。`/usr/local/bin/docker-compose` 是**独立二进制**
+  （v2.20.1，和 `docker compose` 同一个东西），连 cli-plugins 查找都省了。
   ⚠️ **`up -d` 不能替代 `restart`** —— 容器健康运行时它什么都不做。
   判据永远是启动日志那一行 `运行代码 /app/src/qq_rss_bot（最新改动 <时间>）`，
   **时间不对就是没重启成功**，别看命令有没有报错（它不会报错）。
