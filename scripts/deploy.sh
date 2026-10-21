@@ -16,6 +16,9 @@
 set -euo pipefail
 
 NAS_HOST=${NAS_HOST:-JackLin@100.91.151.20}
+# 服务器每次握手都会往 stderr 打三行 "post-quantum key exchange" 警告，
+# 盖住真正有用的输出。LogLevel=ERROR 只留错误。
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR)
 NAS_DIR=${NAS_DIR:-/volume1/docker/qq-rss-bot}
 BRANCH=main
 FORCE=0
@@ -80,15 +83,15 @@ git bundle create "$BUNDLE" --all >/dev/null 2>&1
 say "bundle $(du -h "$BUNDLE" | cut -f1)"
 
 # ---- 5. NAS 那头 --------------------------------------------------------
-ssh -o BatchMode=yes -o ConnectTimeout=8 "$NAS_HOST" true 2>/dev/null \
+ssh "${SSH_OPTS[@]}" "$NAS_HOST" true 2>/dev/null \
   || die "ssh 连不上 $NAS_HOST"
 
-OLD=$(ssh -o BatchMode=yes "$NAS_HOST" \
+OLD=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" \
   "cd $NAS_DIR && /usr/local/bin/git rev-parse --short HEAD 2>/dev/null" || true)
 OLD=${OLD:-（读不到）}
 
 # NAS 上要是有人手改过代码，reset --hard 会把它抹掉 —— 先问清楚
-NAS_DIRTY=$(ssh -o BatchMode=yes "$NAS_HOST" \
+NAS_DIRTY=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" \
   "cd $NAS_DIR && /usr/local/bin/git status --porcelain" 2>/dev/null || true)
 if [[ -n "$NAS_DIRTY" ]]; then
   printf '%s\n' "$NAS_DIRTY" | sed 's/^/    /'
@@ -100,7 +103,7 @@ if [[ -n "$NAS_DIRTY" ]]; then
 fi
 
 say "传 bundle …"
-ssh -o BatchMode=yes "$NAS_HOST" "cat > $NAS_DIR/data/deploy.bundle" < "$BUNDLE"
+ssh "${SSH_OPTS[@]}" "$NAS_HOST" "cat > $NAS_DIR/data/deploy.bundle" < "$BUNDLE"
 
 # 远端脚本用**带引号**的 heredoc，避免本地展开；只替换两个占位符
 REMOTE=$(cat <<'EOS'
@@ -117,7 +120,7 @@ EOS
 REMOTE=${REMOTE//__DIR__/$NAS_DIR}
 REMOTE=${REMOTE//__SHA__/$SHA}
 
-NEW=$(ssh -o BatchMode=yes "$NAS_HOST" "$REMOTE" | tail -1)
+NEW=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" "$REMOTE" | tail -1)
 
 if [[ "$NEW" != "$SHA" ]]; then
   die "部署后 NAS 的 HEAD 是 ${NEW}，期望 $SHA —— 没对上，别重启"
