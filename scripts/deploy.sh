@@ -35,6 +35,16 @@ done
 
 cd "$(dirname "$0")/.."
 
+# ⚠️ 这两个脚本是**在 Mac 上跑**的：它们 ssh 到 NAS 去干活。
+# 在 NAS 上跑会变成「ssh 自己」，而 sshd 未必接受，报出来的却是「连不上」——
+# 2026-10-21 实际踩到过，白白怀疑了一圈网络。
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  printf '✗ 这个脚本要在 **Mac** 上跑（它会 ssh 到 NAS）。\n' >&2
+  printf '  当前系统：%s，当前目录：%s\n' "$(uname -s)" "$PWD" >&2
+  printf '  你在 NAS 上的话，直接执行里面的命令就行，或者回 Mac 再跑。\n' >&2
+  exit 2
+fi
+
 say() { printf '%s\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 
