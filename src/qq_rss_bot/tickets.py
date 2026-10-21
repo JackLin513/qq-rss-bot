@@ -983,27 +983,42 @@ class TicketPoller:
         booths = await self.feed.covers(max_age=0.0) if self.cfg.ticket_images else {}
 
         now = datetime.now(JST)
-        baseline = not self.db.ticket_alerts_any()
-        if baseline:
-            # 首轮把当前正在受付的全部记成「已推过」，**一条 `new` 都不发** ——
-            # 存量 31 条受付（14 条 IM@S），直接跑会当场倒灌十几条进群。
-            # 靠「表里有没有行」判断，所以重启不会把 baseline 重跑一遍。
-            #
-            # ⚠️ **但这里不 return** —— 締切提醒要继续往下走。已经在 24h / 2h
-            # 窗口里的该推就推（实测总有一两条正好卡在窗口边上）。return 的话
-            # 第一次启动群里一条消息都没有，根本没法判断功能通没通。
-            seeded = 0
-            for group in self.groups:
-                for rec in recs:
-                    if rec.status == "within_entry_period":
-                        self.db.mark_ticket_alert(rec.id, group, "new")
-                        seeded += 1
-            _log.info("抽票：首轮建立 baseline，%d 条受付标记为已见（不推 new）", seeded)
 
         # **先算完整轮要发什么，再逐条发。** 不能像原来那样在「群 × 受付 × kind」
         # 的三层循环里直接发 —— 预热/预览是按**一条消息**组织的，同一条提醒
         # 会被预热好几次（每个正式群一次），而且三阶段会被拆散成并发的。
         seen = {g: self.db.ticket_alert_kinds(g) for g in self.groups}
+
+        # ⚠️⚠️ **baseline 判据必须按群，不能按全表。**
+        #
+        # 「这个群一行记录都没有」= 它还没建过 baseline → 把当前正在受付的全部
+        # 记成「已推过」，**一条 `new` 都不发**。存量 31 条受付（14 条 IM@S），
+        # 直接跑会当场倒灌十几条进群。
+        #
+        # 以前判的是 `ticket_alerts_any()`（**整个表**有没有行）。那个判据在
+        # 「只有第一个群」时看起来对，但线上踩到了：正式群 10-18 就有了记录，
+        # 2026-10-21 用 `/set` 把抽票在新群打开 → 那个群的 `seen` 是空的 →
+        # **几天前就推过的 5 条旧受付当成「新受付」连发进群**。
+        # 表里只要有别的群的记录，这个群就永远建不了 baseline。
+        #
+        # 按群判之后：新开的群**不补发存量**，但締切提醒（24h / 2h）照常 ——
+        # 那些是按截止时刻算的，不受 baseline 影响，所以新群不会「一片空白」。
+        #
+        # ⚠️ **这里不 return**（同上）：留在 24h / 2h 窗口里的締切该推就推。
+        seeded_groups = [g for g in self.groups if not seen[g]]
+        if seeded_groups:
+            seeded = 0
+            for group in seeded_groups:
+                for rec in recs:
+                    if rec.status == "within_entry_period":
+                        self.db.mark_ticket_alert(rec.id, group, "new")
+                        seen[group].setdefault(rec.id, set()).add("new")
+                        seeded += 1
+            _log.info(
+                "抽票：%d 个群首次启用，存量 %d 条受付标记为已见（不补发 new）",
+                len(seeded_groups),
+                seeded,
+            )
         pending: list[tuple[Reception, str, list[str]]] = []
         for rec in recs:
             groups_for: dict[str, list[str]] = {}

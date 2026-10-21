@@ -488,15 +488,6 @@ class Database:
 
     # ---------- 抽票提醒（ASOBI TICKET）----------
 
-    def ticket_alerts_any(self) -> bool:
-        """表里有没有任何一行 —— 也就是**有没有建过 baseline**。
-
-        `TicketPoller` 靠它判断是不是首次运行。别改成「有没有某个群的记录」：
-        加一个新群时那个群是空的，会被当成首轮而漏掉全部存量提醒。
-        """
-        row = self._conn.execute("SELECT 1 FROM ticket_alerts LIMIT 1").fetchone()
-        return row is not None
-
     def ticket_alert_kinds(self, group_openid: str) -> dict[str, set[str]]:
         """这个群已经收到过的提醒：`{reception_id: {kind, …}}`。
 

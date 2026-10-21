@@ -5026,11 +5026,14 @@ def _check_tk_db() -> None:
     with tempfile.TemporaryDirectory() as d:
         db = _DB(_P(d) / "t.db")
         try:
-            check("★ 全新库：表是空的（= 还没建过 baseline）", not db.ticket_alerts_any())
-            check("空表查 kinds 得到空 dict", db.ticket_alert_kinds("G") == {})
+            check("★ 全新库：每个群都没建过 baseline（`kinds` 为空）—— "
+                  "判据是**按群**的，见 TicketPoller.poll_once",
+                  db.ticket_alert_kinds("G") == {} and db.ticket_alert_kinds("H") == {})
 
             db.mark_ticket_alert("rec-1", "G", "new")
-            check("★ 记一条之后 baseline 就算建过了", db.ticket_alerts_any())
+            check("★ 记一条之后这个群就算建过 baseline 了（别的群仍然是空的）",
+                  db.ticket_alert_kinds("G") == {"rec-1": {"new"}}
+                  and db.ticket_alert_kinds("H") == {})
             check("★ kinds 按受付归组", db.ticket_alert_kinds("G") == {"rec-1": {"new"}})
 
             db.mark_ticket_alert("rec-1", "G", "entry24")
@@ -5041,7 +5044,7 @@ def _check_tk_db() -> None:
 
             check("★ 提醒是逐群记的（别的群不受影响）", db.ticket_alert_kinds("H") == {})
             db.mark_ticket_alert("rec-1", "H", "new")
-            check("★ 加新群时那个群是干净的 —— 所以 baseline 判据不能按群查",
+            check("  加新群时那个群是干净的 —— 所以**每个群各建一次** baseline",
                   db.ticket_alert_kinds("H") == {"rec-1": {"new"}})
         finally:
             db.close()
@@ -5148,13 +5151,34 @@ def _check_tk_poller() -> None:
                 n2 = await poller.poll_once()
                 check("★ 第二轮：同一条不重复推", n2 == 0, n2)
 
+                # ---- ★ 新开的群不补发存量（2026-10-21 线上真出事的那条）----
+                # 正式群 10-18 就有记录，用 /set 把抽票在新群打开之后，
+                # 那个群被当成「首轮」之外的情况 → 几天前推过的旧受付全当新受付
+                # 又发了一遍。判据从「**整个表**有没有行」改成「**这个群**有没有行」。
+                db.set_group_feature("H", "tickets", True)
+                pusher.sent.clear()
+                n3 = await poller.poll_once()
+                texts3 = [t for _, t in pusher.sent]
+                check("★★ 新开的群**不补发存量「新受付」**（按群建 baseline）",
+                      n3 == 1 and not any("新受付" in t for t in texts3),
+                      f"n={n3} {[t[:14] for t in texts3]}")
+                check("  但締切提醒照旧发给新群 —— 新群不会一片空白",
+                      any("申込締切" in t for t in texts3), str(len(texts3)))
+                check("★ 新群的存量已经记成「已见」（下一轮不会再补）",
+                      db.ticket_alert_kinds("H").get("rec-1") == {"new", "entry24"},
+                      db.ticket_alert_kinds("H"))
+                check("  第二轮之后新群也不重复", await poller.poll_once() == 0)
+
                 # 发失败不能记账，否则那条提醒永远丢了
                 class _Boom:
                     async def send_markdown(self, group, text):
                         raise RuntimeError("boom")
 
                 with tempfile.TemporaryDirectory() as d2:
-                    db2 = _DB(_P(d2) / "t2.db")
+                    # ⚠️ 必须 `_enable`：群列表现在只从库里来，不 enable 的话
+                    # `enabled` 是假、`poll_once` 立刻返回 0 —— 这条钉子会变成
+                    # 「0 == 0」的空转（群列表搬库之后踩过）。
+                    db2 = _enable(_DB(_P(d2) / "t2.db"), "tickets", "G")
                     try:
                         p2 = _tk.TicketPoller(cfg, db2, _Http(), _Boom())
                         check("★ 发送失败时不记账（下一轮会重试）",

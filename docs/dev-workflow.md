@@ -58,7 +58,7 @@ uv run qq-rss-bot            # 前台启动（调试用，Ctrl+C 可停）
 ### 提交前必跑
 
 ```bash
-uv run python scripts/smoke.py        # 当前 1499 项，必须 0 failed
+uv run python scripts/smoke.py        # 当前 1502 项，必须 0 failed
 uv run python scripts/integration.py  # 端到端，假推送，不碰 QQ
 ```
 
