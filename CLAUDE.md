@@ -291,3 +291,24 @@ sudo docker compose up -d --force-recreate bot
 | 限流、配额与出错通知 | `quota.py` `notify.py` | [`docs/quota-notify.md`](docs/quota-notify.md) |
 | 群复读机（连着两个人发同样的话就跟一句） | `repeat.py` | [`docs/repeat.md`](docs/repeat.md) |
 | **按群的功能开关**（群列表存库，`.env` 里没有群参数；`/set` 面板） | `features.py` `db.group_features` `commands._set` | [`docs/group-features.md`](docs/group-features.md) |
+
+## Agent skills
+
+工程技能（`/to-tickets`、`/triage`、`/to-spec`、`/domain-modeling` 等）的逐仓库配置。
+
+### Issue tracker
+
+issue 和 spec 都是 **GitHub issue**（`JackLin513/qq-rss-bot`，用 `gh` CLI 读写）。
+见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+五个分类角色用**默认标签名**：`needs-triage` / `needs-info` / `ready-for-agent` /
+`ready-for-human` / `wontfix`。见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+**单上下文**：仓库根目录 `GLOSSARY.md` + `docs/adr/`。两者**都还没建** ——
+需要时才由 `/domain-modeling` 创建，别提前造。
+⚠️ 和本文件「功能索引」里那 15 份 `docs/*.md` 是两回事（那些是各功能的
+来龙去脉）。见 `docs/agents/domain.md`。
