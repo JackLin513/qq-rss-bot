@@ -3,23 +3,26 @@
 > 本地（Mac）开发 → 推 GitHub → 传到 NAS 并重启 → 换机时怎么迁。
 > **CLAUDE.md 只留三条部署命令和判据**，来龙去脉全在这。
 >
-> ⚠️ **推 GitHub 和部署到 NAS 是两件事**，中间没有自动化：
-> NAS 上的代码是 **tar-over-ssh 传过去的，`.git` 没上传**（NAS 也直连不上
-> github.com，要代理）。所以 `git push` 完**必须**手动同步一次，否则线上还是旧代码。
+> ⚠️ **推 GitHub 和部署到 NAS 仍是两件事**：`git push` 不触发部署。
+> 但 NAS 从 2026-10-21 起**有自己的 `.git`**，部署走 **git bundle** ——
+> Mac 上打包 → ssh 传过去 → NAS `git fetch` + `git reset --hard`。
+> 所以「线上跑的是哪个 commit」有确切答案，回滚是 `git reset --hard <sha>` 一条命令。
+> NAS 直连不上 github.com，但 bundle 是**离线**的完整历史，不需要网络。
 
 ## 0. 一张图
 
 ```
 Mac（开发机）                      GitHub                     NAS DS220+（生产）
 ─────────────                     ──────                     ─────────────────
-uv sync                                                      
+uv sync
 botctl.sh start      ──push──▶   origin/main
 uv run smoke.py                                                 │
-     │                                                          │ tar-over-ssh
-     │  smoke 全绿                                              │ （.git / .venv
-     ▼                                                          ▼   不上传）
+     │                                                          │ scripts/deploy.sh
+     │  smoke 全绿                                              │ （git bundle + reset）
+     ▼                                                          ▼
 git commit / push                                               /volume1/docker/qq-rss-bot/
-                                                                     │
+                                                                     │  git status 干净
+                                                                     │  = 和某个 commit 对得上
                                               sudo docker compose restart bot
                                                                      │
                                                           容器里 import 挂载卷的 src/
@@ -63,7 +66,7 @@ uv run qq-rss-bot            # 前台启动（调试用，Ctrl+C 可停）
 ### 提交前必跑
 
 ```bash
-uv run python scripts/smoke.py        # 当前 1502 项，必须 0 failed
+uv run python scripts/smoke.py        # 当前 1511 项，必须 0 failed
 uv run python scripts/integration.py  # 端到端，假推送，不碰 QQ
 ```
 
@@ -87,16 +90,23 @@ git remote -v
 - **单分支 `main`**，本地 `main` 跟踪 `origin/main`。这是单人项目，直接提交到 main。
 - 提交信息风格：`feat:` / `fix:` / `docs:` + 中文描述，一句话说清做了什么。
 
-### ⚠️ 推送节奏：新功能**验证通过之后**才 push
+### 推送节奏：**smoke 绿就 push，然后部署**
 
-用户定的：**先在测试群真跑一次、确认没问题，再 `git push`。**
+2026-10-21 改的，之前是「测试群验证通过才 push」。
 
-理由：部署走的是 **tar-over-ssh，不是 `git pull`** —— push **根本不触发部署**，
-它纯粹是「存档」。未验证的代码存档没意义，等验证过了再存更合理。
+理由：**让 bug 进群的是部署，不是 push。** push 晚一天不增加任何安全性，
+只让三件事对不上：
+
+- NAS 的 HEAD 在 GitHub 上查不到 → 回滚时 `git log` 和日志对不上
+- `/code-review` 需要一个固定起点，起点得是**提交过**的 commit
+- issue 的 `closes #12` 得指向真实存在的提交
+
+真正的门还是**测试群** —— 但它挡的是「功能上线」，不是「代码存档」。
 
 ```
-做完功能 → 同步到 NAS（tar-over-ssh）→ 在测试群真跑 → 确认没问题 → git push
-              ↑ 中途可以本地 commit（保留历史、方便回退），只是别推
+smoke 绿 → commit → push → scripts/deploy.sh → 重启容器 → 测试群验证
+                                                  ↓
+                                    有问题 → 新 commit 修掉 → 重复
 ```
 
 ### ⚠️ 绝不提交
@@ -240,9 +250,19 @@ git remote -v
   都返回 401（未带 token 的正常响应），0.7–0.9s。compose 里给 rsshub 配代理
   是为了抓被污染的上游，跟构建无关。
 - `.env` 在目标机上是 **600**，`RSSHUB_BASE=http://rsshub:1200`、
-  `DB_PATH=/app/data/bot.db`。传文件用 **tar-over-ssh**：
-  群晖的 `rsync` 是 openrsync（协议 29），不认 `--info=stats2`，
-  且它 fork 出来的 ssh 拿不到密钥，`rsync -av` 直接 `Permission denied`。
+  `DB_PATH=/app/data/bot.db`。
+- **传文件用 `scripts/deploy.sh`（git bundle）**，不要再用 tar 覆盖：
+  群晖的 `rsync` 是 openrsync（协议 29），不认 `--info=stats2`，且它 fork 出来的
+  ssh 拿不到密钥，`rsync -av` 直接 `Permission denied`；而 tar 传过去**没有版本**，
+  事后没法回答「线上是哪一版」。
+  ```bash
+  scripts/deploy.sh                 # 检查分支/工作区 → 跑 smoke → 传 bundle → reset --hard
+  scripts/deploy.sh --skip-smoke    # 急修（自己先跑过）
+  scripts/deploy.sh --force         # 非 main / 工作区脏 / NAS 脏时放行
+  ```
+  NAS 上 `git` 在 **`/usr/local/bin/git`**，**不在 PATH 里**（`PATH` 只有
+  `/usr/bin:/bin:/usr/sbin:/sbin`），所有命令都要写绝对路径。
+  `data/deploy.bundle` 是每次传过去的最新包，`data/` 被 gitignore，不会弄脏仓库。
 - **容器里的日志必须同时落一份到挂载卷**（`LOG_FILE=/app/data/bot.log`，
   由 `__main__.setup_logging` 装 `RotatingFileHandler`）。原因：`docker logs`
   要 root，`/volume1/@docker` 是 `drwx--x--- root root`，非 root 完全看不到 ——
@@ -458,7 +478,8 @@ Docker 自身数据在 `/volume1/@docker`，由 Container Manager 管理，无�
 
 #### 目标机上已就绪
 
-代码与配置已通过 tar-over-ssh 传到 `/volume1/docker/qq-rss-bot/`：
+代码与配置已通过 tar 传到 `/volume1/docker/qq-rss-bot/`（2026-10-21 之后改走
+`scripts/deploy.sh` 的 git bundle）：
 
 - `Dockerfile`、`docker-compose.yml`、`.dockerignore`、`pyproject.toml`、`uv.lock`、
   `README.md`、`CLAUDE.md`、`src/`、`scripts/`

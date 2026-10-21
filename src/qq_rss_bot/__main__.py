@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -41,8 +42,54 @@ def setup_logging(cfg: Config) -> RotatingFileHandler | None:
     return handler
 
 
+def code_revision(pkg: Path) -> str | None:
+    """正在跑的代码是哪个 commit。拿不到返回 `None`（调用方退回 mtime）。
+
+    **三条路，按可靠性从高到低** —— 三个环境里能用的东西不一样：
+
+    1. **git**（Mac 上 `uv run`）—— `git -C <仓库> rev-parse --short HEAD`，
+       工作区脏就加 `-dirty`。
+    2. **`data/DEPLOYED`**（群晖容器里）—— 容器**没装 git、也没挂 `.git`**
+       （compose 只挂了 `./src` `./scripts` `./data`），所以这条是主路径。
+       文件由 `scripts/deploy.sh` 部署成功后写下；`data/` 是挂载卷、又被
+       gitignore，所以容器读得到，也不会弄脏仓库。
+    3. 都没有 → `None`。
+
+    ⚠️ 为什么非要有 SHA：**mtime 不够用了。** 2026-10-21 在 NAS 上做 initial
+    checkout 时，`src/*.py` 的 mtime 被整棵树刷成同一秒 —— 从此时间戳分不清
+    「我改了一行」和「git 重写了整棵树」。SHA 才能回答「这是哪个版本、能不能
+    退回去」。
+    """
+    repo = pkg.parents[1]
+    try:
+        rev = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if rev.returncode == 0 and rev.stdout.strip():
+            dirty = subprocess.run(
+                ["git", "-C", str(repo), "status", "--porcelain",
+                 "--untracked-files=no"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            return rev.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        line = (repo / "data" / "DEPLOYED").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return (line.splitlines()[0].strip() or None) if line else None
+
+
 def code_identity() -> str:
-    """报出「正在跑的是哪份代码」：包目录 + 最新一次改动的时间。
+    """报出「正在跑的是哪份代码」：包目录 + 版本 + 最新一次改动的时间。
 
     **这不是装饰。** 出过一次很难查的事故：镜像从早上 09:56 就没再重建过，
     而源码 13:34 就换过了 —— 连着三次「重建」实际都只是用旧镜像重开容器，
@@ -60,7 +107,9 @@ def code_identity() -> str:
     pkg = Path(__file__).resolve().parent
     newest = max((f.stat().st_mtime for f in pkg.glob("*.py")), default=0.0)
     stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(newest)) if newest else "?"
-    return f"{pkg}（最新改动 {stamp}）"
+    rev = code_revision(pkg)
+    inside = f"{rev}，最新改动 {stamp}" if rev else f"最新改动 {stamp}"
+    return f"{pkg}（{inside}）"
 
 
 def main() -> None:

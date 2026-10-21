@@ -21,7 +21,7 @@ scripts/botctl.sh start                        # 启动（后台，日志 /tmp/q
 scripts/botctl.sh restart                      # 重启 —— **改完代码必须重启**，没有热加载
 scripts/botctl.sh status                       # 看实例（多于 1 个就是出问题了）★
 uv run qq-rss-bot                              # 前台启动（调试用，Ctrl+C 可停）
-uv run python scripts/smoke.py                 # 离线+抓取测试（当前 1502 项）
+uv run python scripts/smoke.py                 # 离线+抓取测试（当前 1511 项）
 uv run python scripts/integration.py           # 端到端（假推送，不碰 QQ）
 uv run python scripts/probe_events.py 20       # 事件探针（先停掉正式实例）
 uv run python scripts/probe_panel.py           # 指令面板 schema 探针（自建自删，可复跑）
@@ -29,6 +29,7 @@ uv run python scripts/check_sources.py         # 复测 RSSHub 各路由可用�
 uv run python scripts/test_push.py             # 测主动消息（不占 WS 会话，可并行）
 uv run python scripts/setup_panel.py --list    # 指令面板：查询（只读，先跑这个）
 uv run python scripts/setup_panel.py --create  # 指令面板：创建
+scripts/deploy.sh                              # ★ 部署：检查 → smoke → 传 bundle → NAS reset
 scripts/wizard-deploy.sh                       # ★ 部署向导：预检 → 选命令 → sudo → 验生效
 ```
 
@@ -118,9 +119,13 @@ sudo docker compose up -d --force-recreate bot
 - ⚠️ **改 `.env` 时 `restart` 不够**：环境变量在**容器创建时**烘进去，
   `restart` 只是把现有容器再启动一次，**不会再读一遍 `.env`**。
   症状**完全静默**：代码是新的、日志正常、新变量全是代码里的默认值。
-- **判据永远是启动日志那一行** `运行代码 /app/src/qq_rss_bot（最新改动 <时间>）`
+- **判据永远是启动日志那一行** `运行代码 /app/src/qq_rss_bot（<sha>，最新改动 <时间>）`
   （`__main__.code_identity`）。**时间不对就是没重启成功**，别看命令有没有报错
   —— 它不会报错。**这条日志是热更新的前提，别删。**
+  ⚠️ **`<sha>` 是 2026-10-21 加的**：那天在 NAS 上做 initial checkout，`src/*.py`
+  的 mtime 被整棵树刷成同一秒 —— 从此时间戳分不清「改了一行」和「git 重写了整棵
+  树」。容器里**没装 git、也没挂 `.git`**，所以 SHA 读的是 `data/DEPLOYED`
+  （由 `deploy.sh` 写下）；`-dirty` 后缀表示部署时工作区不干净。
 - 改 `docker-compose.yml` 本身才需要 `up -d` 一次。改 `src/` 下的代码**永远不用重建**。
 
 ### 网络：代理只给 RSSHub，绝不能给 bot
@@ -140,8 +145,10 @@ sudo docker compose up -d --force-recreate bot
 `/usr/local/bin/docker`，但 PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，
 非 root 连命令都找不到；`sudo` 要密码。**别反复试。**
 
-- 传文件用 **tar-over-ssh**：群晖的 `rsync` 是 openrsync（协议 29），
-  不认 `--info=stats2`，且 fork 出来的 ssh 拿不到密钥。
+- 传文件用 **`scripts/deploy.sh`（git bundle）**，不再用 tar 覆盖：tar 传过去
+  **没有版本**，事后回答不了「线上是哪一版」。NAS 上 `git` 在
+  **`/usr/local/bin/git`**，不在 `PATH` 里，命令都得写绝对路径。
+  （群晖的 `rsync` 也用不了：openrsync 协议 29，fork 出来的 ssh 拿不到密钥。）
 - 容器日志必须同时落一份到挂载卷（`LOG_FILE=/app/data/bot.log`），
   因为 `docker logs` 要 root、`/volume1/@docker` 非 root 进不去。
 - **判断「连上网关没有」只能看日志，别信 netstat**（宿主 netstat 看不到容器命名空间
@@ -149,7 +156,7 @@ sudo docker compose up -d --force-recreate bot
 
 📖 **完整版（本地开发 → GitHub → NAS → 换机迁移，一份看完）：**
 [`docs/dev-workflow.md`](docs/dev-workflow.md)
-—— 含 GUI 幽灵容器、镜像不重建、tar-over-ssh、实机规格、故障判据速查表。
+—— 含 GUI 幽灵容器、镜像不重建、git bundle 部署、实机规格、故障判据速查表。
 
 ## 平台硬事实（别再查了）
 

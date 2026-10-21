@@ -2109,9 +2109,12 @@ def _check_code_identity() -> None:
     「重建」都只是用旧镜像重开容器。日志看起来完全正常（`已上线`、`轮询启动`
     都在），新代码一行都没生效，**而且没有任何地方提示**。这条日志就是那个提示。
     """
+    import inspect as _inspect
+    import re as _re
+    import tempfile as _tempfile
     import time as _time
 
-    from qq_rss_bot.__main__ import code_identity
+    from qq_rss_bot.__main__ import code_identity, code_revision
 
     pkg = Path(__file__).resolve().parents[1] / "src" / "qq_rss_bot"
     ident = code_identity()
@@ -2122,6 +2125,66 @@ def _check_code_identity() -> None:
     newest = max(f.stat().st_mtime for f in pkg.glob("*.py"))
     stamp = _time.strftime("%m-%d %H:%M:%S", _time.localtime(newest))
     check("★ 时间取的是包内最新的 mtime", stamp in ident, f"期望 {stamp}，得到 {ident}")
+
+    # ---- 版本号：光有时间不够了 ----
+    # 2026-10-21 在 NAS 上做 initial checkout 时，src/*.py 的 mtime 被整棵树
+    # 刷成同一秒 —— 从此时间戳分不清「我改了一行」和「git 重写了整棵树」。
+    check("★ `code_revision` 真的调了 `git rev-parse`（不是只读缓存文件）",
+          "rev-parse" in _inspect.getsource(code_revision))
+    rev = code_revision(pkg)
+    check("★ 在 git 仓库里跑 → 报出 SHA（脏工作区加 -dirty）",
+          bool(rev) and _re.fullmatch(r"[0-9a-f]{7,}(-dirty)?", rev) is not None,
+          str(rev))
+    check("★ `code_identity` 里带上了这个 SHA", bool(rev) and rev in ident, ident)
+
+    # 群晖容器里**没装 git、也没挂 .git**，只有 data/ 是挂载卷 ——
+    # 所以容器那条路靠 deploy.sh 写下的 data/DEPLOYED。
+    with _tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        fake = root / "src" / "qq_rss_bot"
+        fake.mkdir(parents=True)
+        check("容器场景：既没 git 也没 DEPLOYED → None（退回 mtime，不崩）",
+              code_revision(fake) is None)
+        (root / "data").mkdir()
+        (root / "data" / "DEPLOYED").write_text("abc1234\n", encoding="utf-8")
+        check("★ 容器场景：从 data/DEPLOYED 读出 SHA",
+              code_revision(fake) == "abc1234", str(code_revision(fake)))
+        (root / "data" / "DEPLOYED").write_text("\n", encoding="utf-8")
+        check("DEPLOYED 是空文件 → None（不能把空串塞进日志）",
+              code_revision(fake) is None)
+
+    # 脏工作区必须带 -dirty：否则「线上跑的和仓库里那份不一样」这件事
+    # 在日志上和干净部署长得一模一样。
+    import os as _os
+    import subprocess as _sp
+
+    with _tempfile.TemporaryDirectory() as td2:
+        def g(*args):
+            _sp.run(
+                ["git", "-C", td2, *args],
+                capture_output=True,
+                text=True,
+                check=True,
+                env={**_os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+            )
+
+        (Path(td2) / "src" / "qq_rss_bot").mkdir(parents=True)
+        (Path(td2) / "tracked.txt").write_text("a", encoding="utf-8")
+        g("init", "-q")
+        g("add", "-A")
+        g("commit", "-qm", "x")
+        fake2 = Path(td2) / "src" / "qq_rss_bot"
+        clean = code_revision(fake2)
+        check("干净仓库 → 不带 -dirty", bool(clean) and "-dirty" not in clean, str(clean))
+        (Path(td2) / "tracked.txt").write_text("b", encoding="utf-8")
+        dirty = code_revision(fake2)
+        check("★ 改了跟踪文件 → 带 -dirty（不然和干净部署长得一模一样）",
+              bool(dirty) and dirty.endswith("-dirty"), str(dirty))
+        (Path(td2) / "untracked.txt").write_text("c", encoding="utf-8")
+        (Path(td2) / "tracked.txt").write_text("a", encoding="utf-8")
+        check("  只有未跟踪文件不算脏（--untracked-files=no）—— 和 deploy.sh 的口径一致",
+              code_revision(fake2) == clean, f"{code_revision(fake2)} vs {clean}")
 
 
 _check_code_identity()
