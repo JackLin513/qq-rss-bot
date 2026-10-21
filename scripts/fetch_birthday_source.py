@@ -67,8 +67,12 @@ ROW_RE = re.compile(r"<tr\b[^>]*>.*?</tr>", re.S)
 DATE_RE = re.compile(r">(\d{1,2})/(\d{1,2})<")
 LI_RE = re.compile(r"<li\b[^>]*>(.*?)</li>", re.S)
 BRAND_RE = re.compile(r'bg-imas-brand-([a-z0-9]+)"\s*>([^<]*)<')
-PERSON_RE = re.compile(r'data-person-id="\d+"')
-NAME_RE = re.compile(r'class="idol-name"[^>]*>(.*?)</span>', re.S)
+PERSON_RE = re.compile(r'data-person-id="(\d+)"')
+# ⚠️ 必须把**开标签的属性**一起抓下来：`data-character-id` 是跟声优一览页
+# 做 join 的唯一可靠依据（两个页面把同一个角色写成不同名字，按名字匹配会静默漏掉）。
+# 属性保住但不写进 TOML —— 渲染结果要和改动前逐字节一致。
+NAME_RE = re.compile(r'<span class="idol-name"([^>]*)>(.*?)</span>', re.S)
+CHARACTER_ID_RE = re.compile(r'data-character-id="(\d+)"')
 ROLE_RE = re.compile(r"^(.*?)\s*\((.*?)役\)\s*$")
 
 
@@ -93,20 +97,24 @@ def parse(page: str) -> tuple[dict[str, str], list[dict]]:
             name_html = NAME_RE.search(li)
             if not name_html:
                 continue
-            name = _text(name_html.group(1))
+            name = _text(name_html.group(2))
             if not name:
                 continue
             bm = BRAND_RE.search(li)
             brand = bm.group(1) if bm else ""
-            if PERSON_RE.search(li):
+            pm = PERSON_RE.search(li)
+            if pm:
                 rm = ROLE_RE.match(name)
                 people.append(
                     {"name": rm.group(1) if rm else name,
                      "role": rm.group(2) if rm else "",
-                     "brand": brand}
+                     "brand": brand,
+                     "person_id": int(pm.group(1))}
                 )
             else:
-                idols.append({"name": name, "brand": brand})
+                cm = CHARACTER_ID_RE.search(name_html.group(1))
+                idols.append({"name": name, "brand": brand,
+                              "character_id": int(cm.group(1)) if cm else None})
         days.append({"date": f"{month:02d}-{day:02d}",
                      "idols": idols, "people": people})
     days.sort(key=lambda d: d["date"])

@@ -8396,7 +8396,211 @@ _gf_repeater_dynamic()
 _gf_wiring()
 _gf_poller_respects_db()
 _gf_run_never_dies()
-_gf_set()
+
+print("[4.100] 声优库：角色 → 现任声优（全离线）")
+
+
+_SY_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _sy_import() -> object:
+    import sys as _sys  # noqa: PLC0415
+
+    _sys.path.insert(0, str(_SY_ROOT / "scripts"))
+    import fetch_seiyuu as _fs  # noqa: PLC0415
+
+    return _fs
+
+
+def _sy_birthday_page() -> None:
+    """生日页的解析要**保住** `data-character-id`，但**不许**写进 TOML。"""
+    fs = _sy_import()
+    import fetch_birthday_source as _fb  # noqa: PLC0415
+
+    page = (
+        '<tr><td>10/19</td><td><ul>'
+        '<li><span class="idol-name" data-brand-id="1" data-character-id="63">'
+        "道明寺歌鈴</span>"
+        '<span class="badge bg-imas-brand-cinderella">シンデレラ</span></li>'
+        "</ul></td></tr>"
+    )
+    brands, days = _fb.parse(page)
+    check("★ 生日页解析保住 character_id（声优库的 join 全靠它）",
+          days and days[0]["idols"][0].get("character_id") == 63,
+          str(days[0]["idols"] if days else None))
+    text = _fb.render(brands, days, "sha", datetime(2026, 10, 21, 23, 0, 0))
+    check("★ character_id **不写进** birthdays.toml（渲染结果逐字节不变）",
+          "character_id" not in text, text.splitlines()[-1])
+
+
+def _sy_parse() -> None:
+    """声优页解析：现任取 `title`，人的身份取行首 `<rb>`。"""
+    fs = _sy_import()
+
+    def row(person: str, attrs: str, name: str, tenure: str = "") -> str:
+        small = f'<small class="date">({tenure})</small>' if tenure else ""
+        return (
+            f'<tr><td class="text-nowrap"><ruby><rb>{person}</rb>'
+            f"<rp> (</rp><rt>x</rt><rp>)</rp></ruby></td>"
+            f'<td><span class="idol-name" {attrs}>{name}</span>{small}</td></tr>'
+        )
+
+    page = "".join([
+        # 现任：从这天起，没结束
+        row("浅倉杏美",
+            'data-character-id="3" data-person-id="41" title="萩原雪歩(CV:浅倉杏美)"',
+            "萩原雪歩", "2010-07-04〜"),
+        # 前任：行首是 長谷優里奈，但 span 上的 person-id 和 title 还是现任的
+        row("長谷優里奈",
+            'data-character-id="3" data-person-id="41" title="萩原雪歩(CV:浅倉杏美)"',
+            "萩原雪歩", "〜2010-07-03"),
+        # 同一角色的另一套 CV（Xenoglossia 那种），没有任期 —— 不是「前任」
+        row("井口裕香",
+            'data-character-id="1" data-person-id="1" title="天海春香(CV:中村繪里子)"',
+            "天海春香"),
+        row("中村繪里子",
+            'data-character-id="1" data-person-id="1" title="天海春香(CV:中村繪里子)"',
+            "天海春香"),
+        # title 自相矛盾 → 这个角色整个跳过，别猜
+        row("A",
+            'data-character-id="9" title="双海亜美(CV:A)"', "双海亜美"),
+        row("B",
+            'data-character-id="9" title="双海亜美(CV:B)"', "双海亜美"),
+    ])
+    current, former, seen = fs.parse_cv(page)
+    check("★ 现任取自 title（不是行首，也不是 data-person-id）",
+          current.get(3) == "浅倉杏美", str(current.get(3)))
+    # ⚠️ 这条不能少：真实页面上，同一个角色的**第一行未必是现任** ——
+    # Xenoglossia 那套 CV 按假名排序就排在前面（井口裕香 < 中村繪里子）。
+    # 只认「第一次出现的行」会静默把现任认成别人，而且只在少数角色上错。
+    check("★ 也不认「第一行」—— 第一行可能是另一套 CV",
+          current.get(1) == "中村繪里子", str(current.get(1)))
+    check("★ 带了结束日期的行首名字才算前任",
+          former.get(3) == {"長谷優里奈"}, str(former.get(3)))
+    check("★ 没有任期记录的别的 CV**不算**前任（Xenoglossia 那种）",
+          "井口裕香" not in former.get(1, set()), str(former.get(1, set())))
+    check("★ 同一角色两个不同 title → 整个跳过，不猜",
+          9 not in current, str(current.get(9)))
+    check("出现的角色 id 都记下来了", seen == {1, 3, 9}, str(seen))
+
+
+def _sy_build() -> None:
+    """生日表 ⨝ 声优页：key 是生日表的名字，按 id 关联。"""
+    fs = _sy_import()
+    days = [{
+        "date": "10-19",
+        "idols": [
+            {"name": "エミリー・スチュアート", "brand": "million", "character_id": 300},
+            {"name": "没有 CV 的角色", "brand": "cinderella", "character_id": 301},
+            {"name": "某个品牌", "brand": "others", "character_id": None},
+        ],
+        "people": [],
+    }]
+    built = fs.build(days, {300: "郁原ゆう"}, {300: {"前任さん"}})
+    check("★ key 用生日表里的全名（不是声优页的短名）",
+          built["roles"] == {"エミリー・スチュアート": "郁原ゆう"},
+          str(built["roles"]))
+    check("★ 没有 CV 的角色进 missing，带 brand 和 id",
+          built["missing"] == [("没有 CV 的角色", "cinderella", 301)],
+          str(built["missing"]))
+    check("★ 带 id=None 的品牌条目**两边都不进**（不是角色）",
+          "某个品牌" not in built["roles"]
+          and all(n != "某个品牌" for n, _, _ in built["missing"]))
+    check("前任记在 former_roles 里，现任同时也在 persons 里",
+          built["former_roles"] == {"エミリー・スチュアート": ["前任さん"]}
+          and set(built["persons"]) == {"郁原ゆう", "前任さん"},
+          str(built))
+
+
+def _sy_render_merge() -> None:
+    """渲染能被 tomllib 读回来；`source=manual` 的条目不丢。"""
+    import tomllib as _tl  # noqa: PLC0415
+
+    fs = _sy_import()
+    persons = {"甲": {"handle": "", "source": "auto"},
+               "乙": {"handle": "someone", "source": "manual"}}
+    roles = {"角色一": {"current": "甲", "source": "auto"}}
+    former = {"角色一": ["乙"]}
+    counts = {"idols": 1, "characters": 1, "with_cv": 1,
+              "without_cv": 0, "persons": 2, "former_cvs": 1}
+    text = fs.render(persons=persons, roles=roles, former_roles=former,
+                     counts=counts, fetched_at=datetime(2026, 10, 21, 23, 0, 0))
+    back = _tl.loads(text)
+    check("★ 渲染的东西 tomllib 读得回来，且 manual 的 handle 原样保留",
+          back["persons"]["乙"]["handle"] == "someone"
+          and back["persons"]["乙"]["source"] == "manual", str(back["persons"]))
+    check("roles / former_roles 结构对得上",
+          back["roles"]["角色一"]["current"] == "甲"
+          and back["former_roles"]["角色一"] == ["乙"])
+
+    existing = {
+        "persons": {"甲": {"handle": "manual_handle", "source": "manual"},
+                    "丙": {"handle": "gone", "source": "auto"}},
+        "roles": {"角色二": {"current": "人工改的", "source": "manual"}},
+    }
+    fresh = {"persons": {"甲": {"handle": "", "source": "auto"}},
+             "roles": {}, "former_roles": {}}
+    kept = fs.merge(existing, fresh)
+    check("★ merge 把 manual 的 handle 盖回来了",
+          fresh["persons"]["甲"]["handle"] == "manual_handle", str(fresh["persons"]))
+    check("source=auto 的旧条目不保留（源里没它了就是没了）",
+          "丙" not in fresh["persons"])
+    check("★ manual 的 role 也保留", fresh["roles"]["角色二"]["current"] == "人工改的")
+    check(f"报告保留了 {kept} 条", kept == 2)
+
+
+def _sy_file() -> None:
+    """真库文件的校验 —— 文件在才跑（它在 git 里，所以正常都在）。"""
+    import re as _re  # noqa: PLC0415
+    import tomllib as _tl  # noqa: PLC0415
+
+    path = _SY_ROOT / "src" / "qq_rss_bot" / "seiyuu.toml"
+    check("★ 声优库进仓库了（运行时只读它）", path.exists(), str(path))
+    if not path.exists():
+        return
+    data = _tl.loads(path.read_text(encoding="utf-8"))
+    meta = data.get("meta") or {}
+    persons = data.get("persons") or {}
+    roles = data.get("roles") or {}
+    former = data.get("former_roles") or {}
+    check("★ 库不是空的（解析失败会写成空表）",
+          bool(persons) and bool(roles), f"{len(persons)} 人 / {len(roles)} 角色")
+    check("每个角色都有现任", all(r.get("current") for r in roles.values()))
+    check("★ 每个现任都在 persons 里",
+          all(r["current"] in persons for r in roles.values()),
+          str([v["current"] for v in roles.values() if v["current"] not in persons][:3]))
+    check("★ 每个前任也都记在 persons 里（不然查不到这个人）",
+          all(p in persons for olds in former.values() for p in olds))
+    check("每个前任都属于库里的某个角色", set(former) <= set(roles))
+    check("★ 声优页里没有的现任名不会出现（title 抽错会露馅）",
+          meta.get("with_cv") == len(roles), f"{meta.get('with_cv')} vs {len(roles)}")
+    HANDLE = _re.compile(r"^[A-Za-z0-9_]{1,15}$")
+    bad = [h for p in persons.values() for h in [p.get("handle", "")] if h and not HANDLE.match(h)]
+    check("非空的 handle 都符合 X 用户名的字符规则", not bad, str(bad[:3]))
+    used = [p["handle"].lower() for p in persons.values() if p.get("handle")]
+    check("★ 没有两个声优共用同一个 handle",
+          len(used) == len(set(used)),
+          str([h for h in used if used.count(h) > 1][:3]))
+    check("每条都有 source 字段（重跑靠它决定要不要覆盖）",
+          all(p.get("source") for p in persons.values())
+          and all(r.get("source") for r in roles.values()))
+
+    cal = _SY_ROOT / "data" / "birthday" / "birthdays.toml"
+    if cal.exists():
+        _sys = __import__("sys")
+        _sys.path.insert(0, str(_SY_ROOT / "src"))
+        from qq_rss_bot import birthday as _bd  # noqa: PLC0415
+        names = {i.name for d in _bd.load_calendar(cal).days.values() for i in d.idols}
+        stray = sorted(set(roles) - names)
+        check("★ 每个 roles 的 key 都在生日表里（生日表改名会在这里红）",
+              not stray, str(stray[:5]))
+
+
+_sy_birthday_page()
+_sy_parse()
+_sy_build()
+_sy_render_merge()
+_sy_file()
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

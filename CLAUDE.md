@@ -21,7 +21,7 @@ scripts/botctl.sh start                        # 启动（后台，日志 /tmp/q
 scripts/botctl.sh restart                      # 重启 —— **改完代码必须重启**，没有热加载
 scripts/botctl.sh status                       # 看实例（多于 1 个就是出问题了）★
 uv run qq-rss-bot                              # 前台启动（调试用，Ctrl+C 可停）
-uv run python scripts/smoke.py                 # 离线+抓取测试（当前 1518 项）
+uv run python scripts/smoke.py                 # 离线+抓取测试（当前 1522 项）
 uv run python scripts/integration.py           # 端到端（假推送，不碰 QQ）
 uv run python scripts/probe_events.py 20       # 事件探针（先停掉正式实例）
 uv run python scripts/probe_panel.py           # 指令面板 schema 探针（自建自删，可复跑）
@@ -312,6 +312,7 @@ sudo /usr/local/bin/docker-compose up -d --force-recreate bot
 | 誕生祭 贺图聚合（22:30） | `birthday_art.py` | [`docs/birthday-art.md`](docs/birthday-art.md) |
 | 限流、配额与出错通知 | `quota.py` `notify.py` | [`docs/quota-notify.md`](docs/quota-notify.md) |
 | 群复读机（连着两个人发同样的话就跟一句） | `repeat.py` | [`docs/repeat.md`](docs/repeat.md) |
+| **声优库**（角色→现任声优，进仓库；贺图三分类的数据底座） | `seiyuu.toml` `scripts/fetch_seiyuu.py` | [`docs/seiyuu-db.md`](docs/seiyuu-db.md) |
 | **按群的功能开关**（群列表存库，`.env` 里没有群参数；`/set` 面板） | `features.py` `db.group_features` `commands._set` | [`docs/group-features.md`](docs/group-features.md) |
 
 ## Agent skills
