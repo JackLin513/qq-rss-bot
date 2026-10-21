@@ -271,9 +271,9 @@ say ""
 MODE=restart
 if confirm "这次改过 .env 吗？（改过 → 必须 up -d，restart 不重读 .env）"; then
   MODE=up
-  step "将执行：sudo docker compose up -d bot"
+  step "将执行：sudo $COMPOSE up -d bot"
 else
-  step "将执行：sudo docker compose restart bot"
+  step "将执行：sudo $COMPOSE restart bot"
 fi
 
 pause "按 Enter 继续"
@@ -336,7 +336,7 @@ else
   else
     warn "重启命令返回 0，但 20 秒内没有新的启动记录"
   fi
-  note "  去看 docker compose 的输出里是不是 Running 0.0s"
+  note "  去看 compose 的输出里是不是 Running 0.0s"
   note "  或者配置压根没变（改的可能是挂载卷里的代码，本来就不需要重建）"
 fi
 say ""

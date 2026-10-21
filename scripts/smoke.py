@@ -2189,6 +2189,31 @@ def _check_code_identity() -> None:
 
 _check_code_identity()
 
+
+def _check_deploy_scripts() -> None:
+    """部署脚本里的 docker 必须写**绝对路径**。
+
+    2026-10-21 线上卡了大半天：`ssh host 'cmd'` 跑的是**非登录 shell**，
+    PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，而 docker 在 `/usr/local/bin`
+    —— `sudo docker …` 直接 `command not found`。而先 ssh 进去手打是能过的
+    （登录 shell 会读 `/etc/profile`），所以「手动好使、脚本不好使」。
+    """
+    import re as _re
+
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    bad = []
+    for f in sorted(scripts.glob("*.sh")):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if line.strip().startswith("#"):
+                continue
+            if _re.search(r"sudo\s+docker(-compose)?(\s|$)", line):
+                bad.append(f"{f.name}:{i}  {line.strip()[:60]}")
+    check("★ 脚本里不许出现裸的 `sudo docker` —— 非交互 shell 的 PATH 里没有 "
+          "/usr/local/bin，必须写绝对路径", not bad, str(bad))
+
+
+_check_deploy_scripts()
+
 print("[4.94] bilibili 链接预览（全离线）")
 
 import qq_rss_bot.bilibili as _bili  # noqa: E402
