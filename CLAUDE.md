@@ -330,7 +330,9 @@ issue 和 spec 都是 **GitHub issue**（`JackLin513/qq-rss-bot`，用 `gh` CLI 
 
 ### Domain docs
 
-**单上下文**：仓库根目录 `GLOSSARY.md` + `docs/adr/`。两者**都还没建** ——
-需要时才由 `/domain-modeling` 创建，别提前造。
+**单上下文**：仓库根目录 `GLOSSARY.md` + `docs/adr/`。**两者都已建**
+（2026-10-21，贺图三分类那次）。GLOSSARY 只收**本项目自己的领域词**，
+不收通用编程概念；ADR 只记「难回退 + 不看就懵 + 真有权衡」的决策。
+新条目由 `/domain-modeling` 增补，别在别处另造一份术语表。
 ⚠️ 和本文件「功能索引」里那 15 份 `docs/*.md` 是两回事（那些是各功能的
 来龙去脉）。见 `docs/agents/domain.md`。

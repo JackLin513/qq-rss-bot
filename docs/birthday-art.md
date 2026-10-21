@@ -109,6 +109,10 @@ handle 一律**小写比较**。`BIRTHDAY_ART_EXCLUDE` 能补额外的（容忍 
 （丸岡和佳奈，杜野凛世的 CV，4582 赞）。要不要排是口味问题，
 用 `BIRTHDAY_ART_EXCLUDE=WakanaMaruoka` 自己加。
 
+> 🔜 **这一段即将被取代**：按 [#2](https://github.com/JackLin513/qq-rss-bot/issues/2)
+> 的 spec，声优会**单列一类**（自己的名额 + 自己的署名 `声優`），不再是「画师池里的
+> 一条、只是不排」。在它落地之前，上面的描述仍然有效。
+
 ### 挑选规则：起作用的是**排序**，不是门槛
 
 真正的机制是「**按点赞排序取前 6**」。`BIRTHDAY_ART_MIN_LIKES`（默认 50）
