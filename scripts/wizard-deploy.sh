@@ -203,6 +203,9 @@ TOTAL_STAGES=4
 
 NAS_HOST="${NAS_HOST:-JackLin@100.91.151.20}"
 NAS_DIR="${NAS_DIR:-/volume1/docker/qq-rss-bot}"
+# 服务器每次握手都往 stderr 打三行 post-quantum 警告；第 4 阶段轮询 20 次，
+# 不压掉的话能把整个屏幕刷满（真踩到过）。
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o LogLevel=ERROR)
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
@@ -235,14 +238,14 @@ fi
 
 say ""
 say "连 NAS …"
-if ssh -o BatchMode=yes -o ConnectTimeout=8 "$NAS_HOST" true 2>/dev/null; then
+if ssh "${SSH_OPTS[@]}" "$NAS_HOST" true 2>/dev/null; then
   step "ssh 通 ✓"
 else
   warn "ssh 连不上 ${NAS_HOST}（检查网络 / Tailscale）"
   exit 1
 fi
 
-NAS_HEAD=$(ssh -o BatchMode=yes "$NAS_HOST" \
+NAS_HEAD=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" \
   "cd $NAS_DIR && /usr/local/bin/git rev-parse --short HEAD 2>/dev/null" || true)
 say "NAS 上：${NAS_HEAD:-（读不到 git 信息）}"
 if [[ -n "$NAS_HEAD" && "$NAS_HEAD" != "$MAC_HEAD" ]]; then
@@ -285,7 +288,7 @@ note "  ⚠️ 输出里出现 Running 0.0s 不是「很快完成」，是「检
 note "  ⚠️ 改 .env 之后只 restart 是静默失败：代码是新的、变量全是默认值"
 say ""
 
-BEFORE_COUNT=$(ssh -o BatchMode=yes "$NAS_HOST" \
+BEFORE_COUNT=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" \
   "cd $NAS_DIR && cat data/bot.log 2>/dev/null | grep -c '运行代码' || true")
 
 pause "按 Enter 执行（Ctrl-C 取消）"
@@ -308,20 +311,24 @@ say ""
 
 AFTER_COUNT=$BEFORE_COUNT
 for _ in $(seq 1 20); do
-  AFTER_COUNT=$(ssh -o BatchMode=yes "$NAS_HOST" \
+  AFTER_COUNT=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" \
     "cd $NAS_DIR && cat data/bot.log 2>/dev/null | grep -c '运行代码' || true")
   (( AFTER_COUNT > BEFORE_COUNT )) && break
   sleep 1
 done
 
-LINE=$(ssh -o BatchMode=yes "$NAS_HOST" \
+LINE=$(ssh "${SSH_OPTS[@]}" "$NAS_HOST" \
   "cd $NAS_DIR && grep '运行代码' data/bot.log 2>/dev/null | tail -1")
 
 say ""
 if (( AFTER_COUNT > BEFORE_COUNT )); then
   step "多了一行启动记录 ✓"
 else
-  warn "20 秒内没有新的启动记录 —— 大概率没重启成功"
+  if (( RC != 0 )); then
+    warn "重启命令本身就返回了 $RC —— 先解决那个（多半是 sudo 密码没输对 / 被 Ctrl-C）"
+  else
+    warn "重启命令返回 0，但 20 秒内没有新的启动记录"
+  fi
   note "  去看 docker compose 的输出里是不是 Running 0.0s"
   note "  或者配置压根没变（改的可能是挂载卷里的代码，本来就不需要重建）"
 fi
