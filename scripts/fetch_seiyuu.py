@@ -83,7 +83,7 @@ CST = timezone(timedelta(hours=8))
 
 # 手写、脚本不生成的 section。重跑时原样带过去 —— 不加这个，手工数据会被
 # 下一次 render 直接抹掉（render 只输出它自己知道的那几张表）。
-EXTRA_SECTIONS = ("character_accounts", "officials")
+EXTRA_SECTIONS = ("character_accounts", "officials", "brands_without_official")
 
 ROW_RE = re.compile(r"<tr\b[^>]*>.*?</tr>", re.S)
 TD_RE = re.compile(r"<td\b[^>]*>(.*?)</td>", re.S)
@@ -225,18 +225,42 @@ def render(*, persons: dict[str, dict], roles: dict[str, dict],
     ]
     for handle in sorted(extra.get("officials") or {}):
         out.append(f"{_q(handle)} = {_inline(extra['officials'][handle])}")
+    out += [
+        "",
+        "# ⚠️ 手写。**没有**官方 X 账号的作品 —— 显式记下来，",
+        "# 这样「每个品牌要么有官号、要么在这里」是可检查的，而不是靠人记住。",
+        "[brands_without_official]",
+    ]
+    for brand in sorted(extra.get("brands_without_official") or {}):
+        out.append(f"{_q(brand)} = {_inline(extra['brands_without_official'][brand])}")
     out.append("")
     return "\n".join(out)
 
 
 def merge(existing: dict, fresh: dict) -> int:
-    """把 source = "manual" 的条目盖回新数据上。返回保留了几条。"""
+    """把人工/查来的东西盖回新数据上。返回保留了几条。
+
+    ⚠️ **不只是 `source = "manual"`**：`handle` 是另一个脚本
+    （`fetch_seiyuu_handles.py`）查来的，`source` 会是 `wikidata` / `wikipedia`。
+    只认 manual 的话，重跑一次就把查好的 handle 全洗成空 —— 白查。
+    """
     kept = 0
-    for section in ("persons", "roles"):
-        for key, old in (existing.get(section) or {}).items():
-            if isinstance(old, dict) and old.get("source") == "manual":
-                fresh[section][key] = old
-                kept += 1
+    for key, old in (existing.get("persons") or {}).items():
+        if not isinstance(old, dict):
+            continue
+        src = old.get("source") or ""
+        if src and src != "auto":
+            # manual / wikidata / wikipedia：整条以旧的为准
+            fresh["persons"][key] = old
+            kept += 1
+        elif key in fresh["persons"] and old.get("handle"):
+            fresh["persons"][key] = {**fresh["persons"][key],
+                                     "handle": old["handle"], "source": src or "auto"}
+            kept += 1
+    for key, old in (existing.get("roles") or {}).items():
+        if isinstance(old, dict) and old.get("source") == "manual":
+            fresh["roles"][key] = old
+            kept += 1
     for key, olds in (existing.get("former_roles") or {}).items():
         if key not in fresh["former_roles"]:
             fresh["former_roles"][key] = olds
@@ -332,7 +356,7 @@ def main() -> int:
     if existing:
         kept = merge(existing, fresh)
         if kept:
-            print(f"  保留 {kept} 条 source=manual 的条目")
+            print(f"  保留 {kept} 条人工/已查到的条目（source != auto）")
     n_extra = sum(len(v) for v in extra.values())
     if n_extra:
         print(f"  原样保留手写的 "

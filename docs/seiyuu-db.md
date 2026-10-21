@@ -127,11 +127,69 @@ smoke `[4.100]` 有一条钉子专门钉这个。
 `source = "auto"` 的条目每次重跑都按源数据重建 —— 源里没有的会被删掉，
 这是有意的（源是事实来源）。
 
-## 运行时怎么用（下一步）
+## 查 X 账号（#4）
+
+    uv run python scripts/fetch_seiyuu_handles.py            # 查 + 写回库
+    uv run python scripts/fetch_seiyuu_handles.py --dry-run  # 只看
+    uv run python scripts/fetch_seiyuu_handles.py --only 浅倉杏美
+
+三级回退，命中即停，`source` 记下是哪一级：
+
+1. **Wikidata `P2002`**（X 用户名）—— 最可靠
+2. **日文维基条目的外部链接**
+3. **跟随重定向后的条目名** —— 改名过的声优靠这一级
+
+⚠️ **宁可留空，也不猜。** 自动填一个错的账号，比留空坏得多：贺图会把别人的图
+当成这位声优发的，而且群里看不出来。所以：
+
+- Wikidata 只认**名字完全一致**（label / alias 去空白后相等）且 `P31 = Q5`（人）的条目
+- 维基只认**恰好一个** X 外链，两个以上进复核清单
+- 一律做 **x.com 存活校验**（200 才算），死号不算
+- 再用页面昵称做一道**软校验**：昵称里找不到名字的单独列出来，建议重点抽查
+
+### 第一次跑的实测结果（2026-10-22）
+
+| | |
+|---|---|
+| 库里的人 | 263 |
+| 自动确认 | **214** |
+| 其中昵称里找不到名字（建议抽查） | 12 |
+| 没查到 | 27 |
+| 多个候选 | 18 |
+| 疑似但账号不存在 | 4 |
+
+「没查到」的 27 人**不是脚本漏抓** —— 他们的 Wikidata 条目里没有 P2002，
+日文维基也不收社交外链（佐倉綾音、松岡禎丞、種田梨沙 都是这个情况）。
+只能人工补，明细在 `data/birthday/seiyuu-handles-review.md`（不进 git）。
+
+## 官号库（#5）
+
+11 个官方号，全部核过 **HTTP 200 + 昵称对得上**，来源是 Wikidata 的 P2002：
+
+| brand | 官号 |
+|---|---|
+| 765as | `@imas_official` |
+| cinderella | `@imascg_chihiro` |
+| million | `@imasml_official`、`@imasml_theater` |
+| sidem | `@SideM_GS` |
+| shinycolors | `@imassc_official`、`@shinyc_official` |
+| gakuen | `@gkmas_official` |
+| others | `@imas_ch`、`@imas_poplinks` |
+| valiv | `@valiv_official` |
+
+**没有官方号的品牌**显式记在 `[brands_without_official]`：`961pro` / `dearlystars` /
+`kr` / `xenoglossia`。smoke 有一条钉子检查「生日表里的每个 brand 要么有官号、
+要么在这张表里」—— 以后上新作忘了配官号会红。
+
+⚠️ `last_post_at` 只是**事实**，能看出哪些号已经停更（`@imasml_official` 停在
+2018、`@imas_poplinks` 停在 2022、`@imascg_chihiro` 停在 2023）。运行时**不读**。
+
+## 运行时怎么用
 
 `[roles]` 的 key 是**生日表里的角色名**，运行时手里拿到的就是这个字符串，
-同源查询，不引入跨源歧义。`[persons]` 是 handle 的落点（下一张票补）。
-`[former_roles]` 只为留档，运行时**不用**。
+同源查询，不引入跨源歧义。`[persons]` 的 `handle` 是声优的账号；
+`[character_accounts]` 是角色自己开的号（vα-liv）；`[former_roles]` 只为留档，
+运行时**不用**。
 
 smoke `[4.100]` 里有一条钉子逐个核对「每个 roles 的 key 都在 `birthdays.toml`
 里」—— 生日表哪天改了名，这里会红，而不是静默失效。

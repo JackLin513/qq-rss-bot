@@ -8548,6 +8548,17 @@ def _sy_render_merge() -> None:
     check("★ manual 的 role 也保留", fresh["roles"]["角色二"]["current"] == "人工改的")
     check(f"报告保留了 {kept} 条", kept == 2)
 
+    # ⚠️ handle 是**另一个脚本**查来的（source=wikidata），不是 manual。
+    # 只认 manual 的话，跑一次 fetch_seiyuu.py 就把 214 个 handle 全洗成空。
+    existing2 = {"persons": {"甲": {"handle": "wikihandle", "source": "wikidata"}},
+                 "roles": {}}
+    fresh2 = {"persons": {"甲": {"handle": "", "source": "auto"}},
+              "roles": {}, "former_roles": {}}
+    fs.merge(existing2, fresh2)
+    check("★ 查到的 handle（source=wikidata）重跑不会被洗掉",
+          fresh2["persons"]["甲"]["handle"] == "wikihandle",
+          str(fresh2["persons"]))
+
     # ⚠️ 这两张表是手写的。render 不把它们带上，下一次重跑就**静默删掉**了。
     text2 = fs.render(
         persons=persons, roles=roles, former_roles=former, counts=counts,
@@ -8624,6 +8635,20 @@ def _sy_file() -> None:
     check("★ 同一个 handle 不会同时在 [persons] 和 [character_accounts] 里",
           not clash, str(clash))
 
+    no_off = data.get("brands_without_official") or {}
+    off_handles = {h.lower() for h in officials}
+    check("★ 账号不存在于两类人的任何一边",
+          not (off_handles & {p.get("handle", "").lower() for p in persons.values()
+                              if p.get("handle")}),
+          str(off_handles & {p.get("handle", "").lower() for p in persons.values()}))
+    bad_off = [h for h in officials if not HANDLE.match(h)]
+    check("官号的 handle 都合法", not bad_off, str(bad_off))
+    check("★ 官号的 last_post_at 都能被当成 ISO 时间解析",
+          all(datetime.fromisoformat(v["last_post_at"])
+              for v in officials.values() if v.get("last_post_at")))
+    check("每个官号都有 brand（运行时不用，但人工维护时要能按品牌查）",
+          all(v.get("brand") for v in officials.values()))
+
     cal = _SY_ROOT / "data" / "birthday" / "birthdays.toml"
     if cal.exists():
         _sys = __import__("sys")
@@ -8636,6 +8661,13 @@ def _sy_file() -> None:
         stray_ch = sorted(set(chars) - names)
         check("★ 每个 character_accounts 的 key 也是生日表里的角色名",
               not stray_ch, str(stray_ch[:5]))
+        cal_obj = _bd.load_calendar(cal)
+        all_brands = set(cal_obj.brands)
+        covered = {v.get("brand", "") for v in officials.values()} | set(no_off)
+        check("★ 生日表里的每个 brand 要么有官号、要么在 brands_without_official 里",
+              all_brands <= covered, str(sorted(all_brands - covered)))
+        check("★ brands_without_official 里没有写错的品牌名",
+              set(no_off) <= all_brands, str(sorted(set(no_off) - all_brands)))
 
 
 _sy_birthday_page()
