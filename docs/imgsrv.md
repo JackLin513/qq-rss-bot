@@ -44,10 +44,18 @@
 （实测回显服务和宽带的真实公网 IP 一致），但只要哪天再开回全局代理就又会写错 ——
 所以图床突然不可达时，**第一个怀疑对象就是代理**。
 
-⚠️ **DDNS 只更新它自己那个域名。** `<id>.synology.me` 会跟着 IP 变，但 DNSPod 上
-手写的 A 记录（`www.jacklin513.top`）**不会**。要么把 `IMGSRV_BASE` 指向
-`synology.me`，要么在 DNSPod 里建一条 **CNAME** 指向它 —— 否则换 IP 那天
-图床静默失效，群里表现和「今天没人画」一模一样。
+`www.jacklin513.top` 和 `jacklin513.synology.me` **都配在 DSM 的 DDNS 里**
+（服务商那一栏选 DNSPod / 自定义），两个都会跟着 IP 变，不用另建 CNAME。
+
+⚠️ 但「配了」和「真的在更新」是两件事 —— 判据只有一条：
+
+```bash
+dig +short www.jacklin513.top          # 对一下 NAS 的出口 IP
+curl -s http://ip.3322.net
+```
+
+两个不一样就是 DDNS 没在跑（或者跑起来又被代理带偏了）。图床静默失效时，
+这条命令比翻日志快。
 
 ## ⚠️ 最后一公里：路由器必须做端口转发（**只能用户本人做**）
 
