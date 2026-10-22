@@ -20,58 +20,58 @@ character_accounts = 3
 officials = 11
 
 [persons]
-"Machico" = { "handle" = "", "source" = "auto" }
+"Machico" = { "handle" = "MachicoOfficial", "source" = "manual" }
 "M・A・O" = { "handle" = "ichimichimao", "source" = "wikidata" }
 "たかはし智秋" = { "handle" = "chiaking58", "source" = "wikidata" }
 "のぐちゆり" = { "handle" = "yuri_nogu", "source" = "wikidata" }
 "バレッタ裕" = { "handle" = "0808antony", "source" = "wikidata" }
 "ユリン千晶" = { "handle" = "yurinno0618", "source" = "wikidata" }
-"ルゥ・ティン" = { "handle" = "", "source" = "auto" }
+"ルゥ・ティン" = { "handle" = "kamaboko1221", "source" = "manual" }
 "七瀬つむぎ" = { "handle" = "tsumugi_nanase", "source" = "wikidata" }
 "三宅麻理恵" = { "handle" = "38kMarie", "source" = "wikidata" }
 "三川華月" = { "handle" = "miiikawa_haruna", "source" = "wikidata" }
-"三瓶由布子" = { "handle" = "", "source" = "auto" }
+"三瓶由布子" = { "handle" = "3paydayo", "source" = "manual" }
 "上坂すみれ" = { "handle" = "uesaka_official", "source" = "wikidata" }
 "上田麗奈" = { "handle" = "ReinaUeda_Staff", "source" = "wikidata" }
 "下地紫野" = { "handle" = "shimojishino", "source" = "wikidata" }
 "下田麻美" = { "handle" = "shimoda_asami", "source" = "wikidata" }
-"中島ヨシキ" = { "handle" = "Yoshiki_N_00", "source" = "wikidata" }
+"中島ヨシキ" = { "handle" = "Yoshiki_n_626", "source" = "manual", "note" = "用户确认：旧号 @Yoshiki_N_00 已停用/改名（2026-10-22）" }
 "中島由貴" = { "handle" = "Yuki_Nakashim", "source" = "wikidata" }
 "中村温姫" = { "handle" = "7330615nayg", "source" = "wikidata" }
 "中村繪里子" = { "handle" = "eriko_co_log", "source" = "wikidata" }
 "中澤ミナ" = { "handle" = "MINA_Ikmdct", "source" = "wikidata" }
-"中田祐矢" = { "handle" = "", "source" = "auto" }
+"中田祐矢" = { "handle" = "NaKaDa_YUYA", "source" = "manual" }
 "丸岡和佳奈" = { "handle" = "WakanaMaruoka", "source" = "wikidata" }
 "久野美咲" = { "handle" = "kuno_misaki0119", "source" = "wikidata" }
 "二ノ宮ゆい" = { "handle" = "yuininomiya0906", "source" = "wikidata" }
 "五十嵐裕美" = { "handle" = "HiRoMi_ig", "source" = "wikidata" }
 "井上ほの花" = { "handle" = "inoue_honokuma", "source" = "wikidata" }
-"仁後真耶子" = { "handle" = "", "source" = "auto" }
+"仁後真耶子" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "今井麻夏" = { "handle" = "asaka_imai", "source" = "wikidata" }
 "今井麻美" = { "handle" = "asamingosu", "source" = "wikidata" }
 "仲村宗悟" = { "handle" = "ShugoAbc", "source" = "wikidata" }
 "伊東健人" = { "handle" = "21s_ken", "source" = "wikidata" }
-"伊瀬結陸" = { "handle" = "", "source" = "auto" }
+"伊瀬結陸" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "伊藤美来" = { "handle" = "InfoItomiku", "source" = "wikidata" }
 "伊藤舞音" = { "handle" = "mao_ito05", "source" = "wikidata" }
 "伊達朱里紗" = { "handle" = "_datex_", "source" = "wikidata" }
 "会沢紗弥" = { "handle" = "_saya_aizawa", "source" = "wikidata" }
-"佐倉綾音" = { "handle" = "", "source" = "auto" }
+"佐倉綾音" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "佐倉薫" = { "handle" = "s_a_k_u_r_a_k", "source" = "wikidata" }
 "佐藤亜美菜" = { "handle" = "", "source" = "manual", "note" = "查到的是广播节目号（アミメン！），不是本人" }
 "佐藤利奈" = { "handle" = "rinasatoh", "source" = "wikidata" }
-"佳村はるか" = { "handle" = "lulucan_himitsu", "source" = "wikidata" }
+"佳村はるか" = { "handle" = "lulucan_himitsu", "source" = "wikidata", "note" = "账号虽在但昵称/bio 无本人信息，用户说可能已退网" }
 "児玉卓也" = { "handle" = "kodama0623", "source" = "wikidata" }
-"八代拓" = { "handle" = "yashiro_taku", "source" = "wikidata" }
+"八代拓" = { "handle" = "yashiro_taku", "source" = "wikidata", "note" = "账号虽在但昵称/bio 无本人信息，用户说可能已退网" }
 "八巻アンナ" = { "handle" = "annakoto117", "source" = "wikidata" }
 "内田真礼" = { "handle" = "MaayaUchida", "source" = "wikidata" }
-"内田雄馬" = { "handle" = "", "source" = "auto" }
+"内田雄馬" = { "handle" = "i_am_yumauchida", "source" = "manual" }
 "前川涼子" = { "handle" = "ryokonekousagi", "source" = "wikidata" }
 "北原沙弥香" = { "handle" = "sayaka_kitahara", "source" = "wikidata" }
 "千春" = { "handle" = "chiharu_okr", "source" = "wikidata" }
 "千菅春香" = { "handle" = "chisugaofficial", "source" = "wikidata" }
 "千葉翔也" = { "handle" = "Shoya_Chiba", "source" = "wikidata" }
-"南早紀" = { "handle" = "", "source" = "auto" }
+"南早紀" = { "handle" = "minamisaki_1119", "source" = "manual" }
 "原優子" = { "handle" = "krs2kn", "source" = "wikidata" }
 "原嶋あかり" = { "handle" = "0309akari", "source" = "wikidata" }
 "原涼子" = { "handle" = "suzuko_hara", "source" = "wikidata" }
@@ -79,11 +79,11 @@ officials = 11
 "原田彩楓" = { "handle" = "sayaka_harada_", "source" = "wikidata" }
 "原由実" = { "handle" = "", "source" = "manual", "note" = "查到的是广播节目号（はらまる大盛），不是本人" }
 "原紗友里" = { "handle" = "harasayuri_81", "source" = "wikidata" }
-"古川慎" = { "handle" = "", "source" = "auto" }
+"古川慎" = { "handle" = "M_Furukawa929", "source" = "manual" }
 "古畑恵介" = { "handle" = "KSK__F", "source" = "wikidata" }
 "和久井優" = { "handle" = "wakuwakuwakuiyu", "source" = "wikidata" }
 "和氣あず未" = { "handle" = "azumi_waki", "source" = "wikidata" }
-"嘉山未紗" = { "handle" = "", "source" = "auto" }
+"嘉山未紗" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "土屋李央" = { "handle" = "tsuchiya_rio", "source" = "wikidata" }
 "土岐隼一" = { "handle" = "tokishunichi", "source" = "wikidata" }
 "堀江瞬" = { "handle" = "holy_yell0525", "source" = "wikidata" }
@@ -91,19 +91,19 @@ officials = 11
 "夏川椎菜" = { "handle" = "Natsukawa_Staff", "source" = "wikidata" }
 "大坪由佳" = { "handle" = "00tsubo_yuka", "source" = "wikidata" }
 "大塚剛央" = { "handle" = "TakeoooOtsuka", "source" = "wikidata" }
-"大塚芳忠" = { "handle" = "", "source" = "auto" }
-"大木咲絵子" = { "handle" = "", "source" = "auto" }
+"大塚芳忠" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
+"大木咲絵子" = { "handle" = "Saeko_Oki", "source" = "manual" }
 "大橋彩香" = { "handle" = "AyakaOhashi", "source" = "wikidata" }
 "大空直美" = { "handle" = "osorasan703", "source" = "wikidata" }
 "大関英里" = { "handle" = "zekieri818", "source" = "wikidata" }
 "天野聡美" = { "handle" = "AmanoSatomiToro", "source" = "wikidata" }
 "天音ゆかり" = { "handle" = "yukari_amane_", "source" = "wikidata" }
 "天﨑滉平" = { "handle" = "amasakikohei", "source" = "wikidata" }
-"子安武人" = { "handle" = "", "source" = "auto" }
+"子安武人" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "安済知佳" = { "handle" = "Anchika_manager", "source" = "wikidata" }
 "安野希世乃" = { "handle" = "Yaskiyo_manager", "source" = "wikidata" }
 "安齋由香里" = { "handle" = "yukari_anzai", "source" = "wikidata" }
-"宮﨑雅也" = { "handle" = "", "source" = "auto" }
+"宮﨑雅也" = { "handle" = "masaya_miyazaki", "source" = "manual" }
 "富田美憂" = { "handle" = "miyju_tomita", "source" = "wikidata" }
 "寺島惇太" = { "handle" = "juntaterashima3", "source" = "wikidata" }
 "寺島拓篤" = { "handle" = "Terashima_dayo", "source" = "wikidata" }
@@ -112,7 +112,7 @@ officials = 11
 "小松昌平" = { "handle" = "shohei_k0414", "source" = "wikidata" }
 "小林大紀" = { "handle" = "DaikiPrt", "source" = "wikidata" }
 "小森結梨" = { "handle" = "yuri_komori222", "source" = "wikidata" }
-"小澤麗那" = { "handle" = "", "source" = "auto" }
+"小澤麗那" = { "handle" = "ozawa_rena", "source" = "manual" }
 "小笠原早紀" = { "handle" = "sachi_oga", "source" = "wikidata" }
 "小鹿なお" = { "handle" = "ojikanao0809", "source" = "wikidata" }
 "山下七海" = { "handle" = "773_paradise", "source" = "wikidata" }
@@ -120,9 +120,9 @@ officials = 11
 "山口立花子" = { "handle" = "YamaguchiRikako", "source" = "wikidata" }
 "山崎はるか" = { "handle" = "yamazaki_haruka", "source" = "wikidata" }
 "山本希望" = { "handle" = "nojomiy", "source" = "wikidata" }
-"山村響" = { "handle" = "", "source" = "auto" }
+"山村響" = { "handle" = "hibiku_yamamura", "source" = "manual" }
 "山根綺" = { "handle" = "ayamintgreen", "source" = "wikidata" }
-"山谷祥生" = { "handle" = "yamayayoshitaka", "source" = "wikidata" }
+"山谷祥生" = { "handle" = "44_yamaya", "source" = "manual", "note" = "用户确认：旧号 @yamayayoshitaka 已停用/改名（2026-10-22）" }
 "岡咲美保" = { "handle" = "okasakimiho_PR", "source" = "wikidata" }
 "峯田茉優" = { "handle" = "mineda_mayu", "source" = "wikidata" }
 "川口莉奈" = { "handle" = "nari_milktea", "source" = "wikidata" }
@@ -130,13 +130,13 @@ officials = 11
 "市ノ瀬加那" = { "handle" = "ichinose_1220", "source" = "wikidata" }
 "希水しお" = { "handle" = "kisui_shio", "source" = "wikidata" }
 "平山笑美" = { "handle" = "hirayama8emi", "source" = "wikidata" }
-"平田宏美" = { "handle" = "", "source" = "auto" }
+"平田宏美" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "幸村恵理" = { "handle" = "Yukimura_Eri", "source" = "wikidata" }
-"徳丸完" = { "handle" = "", "source" = "auto" }
-"徳武竜也" = { "handle" = "", "source" = "auto" }
-"愛美" = { "handle" = "", "source" = "auto" }
+"徳丸完" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
+"徳武竜也" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
+"愛美" = { "handle" = "aimi_sound", "source" = "manual" }
 "成海瑠奈" = { "handle" = "runaNOakami", "source" = "wikidata" }
-"戸松遥" = { "handle" = "", "source" = "auto" }
+"戸松遥" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "戸田めぐみ" = { "handle" = "todamegumi", "source" = "wikidata" }
 "斉藤佑圭" = { "handle" = "yuka_s1113", "source" = "wikidata" }
 "新田ひより" = { "handle" = "nitahiyo_yo_yo", "source" = "wikidata" }
@@ -146,18 +146,18 @@ officials = 11
 "春咲暖" = { "handle" = "Harusaki_non", "source" = "wikidata" }
 "春瀬なつみ" = { "handle" = "haruse_natsumi", "source" = "wikidata" }
 "春野ななみ" = { "handle" = "nanami326", "source" = "wikidata" }
-"朝井彩加" = { "handle" = "", "source" = "auto" }
+"朝井彩加" = { "handle" = "ayakasai0511", "source" = "manual" }
 "木戸衣吹" = { "handle" = "ibuking_1114", "source" = "wikidata" }
 "木村珠莉" = { "handle" = "jullie_egg", "source" = "wikidata" }
 "末柄里恵" = { "handle" = "suzygara", "source" = "wikidata" }
 "村中知" = { "handle" = "king_of_bath", "source" = "wikidata" }
-"村川梨衣" = { "handle" = "", "source" = "auto" }
+"村川梨衣" = { "handle" = "RiEtionOfficial", "source" = "manual" }
 "村瀬歩" = { "handle" = "murase_pipipi", "source" = "wikidata" }
 "村田綾香" = { "handle" = "ayaka_M37", "source" = "wikidata" }
 "杜野まこ" = { "handle" = "makomorino", "source" = "wikidata" }
 "東山奈央" = { "handle" = "naobou_official", "source" = "wikidata" }
 "松井恵理子" = { "handle" = "ErikoMatsui", "source" = "wikidata" }
-"松岡禎丞" = { "handle" = "", "source" = "auto" }
+"松岡禎丞" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "松嵜麗" = { "handle" = "reimatsuzaki", "source" = "wikidata" }
 "松永あかね" = { "handle" = "ma_akane1014", "source" = "wikidata" }
 "松田彩音" = { "handle" = "Matsuda_Ayane7", "source" = "wikidata" }
@@ -178,17 +178,17 @@ officials = 11
 "河西健吾" = { "handle" = "Kengokawanishi", "source" = "wikidata" }
 "河野ひより" = { "handle" = "konohiyori", "source" = "wikidata" }
 "沼倉愛美" = { "handle" = "numakura_manami", "source" = "wikidata" }
-"津田美波" = { "handle" = "", "source" = "auto" }
+"津田美波" = { "handle" = "minami_tsuda3", "source" = "manual" }
 "洲崎綾" = { "handle" = "suzaki_aya", "source" = "wikidata" }
-"浅倉杏美" = { "handle" = "asakura_azumi", "source" = "wikidata" }
+"浅倉杏美" = { "handle" = "azumi__asakura8", "source" = "manual", "note" = "用户确认：旧号 @asakura_azumi 已停用/改名（2026-10-22）" }
 "浜崎奈々" = { "handle" = "7NanaHamasaki7", "source" = "wikidata" }
 "浦尾岳大" = { "handle" = "wokeke8", "source" = "wikidata" }
 "涼本あきほ" = { "handle" = "AkihoSuzumoto", "source" = "wikidata" }
 "深川芹亜" = { "handle" = "seria926", "source" = "wikidata" }
-"深町寿成" = { "handle" = "", "source" = "auto" }
-"渕上舞" = { "handle" = "", "source" = "auto" }
-"渡辺紘" = { "handle" = "", "source" = "auto" }
-"渡部優衣" = { "handle" = "", "source" = "auto" }
+"深町寿成" = { "handle" = "T_fukamachi", "source" = "manual" }
+"渕上舞" = { "handle" = "fuchigami_mai", "source" = "manual" }
+"渡辺紘" = { "handle" = "HiRo2dAyo03", "source" = "manual" }
+"渡部優衣" = { "handle" = "watanabeyui_Ton", "source" = "manual" }
 "渡部恵子" = { "handle" = "keeeko_watanabe", "source" = "wikidata" }
 "湊みや" = { "handle" = "miya_minato1216", "source" = "wikidata" }
 "滝田樹里" = { "handle" = "jurieedom", "source" = "wikidata" }
@@ -198,78 +198,78 @@ officials = 11
 "熊谷健太郎" = { "handle" = "k_kumagaihk", "source" = "wikidata" }
 "牧野由依" = { "handle" = "yuiyui_makino", "source" = "wikidata" }
 "狩野翔" = { "handle" = "Sho_karino", "source" = "wikidata" }
-"生田輝" = { "handle" = "chichichi430", "source" = "wikidata" }
+"生田輝" = { "handle" = "Teru_Ikuta", "source" = "manual", "note" = "用户确认：旧号 @chichichi430 已停用/改名（2026-10-22）" }
 "田中あいみ" = { "handle" = "kanataimi", "source" = "wikidata" }
 "田中有紀" = { "handle" = "yuki_t0626", "source" = "wikidata" }
 "田嶌紗蘭" = { "handle" = "tajimaru25", "source" = "wikidata" }
-"田所あずさ" = { "handle" = "", "source" = "auto" }
+"田所あずさ" = { "handle" = "AzusaTadokoro", "source" = "manual" }
 "田村奈央" = { "handle" = "tamunao10", "source" = "wikidata" }
 "田澤茉純" = { "handle" = "masu_mikan", "source" = "wikidata" }
 "田辺留依" = { "handle" = "rui_kanimiso", "source" = "wikidata" }
 "白井悠介" = { "handle" = "shirai_universe", "source" = "wikidata" }
-"白石晴香" = { "handle" = "", "source" = "auto" }
+"白石晴香" = { "handle" = "shiraharu48", "source" = "manual" }
 "益山武明" = { "handle" = "mascandal_0414", "source" = "wikidata" }
 "矢作紗友里" = { "handle" = "yahagi_sayuri", "source" = "wikidata" }
 "矢野奨吾" = { "handle" = "yano_0319", "source" = "wikidata" }
-"礒部花凜" = { "handle" = "", "source" = "auto" }
-"神原大地" = { "handle" = "", "source" = "auto" }
+"礒部花凜" = { "handle" = "carin_official", "source" = "manual" }
+"神原大地" = { "handle" = "kanbara_daichi", "source" = "manual" }
 "神谷早矢佳" = { "handle" = "kmtnsyk", "source" = "wikidata" }
 "福原綾香" = { "handle" = "ayaka_fuurin", "source" = "wikidata" }
-"種田梨沙" = { "handle" = "", "source" = "auto" }
+"種田梨沙" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "種﨑敦美" = { "handle" = "tanezakiatsumi", "source" = "wikidata" }
 "稲川英里" = { "handle" = "greentea_senbei", "source" = "wikidata" }
 "立花日菜" = { "handle" = "hinata__ba", "source" = "wikidata" }
 "立花理香" = { "handle" = "RiccaTachibana", "source" = "wikidata" }
-"竹達彩奈" = { "handle" = "", "source" = "auto" }
-"笠間淳" = { "handle" = "", "source" = "auto" }
+"竹達彩奈" = { "handle" = "Ayana_take", "source" = "manual" }
+"笠間淳" = { "handle" = "ksm_jun", "source" = "manual" }
 "紫月杏朱彩" = { "handle" = "azusa_shizuki", "source" = "wikidata" }
 "結名美月" = { "handle" = "yuina_mizuki", "source" = "wikidata" }
 "芝崎典子" = { "handle" = "ShibaNori914", "source" = "wikidata" }
 "花井美春" = { "handle" = "Hanai_miharu", "source" = "wikidata" }
 "花守ゆみり" = { "handle" = "hanayumi09", "source" = "wikidata" }
 "花岩香奈" = { "handle" = "kana_hanaiwa", "source" = "wikidata" }
-"花澤香菜" = { "handle" = "", "source" = "auto" }
+"花澤香菜" = { "handle" = "hanazawa_staff", "source" = "manual" }
 "花谷麻妃" = { "handle" = "h_maki_official", "source" = "wikidata" }
-"若林直美" = { "handle" = "", "source" = "auto" }
-"茅原実里" = { "handle" = "", "source" = "auto" }
+"若林直美" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
+"茅原実里" = { "handle" = "minori_contact", "source" = "manual" }
 "菅沼千紗" = { "handle" = "s_schisa", "source" = "wikidata" }
 "菊池勇成" = { "handle" = "kikuchitakeru", "source" = "wikidata" }
 "薄井友里" = { "handle" = "yuri_usui0515", "source" = "wikidata" }
 "藍原ことみ" = { "handle" = "aihara_k_", "source" = "wikidata" }
 "藤井ゆきよ" = { "handle" = "yukiyofujii0508", "source" = "wikidata" }
 "藤本彩花" = { "handle" = "ayaka_0v0_F", "source" = "wikidata" }
-"藤村歩" = { "handle" = "", "source" = "auto" }
-"藤田茜" = { "handle" = "", "source" = "auto" }
+"藤村歩" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
+"藤田茜" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "角元明日香" = { "handle" = "asukak_official", "source" = "wikidata" }
 "諏訪彩花" = { "handle" = "Suwa_Ayaka", "source" = "wikidata" }
 "赤﨑千夏" = { "handle" = "R172", "source" = "wikidata" }
 "近藤唯" = { "handle" = "yun_yk28", "source" = "wikidata" }
 "近藤玲奈" = { "handle" = "reina_kondo", "source" = "wikidata" }
-"郁原ゆう" = { "handle" = "yk_yu002", "source" = "wikidata" }
+"郁原ゆう" = { "handle" = "yu_kahara219", "source" = "manual", "note" = "用户确认：旧号 @yk_yu002 已停用/改名（2026-10-22）" }
 "都丸ちよ" = { "handle" = "chiyo_tomaru", "source" = "wikidata" }
-"野上翔" = { "handle" = "", "source" = "auto" }
+"野上翔" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "野村香菜子" = { "handle" = "kanako_nomura", "source" = "wikidata" }
 "金子有希" = { "handle" = "kanekosanndesu", "source" = "wikidata" }
 "金子真由美" = { "handle" = "mayumi_k719", "source" = "wikidata" }
 "釘宮理恵" = { "handle" = "rie_k_0530", "source" = "wikidata" }
-"鈴木みのり" = { "handle" = "", "source" = "auto" }
+"鈴木みのり" = { "handle" = "minoringo_staff", "source" = "manual" }
 "鈴木絵理" = { "handle" = "Erietty_55", "source" = "wikidata" }
 "長島光那" = { "handle" = "37long", "source" = "wikidata" }
 "長月あおい" = { "handle" = "aoi___nagatsuki", "source" = "wikidata" }
 "長江里加" = { "handle" = "rikachimalu", "source" = "wikidata" }
 "長谷優里奈" = { "handle" = "yurikacanary", "source" = "wikidata" }
-"長谷川明子" = { "handle" = "", "source" = "auto" }
+"長谷川明子" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "長野佑紀" = { "handle" = "Nagano_Yuki0627", "source" = "wikidata" }
 "関口理咲" = { "handle" = "UpxDxo0177oPRhe", "source" = "wikidata" }
 "関根瞳" = { "handle" = "s_hitomi_", "source" = "wikidata" }
-"阿部里果" = { "handle" = "", "source" = "auto" }
+"阿部里果" = { "handle" = "US_of_Aberika", "source" = "manual" }
 "陽高真白" = { "handle" = "hitaka_mashiro", "source" = "wikidata" }
 "集貝はな" = { "handle" = "HN_TMGI_", "source" = "wikidata" }
 "雨宮天" = { "handle" = "Amamiyastaff", "source" = "manual", "note" = "旧号 @sora_haruyasumi 的 bio 指向这里" }
 "青木志貴" = { "handle" = "eerieXeery", "source" = "wikidata" }
-"青木瑠璃子" = { "handle" = "", "source" = "auto" }
+"青木瑠璃子" = { "handle" = "coloruri", "source" = "manual" }
 "飯田ヒカル" = { "handle" = "Iida_Hikaru_828", "source" = "wikidata" }
-"飯田友子" = { "handle" = "", "source" = "auto" }
+"飯田友子" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "香里有佐" = { "handle" = "arisa_kori", "source" = "wikidata" }
 "駒形友梨" = { "handle" = "KomagataYuri", "source" = "wikidata" }
 "駒田航" = { "handle" = "komadwataru", "source" = "wikidata" }
@@ -277,9 +277,9 @@ officials = 11
 "高森奈津美" = { "handle" = "takamori_723", "source" = "wikidata" }
 "高橋李依" = { "handle" = "taka8rie", "source" = "wikidata" }
 "高橋花林" = { "handle" = "karin_takahashi", "source" = "wikidata" }
-"高田憂希" = { "handle" = "sunflower930316", "source" = "wikidata" }
+"高田憂希" = { "handle" = "sunflower930316", "source" = "wikidata", "note" = "bio 自称「サブ」（副号），昵称无本人信息" }
 "髙橋ミナミ" = { "handle" = "miiiiiina_cat", "source" = "wikidata" }
-"髙野麻美" = { "handle" = "", "source" = "auto" }
+"髙野麻美" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "麻倉もも" = { "handle" = "Asakura_Staff", "source" = "wikidata" }
 "黒木ほの香" = { "handle" = "_kuroki_honoka", "source" = "wikidata" }
 "黒沢ともよ" = { "handle" = "TomoyoKurosawa", "source" = "wikidata" }
