@@ -1059,7 +1059,6 @@ class BirthdayArtPoller:
 
         sent = 0
         for group in targets:
-            await self._warmup(messages, day_key)
             delivered = await self._deliver(group, messages, day_key)
             if delivered:
                 self.db.mark_birthday_art(
@@ -1067,30 +1066,6 @@ class BirthdayArtPoller:
                 )
                 sent += len(delivered)
         return sent
-
-    async def _warmup(self, messages: list[tuple[str, list[str]]],
-                      day_key: str) -> None:
-        """markdown 的图由 QQ 自己去抓，**冷链接第一次必炸** —— 先往预热群
-        发一遍同样的内容，等它抓完，正式群那条才显示得出来。
-
-        ⚠️ 预热必须是**真的发一条 markdown**：`post_group_file` 那条路
-        预热不了渲染缓存（见 `config.preview_warmup_sec` 的说明）。
-        """
-        wg = self.cfg.birthday_art_warmup_group
-        if not wg:
-            return
-        ok = 0
-        for md, _ids in messages:
-            try:
-                await self.sender.send_markdown(wg, md)
-                ok += 1
-            except Exception as exc:  # noqa: BLE001
-                _log.warning("贺图：预热发送失败（%s）：%s", wg[:8], exc)
-                break
-        if ok:
-            _log.info("贺图：%s 预热 %d 条已发，等 %d 秒让 QQ 抓图",
-                      day_key, ok, self.cfg.preview_warmup_sec)
-            await asyncio.sleep(self.cfg.preview_warmup_sec)
 
     async def _deliver(
         self, group: str, messages: list[tuple[str, list[str]]], day_key: str

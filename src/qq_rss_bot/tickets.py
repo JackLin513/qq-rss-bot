@@ -908,15 +908,7 @@ class TicketPoller:
         返回**发成功的正式群**；被人工否决时返回 None。
         """
         cfg = self.cfg
-        warm, prev = cfg.warmup_group, cfg.preview_group
-
-        # ① 预热群。两个群配成同一个时跳过 —— 那样预览那条本身就是预热。
-        if warm and warm not in groups and warm != prev:
-            if await self._try_send(warm, text, f"预热/{label}"):
-                _log.info("抽票：预热已发，等 %d 秒让 QQ 把封面抓完", cfg.preview_warmup_sec)
-                await self._wait(cfg.preview_warmup_sec)
-                if self._stopped.is_set():
-                    return []
+        prev = cfg.preview_group
 
         # ② 预览群 + 人工否决窗口
         if prev and prev not in groups:

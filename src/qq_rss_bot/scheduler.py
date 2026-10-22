@@ -431,7 +431,7 @@ class FeedPoller:
         self._sem = asyncio.Semaphore(5)
         self._stopped = asyncio.Event()
         self._ticks = 0
-        # ---- markdown 多图预热 / 人工预览（见 Config.warmup_group 那段注释）----
+        # ---- markdown 多图的人工预览（见 Config.preview_group 那段注释）----
         # 「不发」喊停时置位。**只在预览窗口内有效**。
         self._veto = asyncio.Event()
         self._preview_open = False
@@ -531,7 +531,7 @@ class FeedPoller:
         两个群都留空 = 完全退回改动前的行为（一把 gather）。
         """
         cfg = self.cfg
-        special = {g for g in (cfg.warmup_group, cfg.preview_group) if g}
+        special = {cfg.preview_group} if cfg.preview_group else set()
         if not special:
             return await self._gather_poll(due)
 
@@ -545,16 +545,6 @@ class FeedPoller:
         self._last_pushed = {}
         collected: dict[int, object] = {}
         urls = {s.url for s in real}
-
-        # ① 预热群。两个群配成同一个时跳过这步 —— 那样预览那条本身就是预热。
-        warm = self._stage_subs(cfg.warmup_group, urls)
-        if warm and cfg.warmup_group != cfg.preview_group:
-            collected.update(await self._gather_poll(warm))
-            _log.info(
-                "多图预热① 已发 %d 个订阅，等 %d 秒让 QQ 把图抓完",
-                len(warm), cfg.preview_warmup_sec,
-            )
-            await asyncio.sleep(cfg.preview_warmup_sec)
 
         # ② 预览群 + 人工否决窗口
         prev = self._stage_subs(cfg.preview_group, urls)

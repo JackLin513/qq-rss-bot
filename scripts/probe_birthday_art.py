@@ -187,7 +187,6 @@ async def main() -> int:
     group = _arg("--group")
     do_reset = _flag("--reset")
     do_send = _flag("--send")
-    do_warmup = _flag("--warmup")
     do_search = _flag("--search") or do_send or _flag("--download")
     do_download = _flag("--download") or do_send
 
@@ -273,10 +272,6 @@ async def main() -> int:
         run_cfg = dataclasses.replace(
             cfg,
             birthday_art_window_sec=int(max(late, 0)) + birthday_art.CHECK_SEC,
-            # --warmup：正式发之前先把同样的 markdown 发到这个群一遍。
-            # 生产里用 BIRTHDAY_ART_WARMUP_GROUP 指一个专用预热群。
-            birthday_art_warmup_group=(
-                group if do_warmup else cfg.birthday_art_warmup_group),
         )
     poller = birthday_art.BirthdayArtPoller(
         run_cfg, db, sender, None,

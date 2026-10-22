@@ -137,25 +137,15 @@ class Config:
     multi_image_markdown: bool = True
     # ---- markdown 多图预热：正式群推送前的两道预热 + 一道人工预览 ----
     #
-    # **为什么需要**：2026-10-18 实测，QQ 的图片缓存是**服务端、跨群共享**的，
-    # 但**冷链接第一次渲染必炸** —— 一批 3.4 MB 的图 6 张全裂。把**同一批
-    # 同样的 URL** 隔 20 秒发到**另一个群**，6 张全好。而且那次冷发一张都没
-    # 抓下来（客户端上什么都没缓存），所以只可能是服务端。
+    # ⚠️ **预热机制已于 2026-10-22 删除。** 当年「冷链接第一次渲染必炸」
+    # （3.4 MB 六张全裂、隔 20 秒发到另一个群就全好）是在 `pbs.twimg.com` 上
+    # 量到的；换成自建图床后复现不出来 —— 一张 3.5 MB、从未被访问过的图
+    # **不预热直接发就能显示**（`docs/imgsrv.md` 有实测表）。
+    # 真遇到图不显示，先看图床访问日志有没有 200，别再盲目加预热。
     #
-    # 于是：正式群之前先往 `warmup_group` 发一条 → 等 `preview_warmup_sec`
-    # → 再往 `preview_group` 发一条（这条同时是**给你看的预览**）→ 等
-    # `preview_veto_sec`，你没喊「不发」才发正式群。
-    #
-    # ⚠️ **预热必须是「真的发一条 markdown」。** `upload_image`（`post_group_file`
-    # + `srv_send_msg=False`）那条路**预热不了** —— 生产里每条推送都逐张探过
-    # （探针返回成功 = QQ 确实抓到了），markdown 照样裂。这是实测出来的。
-    #
-    # 两个群都留空 = 整个机制关闭，行为完全退回改动前。
-    warmup_group: str = ""
+    # 保留下来的只有**人工预览**：先发到预览群，等 `preview_veto_sec`，你没喊
+    # 「不发」才发正式群。空 = 关闭，行为退回「一把 gather」。
     preview_group: str = ""
-    # 预热①到预热②之间等多久。QQ 抓完图要时间，和**图片总体积**正相关：
-    # 实测 3.4 MB 约 20 秒够、5.7 MB 要 60 秒左右。图大就调大。
-    preview_warmup_sec: int = 45
     # 预览发出去后等多久算「你没喊停」。这段时间正式群一条都不发。
     preview_veto_sec: int = 30
     # 推送文案里带不带 RSS 摘要。关掉就退回「源名 / 标题 / 链接」三行。
@@ -294,10 +284,6 @@ class Config:
     # 「别发一堆 0 赞垃圾」的兜底。想让冷门偶像一张都不发就往上调。
     birthday_art_min_likes: int = birthday_art_module.DEFAULT_MIN_LIKES
     birthday_art_exclude: tuple[str, ...] = ()
-    # markdown 预热群（空 = 不预热）。QQ 抓图是异步的，冷链接第一次不显示，
-    # 所以正式发之前先往这里发一遍同样的内容，等 `preview_warmup_sec` 秒。
-    # 和 `warmup_group`（RSS 多图那条链路）是两回事，别混。
-    birthday_art_warmup_group: str = ""
     # ⚠️ 2026-10-22 起默认 **False**：官方号不再整个丢掉，而是**单列一格**
     # （官号 1 + 本人/声优 1 + 画师 4）。设成 True 是逃生门 = 官方号一条都不要。
     birthday_art_skip_official: bool = False
@@ -471,9 +457,7 @@ def load_config() -> Config:
         preview_multi_image=_env_bool("PREVIEW_MULTI_IMAGE", True),
         rss_multi_image=_env_bool("RSS_MULTI_IMAGE", True),
         multi_image_markdown=_env_bool("MULTI_IMAGE_MARKDOWN", True),
-        warmup_group=_env_str("WARMUP_GROUP", ""),
         preview_group=_env_str("PREVIEW_GROUP", ""),
-        preview_warmup_sec=_env_int("PREVIEW_WARMUP_SEC", 45),
         preview_veto_sec=_env_int("PREVIEW_VETO_SEC", 30),
         push_summary=_env_bool("PUSH_SUMMARY", True),
         summary_chars=_env_int("SUMMARY_CHARS", 800),
@@ -517,7 +501,6 @@ def load_config() -> Config:
         ),
         birthday_art_exclude=_env_list("BIRTHDAY_ART_EXCLUDE"),
         birthday_art_skip_official=_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", False),
-        birthday_art_warmup_group=_env_str("BIRTHDAY_ART_WARMUP_GROUP", ""),
         imgsrv_base=_env_str("IMGSRV_BASE", "").rstrip("/"),
         imgsrv_port=_env_int("IMGSRV_PORT", 18080),
         imagelib_dir=imagelib_dir,

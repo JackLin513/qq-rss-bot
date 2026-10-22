@@ -4056,25 +4056,24 @@ check("★ 去重仍然生效（不少源 `<img>` 和裸链接给了同一张）
 
 
 # ---------------------------------------------------------------------------
-print("[4.63] markdown 多图预热 / 人工预览（喊「不发」挡下这一条）")
+print("[4.63] markdown 多图的人工预览（喊「不发」挡下这一条）")
 # ---------------------------------------------------------------------------
 #
-# 为什么要有这一节：QQ 的图片缓存是**服务端、跨群共享**的，但**冷链接第一次
-# 渲染必炸** —— 2026-10-18 实测：一批 3.4 MB 的图 6 张全裂；同一批**同样的
-# URL** 隔 20 秒发到**另一个群**，6 张全好。冷发那次一张都没抓下来（客户端
-# 上什么都没缓存），所以只可能是服务端。
-#
-# 于是正式群之前先预热两次，中间留一个人工否决窗口。这一节**全部离线**：
-# `_poll_one` 换成假的，不碰网络也不发消息。
+# 为什么要有这一节：正式群之前先发一条给你看，你喊「不发」就挡下这一批。
+# ⚠️ **预热那一段已经删了**（2026-10-22）：换成自建图床后「冷链接必炸」
+# 复现不出来，见 docs/imgsrv.md。这一节**全部离线**：`_poll_one` 换成假的。
 
 import dataclasses as _dc  # noqa: E402
 
 from qq_rss_bot.db import Subscription as _Sub  # noqa: E402
 
-check("默认关闭：两个群都留空，行为完全等于改动前",
-      cfg_stub().warmup_group == "" and cfg_stub().preview_group == "")
-check("默认：预热等 45 秒，否决窗口 30 秒",
-      cfg_stub().preview_warmup_sec == 45 and cfg_stub().preview_veto_sec == 30)
+check("默认关闭：预览群留空，行为完全等于一把 gather",
+      cfg_stub().preview_group == "")
+check("默认否决窗口 30 秒", cfg_stub().preview_veto_sec == 30)
+check("★ 配置里已经没有预热相关的字段了",
+      not hasattr(cfg_stub(), "warmup_group")
+      and not hasattr(cfg_stub(), "preview_warmup_sec")
+      and not hasattr(cfg_stub(), "birthday_art_warmup_group"))
 
 
 def _mk_sub(sid: int, gid: str, url: str = "http://rss/same") -> "_Sub":
@@ -4102,13 +4101,12 @@ async def _staged(*, veto: bool, real_due: bool = True):
     同一个 `due` 批次里。靠 `due` 对齐的写法会一次都不触发。
     """
     cfg = _dc.replace(
-        cfg_stub(), warmup_group="W", preview_group="P",
-        preview_warmup_sec=0, preview_veto_sec=0.4,
+        cfg_stub(), preview_group="P", preview_veto_sec=0.4,
     )
     all_subs = [
-        _mk_sub(1, "W"), _mk_sub(2, "P"),
-        # 预热群里订阅了**别的源** —— 不该被拉起来预热，预热它对正式群毫无意义
-        _mk_sub(5, "W", url="http://other/feed"),
+        _mk_sub(2, "P"),
+        # 预览群里订阅了**别的源** —— 不该被拉起来，给正式群看它毫无意义
+        _mk_sub(5, "P", url="http://other/feed"),
         _mk_sub(3, "REAL-A"), _mk_sub(4, "REAL-B"),
     ]
     poller = FeedPoller(cfg=cfg, db=_FakeDB(all_subs), http=None, pusher=None)
@@ -4138,7 +4136,7 @@ async def _staged(*, veto: bool, real_due: bool = True):
     if real_due:
         due = [s for s in all_subs if s.group_openid.startswith("REAL")]
     else:
-        due = [s for s in all_subs if s.group_openid in ("W", "P")]
+        due = [s for s in all_subs if s.group_openid == "P"]
     await poller._poll_staged(due)
     if task is not None:
         task.cancel()
@@ -4146,26 +4144,27 @@ async def _staged(*, veto: bool, real_due: bool = True):
 
 
 _p_ok, _order_ok = asyncio.run(_staged(veto=False))
-check("★ 正式群到点时，预热群/预览群被**主动拉起来**（它们自己在 due 里排不上）",
-      _order_ok[:2] == ["W", "P"], str(_order_ok))
-check("★ 顺序：预热群 → 预览群 → 正式群（并发发下去预热就白做了）",
-      _order_ok == ["W", "P", "REAL-A", "REAL-B"], str(_order_ok))
-check("★ 预热群里订阅的**别的源**不许被拉进来",
-      "W" not in _order_ok[2:] and _order_ok.count("W") == 1, str(_order_ok))
+check("★ 正式群到点时，预览群被**主动拉起来**（它自己在 due 里排不上）",
+      _order_ok[:1] == ["P"], str(_order_ok))
+check("★ 顺序：预览群 → 正式群",
+      _order_ok == ["P", "REAL-A", "REAL-B"], str(_order_ok))
+check("★ 预览群里订阅的**别的源**不许被拉进来",
+      "P" not in _order_ok[1:] or len([g for g in _order_ok if g == "P"]) == 1,
+      str(_order_ok))
 check("没喊停 → 一条都不挡", _p_ok._vetoed == {}, str(_p_ok._vetoed))
 
 _p_no, _order_no = asyncio.run(_staged(veto=True))
 check("★ 喊「不发」→ 正好记下预览那批 key",
       set(_p_no._vetoed) == {"k1", "k2"}, str(_p_no._vetoed))
 check("★ 喊停只挡那几条，正式群阶段照常跑",
-      set(_order_no[2:]) == {"REAL-A", "REAL-B"}, str(_order_no))
+      set(_order_no[1:]) == {"REAL-A", "REAL-B"}, str(_order_no))
 
 _p_idle, _order_idle = asyncio.run(_staged(veto=False, real_due=False))
-check("★ 只有预热群/预览群到点时**什么都不发**"
-      "（让它们自己先跑一遍，正式群到点时就预热不出东西了）",
+check("★ 只有预览群到点时**什么都不发**"
+      "（让它自己先跑一遍，正式群到点时就预览不出东西了）",
       _order_idle == [], str(_order_idle))
 
-_special2 = _dc.replace(cfg_stub(), warmup_group="W", preview_group="P")
+_special2 = _dc.replace(cfg_stub(), preview_group="P")
 check("★ 只配了群、due 里只有它们自己 → 也不单独跑",
       asyncio.run(_staged(veto=False, real_due=False))[1] == [])
 
@@ -4972,7 +4971,7 @@ def _check_tk_stage() -> None:
                 try:
                     cfg = dataclasses.replace(
                         cfg_stub(), ticket_images=False,
-                        preview_warmup_sec=0, preview_veto_sec=0, **over)
+                        preview_veto_sec=0, **over)
                     pusher = _Pusher()
                     poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
                     await poller.poll_once()
@@ -4982,32 +4981,17 @@ def _check_tk_stage() -> None:
 
         return _a.run(go())
 
-    # 两个群都没配 → 完全退回改动前的行为
+    # 没配预览群 → 完全退回改动前的行为
     sent, kinds, _ = _run()
-    check("★ 没配预热/预览群时直接发正式群（行为不变）", sent == ["REAL"], sent)
+    check("★ 没配预览群时直接发正式群（行为不变）", sent == ["REAL"], sent)
 
-    # 配了预热群：先预热，再正式
-    sent, _, _ = _run(warmup_group="WARM")
-    check("★ 配了 WARMUP_GROUP → 先预热再发正式群", sent == ["WARM", "REAL"], sent)
-
-    # 只配预览群：预览那条本身就是预热
+    # 只配预览群：预览那条就是给你看的
     sent, _, _ = _run(preview_group="PREV")
-    check("★ 只配 PREVIEW_GROUP → 预览那条兼作预热", sent == ["PREV", "REAL"], sent)
+    check("★ 配了 PREVIEW_GROUP → 先预览再发正式群", sent == ["PREV", "REAL"], sent)
 
-    # 两个群配成同一个 → **只发一次**（不是发两遍）
-    sent, _, _ = _run(warmup_group="SAME", preview_group="SAME")
-    check("★ 预热群和预览群是同一个时只发一次（预览那条就是预热）",
-          sent == ["SAME", "REAL"], sent)
-
-    # 预热群本身就是正式群 → 不能发两遍
-    sent, _, _ = _run(warmup_group="REAL")
-    check("★ 预热群同时是正式群时只发一遍", sent == ["REAL"], sent)
+    # 预览群本身就是正式群 → 不能发两遍
     sent, _, _ = _run(preview_group="REAL")
     check("★ 预览群同时是正式群时只发一遍", sent == ["REAL"], sent)
-
-    # 两个都配 → 三段齐全，顺序不能乱
-    sent, _, _ = _run(warmup_group="WARM", preview_group="PREV")
-    check("★ 三段顺序：预热 → 预览 → 正式", sent == ["WARM", "PREV", "REAL"], sent)
 
     # ---- 人工喊停 ----
     import asyncio as _a
@@ -5018,7 +5002,7 @@ def _check_tk_stage() -> None:
             try:
                 cfg = dataclasses.replace(
                     cfg_stub(), ticket_images=False,
-                    preview_group="PREV", preview_warmup_sec=0, preview_veto_sec=5)
+                    preview_group="PREV", preview_veto_sec=5)
                 pusher = _Pusher()
                 poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
 
@@ -5049,7 +5033,7 @@ def _check_tk_stage() -> None:
             try:
                 cfg = dataclasses.replace(
                     cfg_stub(), ticket_images=False,
-                    warmup_group="WARM", preview_warmup_sec=30)
+                    preview_group="PREV", preview_veto_sec=30)
                 pusher = _Pusher()
                 poller = _tk.TicketPoller(cfg, db, _Http(), pusher)
 
@@ -5063,8 +5047,8 @@ def _check_tk_stage() -> None:
                 db.close()
 
     sent = _a.run(stop_case())
-    check("★ stop() 能打断预热等待，且不再往正式群发",
-          sent == ["WARM"], sent)
+    check("★ stop() 能打断预览等待，且不再往正式群发",
+          sent == ["PREV"], sent)
 
 
 def _check_tk_db() -> None:
@@ -7631,17 +7615,14 @@ async def _ba_poller() -> None:
         check("★ 一个群发失败不连累别的群", n == 3 and db5.posted.get("2026-10-19") == {"G2"},
               str(db5.posted))
 
-        # ---- 预热：先往预热群发一遍同样的内容 ----
+        # ---- 预热已删除：一个群只发一条，没有"先发一遍再发一遍" ----
         db7, s7 = _ba_db(), _BaSender()
         p7 = ba.BirthdayArtPoller(
-            _ba_cfg(tmp, birthday_art_warmup_group="W1", preview_warmup_sec=0),
-            db7, s7, _BaHttp())
+            _ba_cfg(tmp), db7, s7, _BaHttp(), library=_BaFakeLib())
         await p7.poll_once(now=now, arts=arts)
-        check("★ 正式发之前先往预热群发一遍（否则冷链接 QQ 抓不到图）",
-              [g for g, _, _ in s7.sent] == ["W1", "G1"],
-              str([g for g, _, _ in s7.sent]))
-        check("预热那条和正式那条内容一字不差", s7.sent[0][1] == s7.sent[1][1])
-        check("★ 预热群不记账（只有正式群算发出去了）",
+        check("★ 没有预热：每个群只收到一条",
+              [g for g, _, _ in s7.sent] == ["G1"], str([g for g, _, _ in s7.sent]))
+        check("★ 记账只记一次",
               db7.birthday_art_posted("2026-10-19") == {"G1"},
               str(db7.birthday_art_posted("2026-10-19")))
 
