@@ -121,6 +121,20 @@ class _RawSender:
         if self._client is not None:
             await self._client.aclose()
 
+    async def send_markdown(self, group: str, content: str) -> None:
+        """主动发 markdown（`msg_type=2`）—— 一命多条图走这条。"""
+        headers = await self._h()
+        assert self._client is not None
+        resp = await self._client.post(
+            f"{API_BASE}/v2/groups/{group}/messages",
+            headers=headers,
+            json={"msg_type": 2, "markdown": {"content": content}},
+        )
+        data = resp.json() if resp.content else {}
+        if resp.status_code >= 300 or data.get("code"):
+            raise RuntimeError(
+                f"HTTP {resp.status_code} code={data.get('code')}: {data}")
+
     async def send_local_image(self, group: str, content: str, path: Path) -> None:
         raw = Path(path).read_bytes()
         payload = base64.b64encode(raw).decode()
@@ -159,6 +173,7 @@ async def main() -> int:
     group = _arg("--group")
     do_reset = _flag("--reset")
     do_send = _flag("--send")
+    do_warmup = _flag("--warmup")
     do_search = _flag("--search") or do_send or _flag("--download")
     do_download = _flag("--download") or do_send
 
@@ -234,6 +249,10 @@ async def main() -> int:
         run_cfg = dataclasses.replace(
             cfg,
             birthday_art_window_sec=int(max(late, 0)) + birthday_art.CHECK_SEC,
+            # --warmup：正式发之前先把同样的 markdown 发到这个群一遍。
+            # 生产里用 BIRTHDAY_ART_WARMUP_GROUP 指一个专用预热群。
+            birthday_art_warmup_group=(
+                group if do_warmup else cfg.birthday_art_warmup_group),
         )
     poller = birthday_art.BirthdayArtPoller(
         run_cfg, db, sender, None,
@@ -245,9 +264,8 @@ async def main() -> int:
         return 0
 
     # ---- 真搜（网络全在这个 with 里 —— 客户端一关就发不出请求了）----
-    got: list = []
+    picked: dict = {}
     arts: list = []
-    ranked: list = []
     async with preview.make_client(cfg.media_proxy, timeout=birthday_art.SEARCH_TIMEOUT) as http:
         poller.http = http
         poller.x = birthday_art.XSearch(http, cfg.x_auth_token, cfg.x_ct0)
@@ -264,7 +282,7 @@ async def main() -> int:
         print(f"声优库：{'已加载' if book else '读不到（全部按画师）'}"
               + (f"（{len(book.roles)} 角色 / {len(book.handles)} 人 / "
                  f"{len(book.officials)} 官号）" if book else ""))
-        ranked = birthday_art.rank_art(
+        head, rest = birthday_art.select(
             arts,
             [i.name for i in day.idols],
             min_likes=cfg.birthday_art_min_likes,
@@ -273,17 +291,25 @@ async def main() -> int:
             skip_official=cfg.birthday_art_skip_official,
             classify=classify,
         )
-        print(f"过滤 + 排序后 {len(ranked)} 条，将要发前 {cfg.birthday_art_max} 条：")
-        for i, a in enumerate(ranked[: cfg.birthday_art_max]):
-            print(f"  [{i + 1}] ♥{a.likes:<6} {classify(a)[1]:<3} @{a.author:<18} "
-                  f"{a.posted_at.astimezone(birthday_art.JST):%m-%d %H:%M}JST {a.idol}")
-            print(f"      {a.image}")
-        if len(ranked) > cfg.birthday_art_max:
-            print(f"  ……还有 {len(ranked) - cfg.birthday_art_max} 条没排上")
+        print(f"过滤后合格 {len(head) + len(rest)} 条；按偶像分组"
+              f"（每个偶像最多 {cfg.birthday_art_max} 张，一人一条 markdown）：")
+        per_idol: dict[str, list] = {}
+        for a in head:
+            per_idol.setdefault(a.idol, []).append(a)
+        for idol in [i.name for i in day.idols]:
+            group_arts = per_idol.get(idol) or []
+            if not group_arts:
+                continue
+            print(f"  ● {idol}（{len(group_arts)} 张）")
+            for j, a in enumerate(group_arts):
+                print(f"      [{j + 1}] ♥{a.likes:<6} {classify(a)[1]:<3} "
+                      f"@{a.author:<18} "
+                      f"{a.posted_at.astimezone(birthday_art.JST):%m-%d %H:%M}JST")
+        if rest:
+            print(f"  ……另有 {len(rest)} 条补位用")
 
         if do_download:
-            # 下载这一环单独验：图能不能下来、多大、base64 之后会不会超 QQ 的直传上限。
-            got = await poller._download(ranked, cfg.birthday_art_max)
+            picked = await poller._download_by_idol(head, rest, cfg.birthday_art_max)
 
         if do_send:
             # ⚠️ **必须在这个 with 里** —— poll_once 会再搜一次、再下一次图，
@@ -304,7 +330,7 @@ async def main() -> int:
                 why.append(f"**{d} 这个群已经发过了** —— 幂等挡下（加 --reset 清账）")
             if not day.idols:
                 why.append(f"{d} 没有偶像过生日")
-            if not ranked:
+            if not head:
                 why.append(f"没有一条过下限（{cfg.birthday_art_min_likes} 赞）")
             for w in why:
                 print(f"    ⚠️ {w}")
@@ -317,20 +343,19 @@ async def main() -> int:
                   f"{sorted(g[:8] + '…' for g in db.birthday_art_posted(d.isoformat()))}")
 
     if do_download:
-        print(f"\n下载结果：{len(got)}/{min(len(ranked), cfg.birthday_art_max)} 张成功"
-              f"（原图上限 {preview.MAX_IMAGE_BYTES // 1000} KB，"
-              f"base64 上限 {preview.MAX_FILE_DATA_BYTES // 1024 // 1024} MiB）")
-        for a, raw in got:
-            b64 = len(raw) * 4 // 3
-            flag = "⚠️ 超上限" if b64 > preview.MAX_FILE_DATA_BYTES else "✅"
-            print(f"  {flag} {len(raw) / 1024:7.0f} KB（base64 {b64 / 1024:7.0f} KB）  @{a.author}")
-        print("\n将要发出去的文案原文：")
-        for i, (a, _raw) in enumerate(got):
+        n_img = sum(len(v) for v in picked.values())
+        print(f"\n下载结果：{n_img} 张，{len(picked)} 位偶像各一条 markdown"
+              f"（原图上限 {preview.MAX_IMAGE_BYTES // 1000} KB）")
+        for idol, items in picked.items():
+            print(f"\n  ● {idol}：{len(items)} 张")
+            for a, raw in items:
+                print(f"      {len(raw) / 1024:7.0f} KB  @{a.author}")
+            md = birthday_art.render_markdown(
+                idol, [(a, raw, classify(a)[1]) for a, raw in items], d.year)
             print("  ┌" + "─" * 46)
-            for line in birthday_art.render(a, i + 1, len(got), d.year,
-                                            label=classify(a)[1]).splitlines():
+            for line in md.splitlines():
                 print(f"  │ {line}")
-        print("  └" + "─" * 46)
+            print("  └" + "─" * 46)
 
     if not do_send:
         print("\n（只是预览，一条都没发。加 --send 才真发）")

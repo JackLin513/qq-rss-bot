@@ -7007,6 +7007,15 @@ class _BaSender:
         self.fail_at = set(fail_at)
         self._n: dict[str, int] = {}
 
+    async def send_markdown(self, group: str, content: str) -> None:
+        i = self._n.get(group, 0)
+        self._n[group] = i + 1
+        if group in self.fail_first and i == 0:
+            raise RuntimeError("模拟第一条失败")
+        if (group, i) in self.fail_at:
+            raise RuntimeError("模拟中间某条失败")
+        self.sent.append((group, content, b""))
+
     async def send_local_image(self, group: str, content: str, path) -> None:
         i = self._n.get(group, 0)
         self._n[group] = i + 1
@@ -7029,7 +7038,13 @@ class _BaResp:
 class _BaHttp:
     """假客户端。`dead` 里的 URL 抛错（模拟下不动 / 原图过大）。"""
 
-    def __init__(self, blob: bytes = b"\xff\xd8JPEG-ba", dead: set[str] | None = None) -> None:
+    # 最小可解析 JPEG（320x480）—— render_markdown 要读真实宽高才肯放图
+    # ⚠️ image_size 对小于 30 字节的 blob 直接返回 None —— 必须补够长度
+    _FAKE_JPEG = (b"\xff\xd8\xff\xc0\x00\x00\x00"
+                  b"\x01\xe0\x01\x40" + b"\x00" * 24)
+
+    def __init__(self, blob: bytes | None = None, dead: set[str] | None = None) -> None:
+        blob = self._FAKE_JPEG if blob is None else blob
         self.blob = blob
         self.dead = dead or set()
         self.urls: list[str] = []
@@ -7337,9 +7352,11 @@ def _ba_rank() -> None:
     mixed = [_ba_art(1, likes=900, idol="A"), _ba_art(2, likes=800, idol="A"),
              _ba_art(3, likes=700, idol="A"), _ba_art(4, likes=5, idol="B")]
     got = rank_art(mixed, ["A", "B"], min_likes=0)
-    check("★ 冷门偶像也保底一张（否则最火的那位把名额吃光）",
+    check("★ 冷门偶像也单独成组（不再和热门偶像抢同一个名额池）",
           any(a.idol == "B" for a in got), str([(a.idol, a.likes) for a in got]))
-    check("保底那张排在最前面", got[0].idol == "B", str(got[0].idol))
+    check("★ 名额按偶像各算一份：A 的在前面，B 的单独一组成立",
+          got[0].idol == "A" and [a.idol for a in got].count("B") == 1,
+          str([(a.idol, a.likes) for a in got]))
 
     check("敏感的排掉", not rank_art([_ba_art(1, likes=900, sensitive=True)], ["X"], min_likes=0))
     check("没图的排掉", not rank_art([_ba_art(1, likes=900, image=False)], ["X"], min_likes=0))
@@ -7477,6 +7494,36 @@ def _ba_three() -> None:
     check("★ 署名用类别词（公式 / 本人 / 声優 / 画师）",
           line == "♥ 100 · 本人 @vtuber_v", line)
 
+    # ---------- 一人一条 markdown ----------
+    md = ba.render_markdown(
+        "杜野凛世",
+        [(_ba_art(1, likes=3200, author="someartist"), _BaHttp._FAKE_JPEG, "画师")],
+        2026)
+    lines = md.splitlines()
+    check("★ markdown 首行是标题", lines[0] == "🎨 **杜野凛世** 誕生祭 2026", lines[0])
+    check("★ 图带尺寸提示（缺了手机端整条不渲染）",
+          lines[1].startswith("![画师 #320px #400px](https://pbs.twimg.com/"), lines[1])
+    check("★ 图下面是可点击的署名（点赞 + 类别 + handle）",
+          lines[2].startswith("[♥ 3.2k · 画师 @someartist](https://x.com/"), lines[2])
+    check("尺寸是按真实宽高算的（320x480 → 320x400，被 MAX_H 夹住）",
+          "#320px #400px" in lines[1])
+    bad = ba.render_markdown("某人", [(_ba_art(1, likes=1), b"not an image", "画师")], 2026)
+    check("★ 读不出宽高的图直接跳过（宁可不放，也不放被压扁的）",
+          "![" not in bad, bad)
+
+    # ---------- 名额按偶像各算一份 ----------
+    two = [A(11, 9000, "official_x", idol="角色A"), A(12, 8000, "seiyuu_a", idol="角色A"),
+           A(13, 7000, "fan1", idol="角色A"), A(14, 6000, "fan2", idol="角色A"),
+           A(15, 5000, "fan3", idol="角色A"), A(16, 100, "fanB1", idol="角色B"),
+           A(17, 90, "fanB2", idol="角色B")]
+    head2, _rest2 = ba.select(two, ["角色A", "角色B"], min_likes=0, max_n=6, classify=c)
+    check("★ 两位偶像各自成型，互不抢名额（B 拿到自己的 2 张）",
+          [a.idol for a in head2].count("角色B") == 2
+          and [a.idol for a in head2].count("角色A") == 5,
+          str([(a.idol, a.author) for a in head2]))
+    check("A 的名字排在 B 前面（跟日历顺序走）",
+          [a.idol for a in head2][0] == "角色A" and [a.idol for a in head2][-1] == "角色B")
+
 
 async def _ba_poller() -> None:
     import tempfile as _tf  # noqa: PLC0415
@@ -7505,16 +7552,20 @@ async def _ba_poller() -> None:
         now = datetime(2026, 10, 19, 22, 30, 30)
         arts = [_ba_art(i, likes=1000 - i * 10) for i in range(1, 4)]
         n = await p.poll_once(now=now, arts=arts)
-        check("★ 一轮发出去的条数 = 挑中的张数", n == 3, str(n))
-        check("★ 一条一张（消息条数 == 图片张数）", len(sender.sent) == 3, str(len(sender.sent)))
-        check("文案编号是 (i/N)", "（1/3）" in sender.sent[0][1] and "（3/3）" in sender.sent[2][1])
-        check("图片字节真的传进去了", sender.sent[0][2].startswith(b"\xff\xd8"))
+        check("★ 一轮发出去的张数 = 挑中的张数", n == 3, str(n))
+        check("★ 一个偶像一条 markdown（3 张图合成 1 条消息）",
+              len(sender.sent) == 1, str(len(sender.sent)))
+        md1 = sender.sent[0][1]
+        check("★ markdown 里每张图都带尺寸提示（缺了整条不渲染）",
+              md1.count("![") == 3 and md1.count("#320px #") == 3, md1[:200])
+        check("★ 每张图下面有署名链接", md1.count("](https://x.com/") == 3)
+        check("标题带偶像名和年份", "杜野凛世" in md1 and "2026" in md1, md1.splitlines()[0])
         check("落库了，记了条数和推文 id",
               db.rows and db.rows[0][2] == 3 and len(db.rows[0][3].split(",")) == 3, str(db.rows))
 
         # ---- 幂等 ----
         n = await p.poll_once(now=now, arts=arts)
-        check("★ 同一个 slot 再跑一次，一条都不发", n == 0 and len(sender.sent) == 3)
+        check("★ 同一个 slot 再跑一次，一条都不发", n == 0 and len(sender.sent) == 1)
 
         # ---- 清账之后能重发（探针 --reset 走的就是这条路）----
         # 实测踩过：改完挑选规则想拿同一天重测，忘了清账 → 永远「发出去 0 条」，
@@ -7551,14 +7602,13 @@ async def _ba_poller() -> None:
         n = await p3.poll_once(now=now, arts=arts)
         check("★ 首图发不出去 → 不记账（窗口内下一拍会重试）", n == 0 and not db3.rows, str(db3.rows))
 
-        # ---- 中间某张挂 → 照记账，sent 反映真实条数 ----
-        db4 = _ba_db()
-        p4 = ba.BirthdayArtPoller(_ba_cfg(tmp), db4, _BaSender(fail_at={("G1", 1)}), _BaHttp())
-        n = await p4.poll_once(now=now, arts=arts)
-        check("★ 中间某张挂 → 仍记账，且记的是**真的发出去了几张**",
-              n == 2 and db4.rows[0][2] == 2, str(db4.rows))
-        check("  ……记的 id 也是真发出去的那几条（不是前 N 个）",
-              ",".join(a.id for a in arts[:1] + arts[2:3]) == db4.rows[0][3], db4.rows[0][3])
+        # ---- 后续某条挂 → 前面的照记账（一天多个偶像时才会出现）----
+        s4 = _BaSender(fail_at={("G1", 1)})
+        p4 = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), s4, _BaHttp())
+        delivered = await p4._deliver(
+            "G1", [("md-a", ["111"]), ("md-b", ["222"])], "2026-10-19")
+        check("★ 第一条成功、第二条失败 → 记第一条的 id（不整批重发）",
+              delivered == ["111"] and len(s4.sent) == 1, str(delivered))
 
         # ---- 逐群隔离 ----
         db5 = _ba_db("G1", "G2")
@@ -7567,6 +7617,20 @@ async def _ba_poller() -> None:
         n = await p5.poll_once(now=now, arts=arts)
         check("★ 一个群发失败不连累别的群", n == 3 and db5.posted.get("2026-10-19") == {"G2"},
               str(db5.posted))
+
+        # ---- 预热：先往预热群发一遍同样的内容 ----
+        db7, s7 = _ba_db(), _BaSender()
+        p7 = ba.BirthdayArtPoller(
+            _ba_cfg(tmp, birthday_art_warmup_group="W1", preview_warmup_sec=0),
+            db7, s7, _BaHttp())
+        await p7.poll_once(now=now, arts=arts)
+        check("★ 正式发之前先往预热群发一遍（否则冷链接 QQ 抓不到图）",
+              [g for g, _, _ in s7.sent] == ["W1", "G1"],
+              str([g for g, _, _ in s7.sent]))
+        check("预热那条和正式那条内容一字不差", s7.sent[0][1] == s7.sent[1][1])
+        check("★ 预热群不记账（只有正式群算发出去了）",
+              db7.birthday_art_posted("2026-10-19") == {"G1"},
+              str(db7.birthday_art_posted("2026-10-19")))
 
         # ---- 一张图都下不下来 → 这拍不发、不记账 ----
         db6 = _ba_db()
@@ -7587,13 +7651,13 @@ async def _ba_fetch_fallback() -> None:
         # 原图下得动 → 用原图
         http = _BaHttp()
         p = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), http)
-        got = await p._download([art], 1)
+        got = (await p._download_by_idol([art], [], 1)).get(art.idol, [])
         check("原图能下就直接用", len(got) == 1 and any("name=orig" in u for u in http.urls))
 
         # ★ 原图下不动（多半是超过 3.5MB 的直传上限）→ 退到 large
         http = _BaHttp(dead={"name=orig"})
         p = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), http)
-        got = await p._download([art], 1)
+        got = (await p._download_by_idol([art], [], 1)).get(art.idol, [])
         check("★ 原图下不动时退到 large（实测 5 张里有 1 张原图超限）",
               len(got) == 1 and any("name=large" in u for u in http.urls), str(http.urls))
 
@@ -7601,7 +7665,8 @@ async def _ba_fetch_fallback() -> None:
         arts = [_ba_art(i, likes=900 - i) for i in range(1, 5)]
         http = _BaHttp(dead={"IMG1"})
         p = ba.BirthdayArtPoller(_ba_cfg(tmp), _ba_db(), _BaSender(), http)
-        got = await p._download(arts, 2)
+        picked = await p._download_by_idol(arts, [], 2)
+        got = [x for v in picked.values() for x in v]
         check("★ 下不动的往后补位，凑满想要的张数",
               len(got) == 2 and all(a.id != arts[0].id for a, _ in got),
               str([a.id for a, _ in got]))
@@ -7670,7 +7735,7 @@ def _ba_wiring() -> None:
     check("★ 轮询器每拍读一次声优库", "seiyuu.load()" in src)
     check("★ 分类器传进了 rank_art（不是摆设）", "classify=classify" in src, "")
     check("★ 文案的类别词来自分类器，不是写死「画师」",
-          "label=classify(a)[1]" in src)
+          "render_markdown(" in src and "classify(a)[1]" in src)
     from qq_rss_bot import config as _cfg_mod  # noqa: PLC0415
     cfg_src = Path(_cfg_mod.__file__).read_text()
     check("★ BIRTHDAY_ART_SKIP_OFFICIAL 默认 False（官号单列，不再整个丢）",

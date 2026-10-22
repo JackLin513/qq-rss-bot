@@ -294,6 +294,10 @@ class Config:
     # 「别发一堆 0 赞垃圾」的兜底。想让冷门偶像一张都不发就往上调。
     birthday_art_min_likes: int = birthday_art_module.DEFAULT_MIN_LIKES
     birthday_art_exclude: tuple[str, ...] = ()
+    # markdown 预热群（空 = 不预热）。QQ 抓图是异步的，冷链接第一次不显示，
+    # 所以正式发之前先往这里发一遍同样的内容，等 `preview_warmup_sec` 秒。
+    # 和 `warmup_group`（RSS 多图那条链路）是两回事，别混。
+    birthday_art_warmup_group: str = ""
     # ⚠️ 2026-10-22 起默认 **False**：官方号不再整个丢掉，而是**单列一格**
     # （官号 1 + 本人/声优 1 + 画师 4）。设成 True 是逃生门 = 官方号一条都不要。
     birthday_art_skip_official: bool = False
@@ -493,6 +497,7 @@ def load_config() -> Config:
         ),
         birthday_art_exclude=_env_list("BIRTHDAY_ART_EXCLUDE"),
         birthday_art_skip_official=_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", False),
+        birthday_art_warmup_group=_env_str("BIRTHDAY_ART_WARMUP_GROUP", ""),
         x_auth_token=_env_str("auth_token", ""),
         x_ct0=_env_str("ct0", ""),
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),

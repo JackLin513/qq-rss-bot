@@ -120,6 +120,7 @@ import httpx
 
 from . import birthday as birthday_module
 from . import features
+from . import multiimage
 from . import preview
 from . import seiyuu
 from .tickets import JST
@@ -399,7 +400,7 @@ def make_classifier(
     return classify
 
 
-def rank_art(
+def select(
     arts: Iterable[Art],
     idols: list[str],
     *,
@@ -409,12 +410,12 @@ def rank_art(
     exclude: Iterable[str] = (),
     skip_official: bool = False,
     classify: Any = None,
-) -> list[Art]:
-    """过滤 + 分类 + 排序 + 名额，**返回全部合格候选**（截多少由下载那一步决定）。
+) -> tuple[list[Art], list[Art]]:
+    """→ (每个偶像的前 `max_n` 条, 其余补位用的候选)。
 
+    名额**按偶像各算一份**：每个偶像自己 1 官号 + 1 本人/声优 + 4 画师，
+    某类不够就让给画师。一天两位偶像 = 两条消息，互不抢名额。
     顺序 = 官号 → 本人/声优 → 画师；同类别内点赞降序、同分按 id。
-    名额见 `OFFICIAL_QUOTA` / `PERSON_QUOTA`，**某类不够就把名额让给画师**。
-    前 `max_n` 条就是这次该发的内容，后面的用来在下图失败时补位。
 
     `skip_official=True` 是配置里的逃生门：官方号**整个**不要（不是「不占名额」）。
     """
@@ -439,45 +440,57 @@ def rank_art(
         keep.append(a)
     keep.sort(key=lambda a: (-a.likes, a.id))  # 同分按 id → 结果确定，可复现
 
-    buckets: dict[str, list[Art]] = {
-        seiyuu.CATEGORY_OFFICIAL: [],
-        seiyuu.CATEGORY_PERSON: [],
-        seiyuu.CATEGORY_ARTIST: [],
-    }
-    budget: dict[str, int] = {}
-    for a in keep:
-        if budget.get(a.author, 0) >= per_author:
-            continue
-        budget[a.author] = budget.get(a.author, 0) + 1
-        buckets[_classify(a)[0]].append(a)
+    # ⚠️ 名额是**按偶像各算一份**（每个偶像自己 1+1+4）。
+    # 一天两位偶像 → 两条消息，各自独立，不互相抢名额。
+    budget: dict[str, int] = {}  # 每位作者全天只出现一次（跨偶像也成立）
 
-    # ⚠️ **本人优先于声优**：两者抢同一格，本人才是过生日的那个人，
-    # 哪怕赞少很多。先按类别内小序排，再让「每位偶像保底」去挪。
-    buckets[seiyuu.CATEGORY_PERSON].sort(
-        key=lambda a: (0 if _classify(a)[1] == seiyuu.LABEL_CHARACTER else 1,
-                       -a.likes, a.id))
+    def pick(candidates: list[Art]) -> tuple[list[Art], list[Art]]:
+        buckets: dict[str, list[Art]] = {
+            seiyuu.CATEGORY_OFFICIAL: [],
+            seiyuu.CATEGORY_PERSON: [],
+            seiyuu.CATEGORY_ARTIST: [],
+        }
+        for a in candidates:
+            if budget.get(a.author, 0) >= per_author:
+                continue
+            budget[a.author] = budget.get(a.author, 0) + 1
+            buckets[_classify(a)[0]].append(a)
 
-    # 每位偶像至少保一张：把这个偶像在**它自己那一类**里的第一名挪到该类最前
-    # （不保底的话，最火的那位会把名额吃光）。一天最多 6 位偶像。
+        # ⚠️ **本人优先于声优**：两者抢同一格，本人才是过生日的那个人，
+        # 哪怕赞少很多。
+        buckets[seiyuu.CATEGORY_PERSON].sort(
+            key=lambda a: (0 if _classify(a)[1] == seiyuu.LABEL_CHARACTER else 1,
+                           -a.likes, a.id))
+
+        off = buckets[seiyuu.CATEGORY_OFFICIAL]
+        per = buckets[seiyuu.CATEGORY_PERSON]
+        art = buckets[seiyuu.CATEGORY_ARTIST]
+        off_n = min(len(off), OFFICIAL_QUOTA)
+        per_n = min(len(per), PERSON_QUOTA)
+        # ⚠️ 回流就发生在这行：某一类空出来的名额自动落到画师头上。
+        art_n = max(0, max_n - off_n - per_n)
+        head = off[:off_n] + per[:per_n] + art[:art_n]
+        tail = art[art_n:] + off[off_n:] + per[per_n:]
+        return head, tail
+
+    head_all: list[Art] = []
+    tail_all: list[Art] = []
     for idol in idols:
-        for cat in (seiyuu.CATEGORY_OFFICIAL, seiyuu.CATEGORY_PERSON,
-                    seiyuu.CATEGORY_ARTIST):
-            group = [a for a in buckets[cat] if a.idol == idol]
-            if group:
-                top = group[0]
-                buckets[cat].remove(top)
-                buckets[cat].insert(0, top)
-                break
+        group = [a for a in keep if a.idol == idol]
+        if not group:
+            continue
+        head, tail = pick(group)
+        head_all += head
+        tail_all += tail
+    # 只把**不属于任何偶像**的候选放到最后 —— 被「每位作者一张」挡掉的那些
+    # 不能因为没进 buckets 就又被捡回来（那样上限形同虚设）。
+    known = set(idols)
+    return head_all, tail_all + [a for a in keep if a.idol not in known]
 
-    off = buckets[seiyuu.CATEGORY_OFFICIAL]
-    per = buckets[seiyuu.CATEGORY_PERSON]
-    art = buckets[seiyuu.CATEGORY_ARTIST]
-    off_n = min(len(off), OFFICIAL_QUOTA)
-    per_n = min(len(per), PERSON_QUOTA)
-    # ⚠️ 回流就发生在这行：某一类空出来的名额自动落到画师头上。
-    art_n = max(0, max_n - off_n - per_n)
-    head = off[:off_n] + per[:per_n] + art[:art_n]
-    tail = art[art_n:] + off[off_n:] + per[per_n:]
+
+def rank_art(arts: Iterable[Art], idols: list[str], **kwargs: Any) -> list[Art]:
+    """平铺版（探针和测试用）：前段是要发的，后段是补位。"""
+    head, tail = select(arts, idols, **kwargs)
     return head + tail
 
 
@@ -488,14 +501,46 @@ def _likes(n: int) -> str:
     return f"{n / 1000:.1f}k".replace(".0k", "k")
 
 
-_STATUS_ID_RE = re.compile(r"/status/(\d+)\s*$")
+_STATUS_ID_RE = re.compile(r"/status/(\d+)")
 
 
 def _id_of(text: str) -> str:
-    """从渲染出来的文案里取回推文 id —— `_deliver` 只有文案和路径，
-    而记账需要知道**到底哪几条发出去了**。"""
+    """从文案 / URL 里取回推文 id —— 记账需要知道**到底哪几条发出去了**。
+
+    不锚定行尾：同一个函数既要能吃纯 URL，也要能吃 markdown 里的链接
+    （`[…](https://x.com/…/status/123)`，后面还跟着括号）。
+    """
     m = _STATUS_ID_RE.search(text)
     return m.group(1) if m else ""
+
+
+# markdown 里一张图的显示宽度。6 张挤在一条里，320 差不多一屏半。
+MARKDOWN_IMAGE_W = 320
+
+
+def render_markdown(
+    idol: str, items: list[tuple[Art, bytes, str]], year: int
+) -> str:
+    """**一个偶像一条 markdown**：正文里放 N 张图，每张下面是署名。
+
+    `items` 是 `(Art, 图片字节, 标签)`。宽高必须逐张读真实值 ——
+    QQ 的尺寸提示**必填**（手机端不带就整条不渲染），而且**比例错了图会被拉伸**。
+    读不出尺寸的那张直接跳过（宁可不放，也不放一张被压扁的）。
+
+    ⚠️ 图片 URL 原样给，**绝不加 `_cb` 之类的参数** —— 加了 QQ 的图片代理抓不到。
+    """
+    lines = [f"🎨 **{idol}** 誕生祭 {year}"]
+    for art, raw, label in items:
+        size = multiimage.image_size(raw)
+        if size is None:
+            _log.info("贺图：%s 的图读不出宽高，markdown 里跳过", art.id)
+            continue
+        w, h = size
+        disp_h = max(multiimage.MIN_H,
+                     min(multiimage.MAX_H, round(MARKDOWN_IMAGE_W * h / w)))
+        lines.append(f"![{label} #{MARKDOWN_IMAGE_W}px #{disp_h}px]({art.image})")
+        lines.append(f"[♥ {_likes(art.likes)} · {label} @{art.author}]({art.url})")
+    return "\n".join(lines)
 
 
 def render(art: Art, index: int, total: int, year: int, *,
@@ -822,19 +867,31 @@ class BirthdayArtPoller:
         _log.info("贺图：原图下不来或太大，退到 large：%s", url)
         return await preview.fetch_image(self.http, alt)
 
-    async def _download(self, ranked: list[Art], want: int) -> list[tuple[Art, bytes]]:
-        """并发下载，**按排名保留前 `want` 张成功的**（前面下不动的往后补位）。"""
-        head = ranked[: want * DOWNLOAD_LOOKAHEAD]
-        blobs = await asyncio.gather(*(self._fetch(a.image) for a in head))
-        out: list[tuple[Art, bytes]] = []
-        for art, raw in zip(head, blobs):
+    async def _download_by_idol(
+        self, head: list[Art], rest: list[Art], want: int
+    ) -> dict[str, list[tuple[Art, bytes]]]:
+        """按偶像并发下载，**每个偶像最多保留前 `want` 张成功的**（下不动的往后补）。"""
+        plans: dict[str, list[Art]] = {}
+        extra: dict[str, list[Art]] = {}
+        for a in head:
+            plans.setdefault(a.idol, []).append(a)
+        for a in rest:
+            extra.setdefault(a.idol, []).append(a)
+        for idol, arts in plans.items():
+            plans[idol] = (arts + extra.get(idol, []))[: want * DOWNLOAD_LOOKAHEAD]
+
+        flat = [(idol, a) for idol, arts in plans.items() for a in arts]
+        blobs = await asyncio.gather(*(self._fetch(a.image) for _, a in flat))
+        out: dict[str, list[tuple[Art, bytes]]] = {}
+        for (idol, art), raw in zip(flat, blobs):
             if raw is None:
                 _log.warning("贺图：%s 的图下不下来（%s），跳过", art.id, art.image)
                 continue
-            out.append((art, raw))
-            if len(out) >= want:
-                break
-        return out
+            bucket = out.setdefault(idol, [])
+            if len(bucket) >= want:
+                continue
+            bucket.append((art, raw))
+        return {k: v for k, v in out.items() if v}
 
     async def _alert(self, text: str) -> None:
         """**群里看不见的失败必须私聊报。** cookie 失效的症状是「今天没图」，
@@ -891,7 +948,7 @@ class BirthdayArtPoller:
         # 下一拍就生效。读不到时 load() 自己打 WARNING，这里退回「全是画师」。
         classify = make_classifier(
             seiyuu.load(), exclude=self.cfg.birthday_art_exclude)
-        ranked = rank_art(
+        head, rest = select(
             arts,
             idols,
             min_likes=self.cfg.birthday_art_min_likes,
@@ -900,7 +957,7 @@ class BirthdayArtPoller:
             skip_official=self.cfg.birthday_art_skip_official,
             classify=classify,
         )
-        if not ranked:
+        if not head:
             _log.info(
                 "贺图：%s 共 %d 条候选，没有一条过下限（%d 赞），今天不发",
                 day_key,
@@ -908,61 +965,92 @@ class BirthdayArtPoller:
                 self.cfg.birthday_art_min_likes,
             )
             return 0
-        head = ranked[:self.cfg.birthday_art_max]
         counts: dict[str, int] = {}
         for a in head:
             label = classify(a)[1]
             counts[label] = counts.get(label, 0) + 1
-        _log.info("贺图：%s 选中 %d 条（%s）", day_key, len(head),
+        by_idol = len({a.idol for a in head})
+        _log.info("贺图：%s 选中 %d 张 / %d 位偶像（%s）", day_key, len(head), by_idol,
                   " / ".join(f"{k} {v}" for k, v in counts.items()))
 
-        picked = await self._download(ranked, self.cfg.birthday_art_max)
+        picked = await self._download_by_idol(head, rest, self.cfg.birthday_art_max)
         if not picked:
             # 一张都没下来 —— 多半是网络。留窗口内下一拍重试，**绝不记账**。
-            _log.warning("贺图：%s 候选 %d 条但一张图都没下来，这一拍不发", day_key, len(ranked))
+            _log.warning("贺图：%s 候选 %d 条但一张图都没下来，这一拍不发",
+                         day_key, len(head))
             return 0
 
-        total = len(picked)
-        texts = [render(a, i + 1, total, d.year, label=classify(a)[1])
-                 for i, (a, _) in enumerate(picked)]
+        # 每个偶像一条 markdown。顺序跟 `idols` 走（日历里的顺序）。
+        messages: list[tuple[str, list[str]]] = []
+        for idol in idols:
+            items = picked.get(idol) or []
+            if not items:
+                continue
+            md = render_markdown(
+                idol, [(a, raw, classify(a)[1]) for a, raw in items], d.year)
+            messages.append((md, [_id_of(a.url) for a, _ in items]))
+        if not messages:
+            _log.warning("贺图：%s 有候选但一条都渲染不出来，这一拍不发", day_key)
+            return 0
+
         sent = 0
-        # 图片落临时目录、用完就删 —— `send_local_image` 收的是路径，
-        # 这里只是要个路径，不是素材，不该在 NAS 上留痕。
-        with tempfile.TemporaryDirectory(prefix="birthday-art-") as tmp:
-            paths = []
-            for i, (_a, raw) in enumerate(picked):
-                p = Path(tmp) / f"{i}.jpg"
-                p.write_bytes(raw)
-                paths.append(p)
-            for group in targets:
-                delivered = await self._deliver(group, texts, paths, day_key)
-                if delivered:
-                    self.db.mark_birthday_art(
-                        day_key, group, len(delivered), ",".join(delivered)
-                    )
-                    sent += len(delivered)
+        for group in targets:
+            await self._warmup(messages, day_key)
+            delivered = await self._deliver(group, messages, day_key)
+            if delivered:
+                self.db.mark_birthday_art(
+                    day_key, group, len(delivered), ",".join(delivered)
+                )
+                sent += len(delivered)
         return sent
 
-    async def _deliver(
-        self, group: str, texts: list[str], paths: list[Path], day_key: str
-    ) -> list[str]:
-        """逐条发。**首条挂了就整批放弃**（正文还没出去，下一拍重来）；
-        后续某张挂了只记日志、跳过 —— 首图已经发出去了，再退一次就是重复刷屏。
-        和项目里多图那条现成规矩一致。"""
-        sent: list[str] = []
-        for i, (text, path) in enumerate(zip(texts, paths)):
+    async def _warmup(self, messages: list[tuple[str, list[str]]],
+                      day_key: str) -> None:
+        """markdown 的图由 QQ 自己去抓，**冷链接第一次必炸** —— 先往预热群
+        发一遍同样的内容，等它抓完，正式群那条才显示得出来。
+
+        ⚠️ 预热必须是**真的发一条 markdown**：`post_group_file` 那条路
+        预热不了渲染缓存（见 `config.preview_warmup_sec` 的说明）。
+        """
+        wg = self.cfg.birthday_art_warmup_group
+        if not wg:
+            return
+        ok = 0
+        for md, _ids in messages:
             try:
-                await self.sender.send_local_image(group, text, path)
+                await self.sender.send_markdown(wg, md)
+                ok += 1
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("贺图：预热发送失败（%s）：%s", wg[:8], exc)
+                break
+        if ok:
+            _log.info("贺图：%s 预热 %d 条已发，等 %d 秒让 QQ 抓图",
+                      day_key, ok, self.cfg.preview_warmup_sec)
+            await asyncio.sleep(self.cfg.preview_warmup_sec)
+
+    async def _deliver(
+        self, group: str, messages: list[tuple[str, list[str]]], day_key: str
+    ) -> list[str]:
+        """每个偶像一条 markdown，逐条发。
+
+        **第一条挂了就整批放弃**（群里还没看到任何东西，下一拍重来）；
+        后续某条挂了只记日志、跳过 —— 第一条已经发出去了，再退一次就是重复刷屏。
+        返回这轮**确实发出去的推文 id**（记账用）。"""
+        sent: list[str] = []
+        ok = 0
+        for i, (md, ids) in enumerate(messages):
+            try:
+                await self.sender.send_markdown(group, md)
             except Exception as exc:  # noqa: BLE001
                 if not sent:
-                    _log.warning("贺图：首图就发不出去 → %s：%s（这一拍不记账）", group[:8], exc)
+                    _log.warning("贺图：第一条就发不出去 → %s：%s（这一拍不记账）",
+                                 group[:8], exc)
                     return []
-                _log.warning("贺图：第 %d 张发失败 → %s：%s（跳过）", i + 1, group[:8], exc)
+                _log.warning("贺图：第 %d 条发失败 → %s：%s（跳过）", i + 1, group[:8], exc)
                 continue
-            sent.append(_id_of(text))
+            ok += 1
+            sent.extend(ids)
         if sent:
-            _log.info(
-                "贺图：已推送 %s 共 %d 张 → %s（%s）",
-                day_key, len(sent), group[:8], ",".join(sent),
-            )
+            _log.info("贺图：已推送 %s 共 %d 条消息 / %d 张图 → %s",
+                      day_key, ok, len(sent), group[:8])
         return sent
