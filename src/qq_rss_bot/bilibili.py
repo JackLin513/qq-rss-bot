@@ -171,8 +171,11 @@ def fmt_duration(sec: object) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
-def render(data: dict) -> str:
+def render(data: dict, cover: str | None = None) -> str:
     """把 view API 的 ``data`` 渲染成 QQ 的 markdown。
+
+    `cover` **覆盖封面 URL**（ticket #13：图先收进图库，正文里用图库地址）。
+    `None` = 自己从 `pic` 取（原行为）；空字符串 = 这张卡片不带图。
 
     **标题单独一行加粗，不放进 ``[文字](url)`。** 实测 100 条热门标题里 7 条含
     `|` / `[` / `]` / `!` —— 塞进链接文字里会把后面所有的括号配对搞乱。
@@ -180,7 +183,8 @@ def render(data: dict) -> str:
     """
     lines: list[str] = []
 
-    cover = _cover_url(data.get("pic"))
+    if cover is None:
+        cover = cover_url(data.get("pic"))
     if cover:
         lines.append(f"![封面 #{_COVER_W}px #{_COVER_H}px]({cover})")
 
@@ -276,8 +280,12 @@ def _ark_fields(ark_data: object) -> dict:
     return fields if isinstance(fields, dict) else {}
 
 
-def _cover_url(pic: object) -> str | None:
-    """封面 URL：``http`` 改 ``https``，并加上图床的缩放后缀。"""
+def cover_url(pic: object) -> str | None:
+    """封面 URL：``http`` 改 ``https``，并加上图床的缩放后缀。
+
+    **只有 `render` 和抓图镜像用得到它** —— 镜像必须在加后缀**之后**下载
+    （后缀是 bilibili 的缩放参数，去掉会拿到原图、体积大好几倍）。
+    """
     if not isinstance(pic, str) or not pic.strip():
         return None
     url = pic.strip()

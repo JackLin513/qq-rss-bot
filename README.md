@@ -350,6 +350,7 @@ TWITTER_PREVIEW=true
 PREVIEW_MULTI_IMAGE=true   # 推文多图 → 一条 markdown 带全部配图
 RSS_MULTI_IMAGE=true       # 一条资讯多图 → 一条 markdown 带全部配图
 MULTI_IMAGE_MARKDOWN=true  # 多图合并成一条 markdown（关掉 → 只发第一张）
+MIRROR_IMAGES=true         # bilibili / 抽票 / RSS 的图下载入库，用图库地址
 PUSH_SUMMARY=true          # 推送文案带 RSS 摘要（关掉退回三行）
 MEDIA_PROXY=http://192.168.0.63:6152   # 必填，见下
 ```

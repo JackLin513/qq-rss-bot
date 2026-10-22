@@ -86,6 +86,21 @@ class RssBot(botpy.Client):
         )
         # 出错走私聊，不在群里报错。配了 NOTIFY_OPENIDS 就只发给名单上的人。
         self.notifier = C2CNotifier(self, self.db, allowlist=cfg.notify_openids)
+        # ---- 图库 + 图床（**必须在所有轮询器之前建**）----
+        # `imgsrv` 是自建图床：markdown 的图是 QQ 的服务器去抓的，而它在大陆机房
+        # 够不到 pbs.twimg.com —— 所以图先落本地、用我们自己的公网地址给它抓。
+        # 端口开不起来不拖垮机器人（`start()` 只打 WARNING）。
+        lib_dir = cfg.imagelib_dir or (cfg.db_path.parent / "library")
+        self.library = imagelib.Library(self.db, lib_dir, cfg.imgsrv_base)
+        self.imgsrv = imgsrv.ImageServer(
+            self.library.root, cfg.imgsrv_base, port=cfg.imgsrv_port)
+        self.imgsrv.start()
+        # 开关状态必须打得出来：镜像出问题时，第一个要回答的就是它开没开。
+        _log.info(
+            "第三方图镜像（MIRROR_IMAGES）：%s",
+            "开 —— bilibili / 抽票 / RSS 的图会下载入库" if cfg.mirror_images
+            else "关 —— 第三方图床的 URL 直接交给 QQ",
+        )
         self.commands = CommandHandler(
             cfg,
             self.db,
@@ -93,6 +108,7 @@ class RssBot(botpy.Client):
             self.sender,
             notifier=self.notifier,
             ai_http=self.media_http,
+            library=self.library,
         )
         # 进群自动订阅。cfg.auto_subscribe_feed 留空时 enabled 为假，整个功能关掉。
         self.autosub = AutoSubscriber(cfg, self.db, self.sender)
@@ -106,21 +122,14 @@ class RssBot(botpy.Client):
             # 抓文章正文时直连失败才会用到它。**和 media_http 是同一个对象**：
             # 它本来就是「给被墙站点用的客户端」，语义一致，不必再建一个。
             ai_http=self.media_http,
+            library=self.library,
         )
         self._poller_task: Any = None
-        # ---- 图库 + 图床（**必须在所有轮询器之前建**）----
-        # `imgsrv` 是自建图床：markdown 的图是 QQ 的服务器去抓的，而它在大陆机房
-        # 够不到 pbs.twimg.com —— 所以图先落本地、用我们自己的公网地址给它抓。
-        # 端口开不起来不拖垮机器人（`start()` 只打 WARNING）。
-        lib_dir = cfg.imagelib_dir or (cfg.db_path.parent / "library")
-        self.library = imagelib.Library(self.db, lib_dir, cfg.imgsrv_base)
-        self.imgsrv = imgsrv.ImageServer(
-            self.library.root, cfg.imgsrv_base, port=cfg.imgsrv_port)
-        self.imgsrv.start()
         # 抽票提醒（ASOBI TICKET）。**单独一个 task**，不塞进 FeedPoller ——
         # 数据源、轮询节奏、失败语义都不一样。没配 TICKET_GROUPS 时
         # `run()` 会立刻返回，等于功能关闭。
-        self.tickets = TicketPoller(cfg, self.db, self.rss_http, self.sender)
+        self.tickets = TicketPoller(cfg, self.db, self.rss_http, self.sender,
+                                    library=self.library)
         self._ticket_task: Any = None
         # 「月曜が近いよ」每周播报。同样单独一个 task。没配 MONDAY_GROUPS 时
         # `run()` 立刻返回，等于功能关闭。
@@ -516,7 +525,19 @@ class RssBot(botpy.Client):
                 return False
             # 非 @ 的消息不会有别人回，所以这条必定消耗 msg_seq=1，没有撞号风险
             _reply, reply_card = self._make_repliers(message)
-            await reply_card(bilibili.render(data))
+            # 封面收进图库再用（ticket #13）。**失败只降级这一张** ——
+            # `mirror` 原样返回第三方地址，卡片照发。
+            cover = bilibili.cover_url(data.get("pic"))
+            if cover and self.cfg.mirror_images:
+                cover = await imagelib.mirror(
+                    self.library, self.rss_http, cover,
+                    kind=imagelib.KIND_PREVIEW,
+                    event_date=datetime.now().date().isoformat(),
+                    source_url=cover,
+                    page_url=f"https://www.bilibili.com/video/{data.get('bvid', '')}",
+                    source_id=str(data.get("bvid") or ""),
+                )
+            await reply_card(bilibili.render(data, cover=cover))
         except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
             # 对**群里**静默，但日志要留痕：没有这个栈，线上出问题只能靠猜
             _log.warning("bilibili 预览失败", exc_info=True)

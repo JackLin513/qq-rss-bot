@@ -18,7 +18,7 @@ from typing import Awaitable, Protocol
 
 import httpx
 
-from . import ai, idolmaster, multiimage
+from . import ai, idolmaster, imagelib, multiimage
 from .config import Config
 from .db import Database, Subscription, utcnow
 from .notify import Notifier, NullNotifier
@@ -406,11 +406,15 @@ class FeedPoller:
         notifier: Notifier | None = None,
         quota=None,
         ai_http: httpx.AsyncClient | None = None,
+        library: imagelib.Library | None = None,
     ) -> None:
         self.cfg = cfg
         self.db = db
         self.http = http
         self.pusher = pusher
+        # 第三方图床的图收进图库（`MIRROR_IMAGES`，ticket #13）。没有库就原样
+        # 把 URL 交给 QQ，行为和以前完全一样。
+        self.library = library
         # 抓文章正文用的**备用**客户端（走代理）。直连失败才会用到 ——
         # 国内的源走代理又慢又可能撞 MITM 证书问题，不能一上来就代理。
         self.ai_http = ai_http
@@ -754,6 +758,19 @@ class FeedPoller:
             images = list(entry.images or ())
             if not self.cfg.rss_multi_image:
                 images = images[:1]
+            if images and self.library is not None and self.cfg.mirror_images:
+                # 收进图库、换成我们自己的地址（`MIRROR_IMAGES`，ticket #13）。
+                # **单张失败只退回那一张的原 URL**，不影响这条推送。
+                images = list(await asyncio.gather(*(
+                    imagelib.mirror(
+                        self.library, self.http, u,
+                        kind=imagelib.KIND_FEED,
+                        event_date=today(),
+                        source_url=u,
+                        page_url=entry.link,
+                        source_id=entry.key,
+                    ) for u in images
+                )))
             # 多图合并成一条 markdown 时，链接要排在图片**后面**，
             # 所以这里先别把它排进正文（下面单独补 `[打开原文]`）。
             use_md = (

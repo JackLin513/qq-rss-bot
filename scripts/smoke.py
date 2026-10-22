@@ -7935,6 +7935,184 @@ _imgsrv()
 
 
 # ---------------------------------------------------------------------------
+# 第三方图镜像（ticket #13）
+# ---------------------------------------------------------------------------
+
+print("[4.97.2] 第三方图收进图库（开关开 / 关 / 单张降级）")
+
+
+async def _mirror() -> None:
+    """bilibili / 抽票 / RSS 的图 → 下载 → 入库 → 用图库地址。
+
+    三条断言各自对应一个**真实故障模式**：
+
+    * 开关关掉 —— 必须和以前逐字节一致（第三方 URL 直接交给 QQ），否则回滚开关
+      就没意义了；
+    * 单张下载失败 —— **只降级那一张**，不能让整条推送没图；
+    * 图库没配地址 —— 等于没有库，同样是原样返回。
+    """
+    import httpx as _hx  # noqa: PLC0415
+    import tempfile as _tf  # noqa: PLC0415
+
+    from qq_rss_bot import bilibili as _bl  # noqa: PLC0415
+    from qq_rss_bot import config as _cfg  # noqa: PLC0415
+    from qq_rss_bot import imagelib as _il  # noqa: PLC0415
+    from qq_rss_bot import imgsrv as _is  # noqa: PLC0415
+    from qq_rss_bot.db import Database as _DB  # noqa: PLC0415
+    from qq_rss_bot.rss import Entry as _E  # noqa: PLC0415
+    from qq_rss_bot.scheduler import FeedPoller as _FP  # noqa: PLC0415
+
+    jpeg = _BaHttp._FAKE_JPEG
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, blob: bytes) -> None:
+            self.content = blob
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class _Http:
+        """按 URL 决定成功 / 失败 —— 按调用次序注入会被并发 gather 打乱。
+
+        `bad_full` 只让**整图下载**失败（镜像那一步），读宽高（带 `Range` 头）
+        照样成功 —— 这样才能区分「镜像挂了」和「图本身不可达」。
+        """
+
+        def __init__(self, bad: "set[str] | None" = None,
+                     bad_full: "set[str] | None" = None) -> None:
+            self.bad = bad or set()
+            self.bad_full = bad_full or set()
+            self.seen: list[str] = []
+
+        async def get(self, url, **kw):
+            self.seen.append(url)
+            if url in self.bad:
+                raise _hx.ConnectError("镜像下载失败")
+            if url in self.bad_full and "Range" not in (kw.get("headers") or {}):
+                raise _hx.ConnectError("整图下载失败（探测尺寸没问题）")
+            return _Resp(jpeg)
+
+    with _tf.TemporaryDirectory() as td:
+        db = _DB(Path(td) / "bot.db")
+        lib = _il.Library(db, Path(td) / "library", "http://img.test:18080")
+
+        # ---- 1) 开关打开：入库并返回图库地址 ----
+        http = _Http()
+        got = await _il.mirror(
+            lib, http, "https://i1.hdslb.com/cover.jpg",
+            kind=_il.KIND_FEED, event_date="2026-10-22",
+            source_url="https://i1.hdslb.com/cover.jpg",
+            page_url="https://www.bilibili.com/video/BV1xx", source_id="BV1xx")
+        check("★ 开关打开 → 用图库地址", got.startswith("http://img.test:18080/i/"), got)
+        check("★ 第三方域名不出现在结果里", "hdslb" not in got, got)
+        check("  确实下载过那张图", http.seen == ["https://i1.hdslb.com/cover.jpg"],
+              str(http.seen))
+        rows = db.image_refs(kind=_il.KIND_FEED)
+        check("★ 入库的引用带来源（查得到它来自哪条视频）",
+              len(rows) == 1 and rows[0]["source_id"] == "BV1xx"
+              and rows[0]["page_url"].endswith("BV1xx"), str(rows))
+        check("  内容按 sha 落盘", lib.path_of(rows[0]["sha256"], ".jpg").is_file())
+
+        # ---- 2) 开关关掉：原样返回，一次网都不上 ----
+        http = _Http()
+        got = await _il.mirror(
+            lib, http, "https://i1.hdslb.com/cover.jpg", enabled=False,
+            kind=_il.KIND_FEED, event_date="2026-10-22")
+        check("★★ 开关关掉 → 原样返回第三方 URL",
+              got == "https://i1.hdslb.com/cover.jpg", got)
+        check("★ 开关关掉 → 一次下载都不发", http.seen == [], str(http.seen))
+
+        # ---- 3) 单张失败 / 超限：只降级那一张 ----
+        http = _Http(bad={"https://i1.hdslb.com/bad.jpg"})
+        bad = await _il.mirror(
+            lib, http, "https://i1.hdslb.com/bad.jpg",
+            kind=_il.KIND_FEED, event_date="2026-10-22")
+        check("★★ 下载失败 → 退回原 URL（消息照发）",
+              bad == "https://i1.hdslb.com/bad.jpg", bad)
+
+        class _Giant(_Http):
+            async def get(self, url, **kw):
+                return _Resp(b"\xff\xd8\xff" + b"\0" * (_is.MAX_BYTES + 1))
+
+        big = await _il.mirror(
+            lib, _Giant(), "https://i1.hdslb.com/huge.jpg",
+            kind=_il.KIND_FEED, event_date="2026-10-22")
+        check("★ 超过图床上限 → 也退回原 URL", big == "https://i1.hdslb.com/huge.jpg",
+              big)
+
+        # ---- 4) 图库没配对外地址 = 关闭 ----
+        dead = _il.Library(db, Path(td) / "lib2", "")
+        got = await _il.mirror(
+            dead, _Http(), "https://i1.hdslb.com/cover.jpg",
+            kind=_il.KIND_FEED, event_date="2026-10-22")
+        check("图库没配 base → 原样返回", got == "https://i1.hdslb.com/cover.jpg", got)
+
+        # ---- 5) RSS 推送：一条里一张成功、一张失败 ----
+        class _Push:
+            def __init__(self) -> None:
+                self.rich: list[tuple[str, str]] = []
+                self.md: list[str] = []
+
+            async def send_text(self, g, c):
+                pass
+
+            async def send_rich(self, g, c, url):
+                self.rich.append((c, url))
+
+            async def upload_image(self, g, u):
+                return True
+
+            async def send_markdown(self, g, c):
+                self.md.append(c)
+
+        sid, _ = db.add_subscription("G", "https://a.com/f", "源名", 60)
+        db.mark_polled(sid, title="源名", mark_initialized=True)
+        sub = db.list_subscriptions("G")[0]
+        entry = _E("k9", "标题9", "https://a.com/9", None, "",
+                   ("https://cdn.example.com/ok.jpg", "https://cdn.example.com/bad.jpg"))
+
+        md_on = dataclasses.replace(cfg_stub(), multi_image_markdown=True)
+        p = _Push()
+        await _FP(md_on, db,
+                  _Http(bad_full={"https://cdn.example.com/bad.jpg"}),
+                  p, library=lib)._push_entries(sub, "源名", [entry])
+        check("★ 推送走 markdown 一条", len(p.md) == 1, f"{p.md} / {p.rich}")
+        if p.md:
+            check("★ 成功那张换成图库地址",
+                  "http://img.test:18080/i/" in p.md[0], p.md[0][:240])
+            check("★★ 失败那张退回原 URL（其余图正常走图库）",
+                  "https://cdn.example.com/bad.jpg" in p.md[0]
+                  and "cdn.example.com/ok.jpg" not in p.md[0], p.md[0][:240])
+
+        # 开关关掉 → 第三方 URL 原样交给 QQ
+        p = _Push()
+        off = dataclasses.replace(cfg_stub(), mirror_images=False,
+                                  multi_image_markdown=True)
+        await _FP(off, db, _Http(), p, library=lib)._push_entries(sub, "源名", [entry])
+        check("★★ 开关关掉 → 推送里全是第三方 URL",
+              bool(p.md) and "cdn.example.com/ok.jpg" in p.md[0]
+              and "img.test" not in p.md[0], str(p.md)[:240])
+
+        # ---- 6) bilibili 卡片：封面可以外部覆盖 ----
+        data = {"pic": "http://i1.hdslb.com/x.jpg", "title": "标题", "owner": {}}
+        plain = _bl.render(data)
+        check("不传 cover → 用 pic（原行为不变）", "i1.hdslb.com" in plain, plain[:80])
+        over = _bl.render(data, cover="http://img.test:18080/i/abc.jpg")
+        check("★ 传了 cover → 用覆盖后的地址",
+              "img.test" in over and "hdslb" not in over, over[:80])
+        check("★ cover='' → 卡片不带图", "![" not in _bl.render(data, cover=""), "")
+        check("★ 封面 URL 的缩放后缀保留在抓图地址里（否则抓到原图）",
+              (_bl.cover_url("http://i1.hdslb.com/x.jpg") or "").endswith(
+                  _bl._COVER_SUFFIX), _bl.cover_url("http://i1.hdslb.com/x.jpg") or "")
+        db.close()
+
+
+asyncio.run(_mirror())
+
+
+# ---------------------------------------------------------------------------
 # 群复读机
 # ---------------------------------------------------------------------------
 

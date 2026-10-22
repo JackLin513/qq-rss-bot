@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Mapping, Sequence
 
-from . import features, multiimage
+from . import features, imagelib, multiimage
 
 if TYPE_CHECKING:
     import httpx
@@ -722,11 +722,15 @@ async def render_digest(
     cache: dict | None = None,
     width: int = multiimage.COVER_W,
     booths: Mapping[str, Mapping[str, str]] | None = None,
+    library: "imagelib.Library | None" = None,
 ) -> str:
     """列表输出。`wanted` 是要哪几节，见 `SECTIONS`。
 
     `booths` 是 `TicketFeed.covers()` 那份 `{slug: {档位: URL}}`，每场 live
     的封面都在里面。**不传也能跑**，只是退到受付级封面（一半的场没有）。
+
+    `library` 给了就把封面**收进图库**再用（`MIRROR_IMAGES`，ticket #13）。
+    单张失败只退回那张的原 URL。
     """
     sections = plan(recs, now, wanted)
     if not sections:
@@ -747,6 +751,15 @@ async def render_digest(
                 and len("\n".join(lines)) < multiimage.MAX_CHARS - 600
             ):
                 url = cover_url(head, size, booths)
+                if url and library is not None:
+                    url = await imagelib.mirror(
+                        library, http, url,
+                        kind=imagelib.KIND_FEED,
+                        event_date=now.date().isoformat(),
+                        source_url=url,
+                        page_url=head.url,
+                        source_id=head.id,
+                    )
                 wh = await _size_of(http, url, cache) if url else None
                 if wh:
                     used += 1
@@ -814,15 +827,27 @@ async def with_cover(
     cache: dict[str, tuple[int, int] | None] | None = None,
     width: int = multiimage.COVER_W,
     booths: Mapping[str, Mapping[str, str]] | None = None,
+    library: "imagelib.Library | None" = None,
 ) -> str:
     """把封面图那行拼到正文**最上面**（和 `preview.py` 的 bilibili 卡片一致）。
 
     读不到尺寸就**丢图发纯文字** —— 不猜比例。比例猜错图会被拉伸，用户一眼
     看得出来；而且 markdown 的尺寸提示在手机端是必填的，缺了整条都不渲染。
+
+    `library` 给了就先把封面收进图库（ticket #13），失败只退回原 URL。
     """
     url = cover_url(rec, size, booths)
     if not url:
         return text
+    if library is not None:
+        url = await imagelib.mirror(
+            library, http, url,
+            kind=imagelib.KIND_FEED,
+            event_date=datetime.now().date().isoformat(),
+            source_url=url,
+            page_url=rec.url,
+            source_id=rec.id,
+        )
     wh = await _size_of(http, url, cache)
     if not wh:
         _log.info("抽票：封面读不到尺寸，这条不发图（%s）", url)
@@ -840,17 +865,20 @@ class TicketPoller:
     数据模型、轮询节奏、失败语义都不一样，而且 `FeedPoller` 已经很长了。
     """
 
-    def __init__(self, cfg, db, http: "httpx.AsyncClient", pusher) -> None:
+    def __init__(self, cfg, db, http: "httpx.AsyncClient", pusher,
+                 library=None) -> None:
         self.cfg = cfg
         self.db = db
         self.http = http
         self.pusher = pusher
+        # 封面收进图库（ticket #13）。`MIRROR_IMAGES=false` 就等于没有库。
+        self.library = library
         self.feed = TicketFeed(cfg, http)
         self._stopped = asyncio.Event()
         self._size_cache: dict[str, tuple[int, int] | None] = {}
         self._sent_total = 0
-        # 预热 / 预览 / 人工否决。语义和 `FeedPoller` 那套**完全一致**，
-        # 复用同一组配置（`WARMUP_GROUP` / `PREVIEW_GROUP` / 两个秒数）。
+        # 预览 / 人工否决。语义和 `FeedPoller` 那套**完全一致**，
+        # 复用同一组配置（`PREVIEW_GROUP` / `preview_veto_sec`）。
         self._veto = asyncio.Event()
         self._preview_open = False
 
@@ -1034,6 +1062,7 @@ class TicketPoller:
                     self._size_cache,
                     self.cfg.ticket_image_w,
                     booths,
+                    library=self.library if self.cfg.mirror_images else None,
                 )
             label = f"{kind}/{rec.title[:40]}"
             delivered = await self._deliver(text, groups, label)

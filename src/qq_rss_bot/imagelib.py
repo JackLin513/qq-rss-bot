@@ -147,3 +147,43 @@ def _iso(value: datetime | str | None) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+async def mirror(
+    library: "Library | None",
+    http,
+    url: str,
+    *,
+    enabled: bool = True,
+    kind: str,
+    event_date: str,
+    source_url: str = "",
+    page_url: str = "",
+    source_id: str = "",
+) -> str:
+    """第三方图床的图 → **我们自己的图库地址**。失败只降级这一张。
+
+    bilibili / 抽票 / RSS 的图本来就由 QQ 自己去抓，能显示；镜像它们的意义是
+    「图留在自己手里」（第三方删图、防盗链、CDN 换域名都不再影响历史消息）。
+
+    ⚠️ **任何一步不成（下载失败 / 超体积 / 图库没配）都原样返回 `url`** ——
+    一行 markdown 里只有这一张退回第三方地址，其余照常走图库，消息照发。
+    整条发不出去是比「这张从别处加载」严重得多的错误。
+    """
+    if not enabled or library is None or not library.enabled or not url or http is None:
+        return url
+    # 局部 import：preview 依赖 multiimage，模块级互相 import 会绕成环。
+    from . import preview
+
+    raw = await preview.fetch_image(http, url, max_bytes=imgsrv.MAX_BYTES)
+    if raw is None:
+        return url
+    ref = library.store(
+        raw,
+        kind=kind,
+        event_date=event_date,
+        source_url=source_url or url,
+        page_url=page_url,
+        source_id=source_id,
+    )
+    return ref.url if ref is not None else url

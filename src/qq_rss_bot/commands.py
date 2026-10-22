@@ -299,6 +299,7 @@ class CommandHandler:
         pusher: Pusher | None = None,
         notifier: Notifier | None = None,
         ai_http: httpx.AsyncClient | None = None,
+        library=None,
     ) -> None:
         self.cfg = cfg
         self.db = db
@@ -313,6 +314,8 @@ class CommandHandler:
         self.notifier: Notifier = notifier or NullNotifier()
         # 抓正文时直连失败才会用到的备用客户端（走代理）。
         self.ai_http = ai_http
+        # 第三方图收进图库（ticket #13）。`/抽选` 的封面也走这条路。
+        self.library = library
         self._routes = None  # 路由表懒加载，进程内常驻
         self._last_new: dict[str, float] = {}  # /new 的每群冷却
         # 抽票指令的数据源。带 60 秒内存缓存，见 TicketFeed。
@@ -1140,6 +1143,7 @@ class CommandHandler:
             cache=self._ticket_cover_sizes,
             width=self.cfg.ticket_image_w,
             booths=covers,
+            library=self.library if self.cfg.mirror_images else None,
         )
         await self._reply_markdown(ctx, text)
 

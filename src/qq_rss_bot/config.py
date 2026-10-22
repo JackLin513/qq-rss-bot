@@ -133,8 +133,15 @@ class Config:
     # 事后无从发现。
     #
     # 2026-10-18 实测有效（手机端 + 电脑端都确认过）。语法和坑见
-    # `multiimage.py` 的模块说明。**关掉它就退回连发**。
+    # `multiimage.py` 的模块说明。**关掉它只发第一张**（不连发）。
     multi_image_markdown: bool = True
+    # 第三方图床的图（bilibili 封面 / 抽票封面 / RSS 配图）**下载后收进图库**，
+    # 消息里用我们自己的地址。图留在自己手里，第三方删图 / 防盗链 / 换 CDN
+    # 都不再影响历史消息。
+    #
+    # 代价：每条推送多下载、多存几 MB。**单张失败只降级那一张**（退回原 URL），
+    # 消息照发。发现带宽或磁盘吃不消就关掉这个开关（不用回滚代码）。
+    mirror_images: bool = True
     # ---- markdown 多图预热：正式群推送前的两道预热 + 一道人工预览 ----
     #
     # ⚠️ **预热机制已于 2026-10-22 删除。** 当年「冷链接第一次渲染必炸」
@@ -457,6 +464,7 @@ def load_config() -> Config:
         preview_multi_image=_env_bool("PREVIEW_MULTI_IMAGE", True),
         rss_multi_image=_env_bool("RSS_MULTI_IMAGE", True),
         multi_image_markdown=_env_bool("MULTI_IMAGE_MARKDOWN", True),
+        mirror_images=_env_bool("MIRROR_IMAGES", True),
         preview_group=_env_str("PREVIEW_GROUP", ""),
         preview_veto_sec=_env_int("PREVIEW_VETO_SEC", 30),
         push_summary=_env_bool("PUSH_SUMMARY", True),
