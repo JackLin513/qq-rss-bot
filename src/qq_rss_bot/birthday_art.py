@@ -704,12 +704,16 @@ class XSearch:
 class BirthdayArtPoller:
     """每天定时收贺图。结构和 `BirthdayPoller` 同构：slot / 窗口 / 逐群隔离。"""
 
-    def __init__(self, cfg, db, sender, media_http, notifier=None) -> None:
+    def __init__(self, cfg, db, sender, media_http, notifier=None, *,
+                 groups_override: tuple[str, ...] | None = None) -> None:
         self.cfg = cfg
         self.db = db
         self.sender = sender
         self.http = media_http
         self.notifier = notifier
+        # 只给探针/测试用：把「发哪些群」钉死，不去动库里的开关。
+        # 生产路径永远是 None，走 `groups` 属性（每拍重查库）。
+        self._groups_override = groups_override
         self._stopped = asyncio.Event()
         self._calendar: birthday_module.Calendar | None = None
         self._calendar_tried = False
@@ -721,6 +725,8 @@ class BirthdayArtPoller:
 
         群开关存在库里（见 `features.py`），`.env` 里**一个群参数都没有**。
         """
+        if self._groups_override is not None:
+            return self._groups_override
         return features.groups_for(self.db, "birthday_art")
 
     @property

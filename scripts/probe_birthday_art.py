@@ -233,10 +233,11 @@ async def main() -> int:
         # 把窗口临时收成「刚好用完」，好让它立刻发而不是等下一拍。
         run_cfg = dataclasses.replace(
             cfg,
-            birthday_art_groups=(group,),
             birthday_art_window_sec=int(max(late, 0)) + birthday_art.CHECK_SEC,
         )
-    poller = birthday_art.BirthdayArtPoller(run_cfg, db, sender, None)
+    poller = birthday_art.BirthdayArtPoller(
+        run_cfg, db, sender, None,
+        groups_override=(group,) if do_send else None)
 
     if not do_search:
         print("\n（离线模式：没上过网。加 --search 才真去搜一次）")
