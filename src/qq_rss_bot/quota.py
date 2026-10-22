@@ -48,8 +48,6 @@ class Pusher(Protocol):
 
     async def upload_image(self, group_openid: str, image_url: str) -> bool: ...
 
-    async def send_local_image(self, group_openid: str, content: str, path: Path) -> None: ...
-
     async def send_video(self, group_openid: str, path: Path) -> None: ...
 
     async def send_voice(self, group_openid: str, path: Path) -> None: ...
@@ -170,24 +168,11 @@ class GroupSender:
             group_openid, lambda: self.pusher.send_markdown(group_openid, content)
         )
 
-    async def send_local_image(self, group_openid: str, content: str, path: Path) -> None:
-        """发一条「文字 + 本地图片」的富媒体消息（`file_type=1` + `msg_type=7`）。
-
-        **和 `upload_image` 的语义完全不同，别混**：那个只上传、不发消息，所以
-        不占配额也不进令牌桶；这个上传完就真发一条，所以**照常走 `_send`**。
-
-        ⚠️ **算一条主动消息**：月曜那条播报现在是「文案+表情包」一条、视频
-        一条，**一次播报吃两条配额**。
-        """
-        await self._send(
-            group_openid, lambda: self.pusher.send_local_image(group_openid, content, path)
-        )
-
     async def send_video(self, group_openid: str, path: Path) -> None:
         """发一条视频（`file_type=2` + `msg_type=7`）。
 
         **没有 `content`** —— 视频那条 `content` 客户端不渲染（见 `RssBot.send_video`），
-        所以文案必须由调用方另发一条（`send_local_image` 或 `send_text`）。
+        所以文案必须由调用方另发一条（`send_markdown` 或 `send_text`）。
 
         **和 `upload_image` 的语义完全不同，别混**：那个只上传、不发消息，所以
         不占配额也不进令牌桶；这个上传完就真发一条，所以**照常走 `_send`**

@@ -7,16 +7,15 @@
 
 **2026-10-20 起是「两条消息」**（原先只有一条语音，而**群里没人点开听**）：
 
-    ① msg_type=7：头像 + 「角色名\n日语原文」     ← send_local_image
-    ② msg_type=7：语音                            ← send_voice
+    ① markdown：头像 + 「角色名\n日语原文」     ← send_markdown（图走图库）
+    ② msg_type=7：语音                          ← send_voice
 
-`msg_type=7` 的 `MediaInfo` 只有一个 `file_info`，一条只能带一个媒体，
-所以必然是两条。**图片那条的 `content` 是渲染的**（实测过），文字就搭在图上。
+语音没法塞进 markdown（`file_type=3` 是富媒体），所以必然是两条。
 两条之间隔 `MESSAGE_GAP_SEC`（2 秒），挨太近客户端可能把气泡叠在一起。
 
-**不走 markdown**：markdown 的图必须公网 URL、由 QQ 自己派服务器去拉，
-本地头像一个字节都送不进去。180×180 在 `msg_type=7` 下渲染出来的大小
-客户端自己定，实测**够用**，所以 `#Wpx #Hpx` 那套用不上。
+⚠️ **2026-10-22 之前头像是 base64 上传**（`send_local_image`），理由是「markdown
+的图必须公网 URL、QQ 派服务器去拉，本地头发不出去」。现在有了自建图床，
+头像先入库、再由图床用自己的地址发 —— 那条推理不再成立。
 
 **失败语义两条故意不一样**（这是最容易写反的地方）：
 

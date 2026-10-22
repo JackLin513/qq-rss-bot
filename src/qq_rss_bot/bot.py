@@ -108,30 +108,8 @@ class RssBot(botpy.Client):
             ai_http=self.media_http,
         )
         self._poller_task: Any = None
-        # 抽票提醒（ASOBI TICKET）。**单独一个 task**，不塞进 FeedPoller ——
-        # 数据源、轮询节奏、失败语义都不一样。没配 TICKET_GROUPS 时
-        # `run()` 会立刻返回，等于功能关闭。
-        self.tickets = TicketPoller(cfg, self.db, self.rss_http, self.sender)
-        self._ticket_task: Any = None
-        # 「月曜が近いよ」每周播报。同样单独一个 task。没配 MONDAY_GROUPS 时
-        # `run()` 立刻返回，等于功能关闭。
-        self.monday = MondayPoller(cfg, self.db, self.sender)
-        self._monday_task: Any = None
-        # 每日早安语音。同样单独一个 task，没配 MORNING_GROUPS 时 `run()`
-        # 立刻返回，等于功能关闭。
-        self.morning = MorningPoller(cfg, self.db, self.sender)
-        self._morning_task: Any = None
-        # 偶像生日推送。同样单独一个 task。它和上面几个的**唯一结构差别**是
-        # 要自己去抓推文，所以多收一个 **`media_http`**（带代理的那个）——
-        # 容器直连 x.com / pbs.twimg.com 全不通，见 birthday.py 的模块说明。
-        self.birthday = BirthdayPoller(cfg, self.db, self.sender, self.media_http)
-        self._birthday_task: Any = None
-        # 誕生祭贺图：**带 cookie 直接打 X 的 GraphQL**（不是 RSS，也不是爬 HTML），
-        # 所以同样收 `media_http`（带代理的那个）。多一个 `notifier` 是因为
-        # **cookie 失效的症状是「群里今天没图」**，和「今天真没人画」长得一样，
-        # 只能走私聊告警。见 birthday_art.py 的模块说明。
-        #
-        # `imgsrv` 是**自建图床**：markdown 的图由 QQ 的服务器去抓，而它在大陆机房
+        # ---- 图库 + 图床（**必须在所有轮询器之前建**）----
+        # `imgsrv` 是自建图床：markdown 的图是 QQ 的服务器去抓的，而它在大陆机房
         # 够不到 pbs.twimg.com —— 所以图先落本地、用我们自己的公网地址给它抓。
         # 端口开不起来不拖垮机器人（`start()` 只打 WARNING）。
         lib_dir = cfg.imagelib_dir or (cfg.db_path.parent / "library")
@@ -139,6 +117,30 @@ class RssBot(botpy.Client):
         self.imgsrv = imgsrv.ImageServer(
             self.library.root, cfg.imgsrv_base, port=cfg.imgsrv_port)
         self.imgsrv.start()
+        # 抽票提醒（ASOBI TICKET）。**单独一个 task**，不塞进 FeedPoller ——
+        # 数据源、轮询节奏、失败语义都不一样。没配 TICKET_GROUPS 时
+        # `run()` 会立刻返回，等于功能关闭。
+        self.tickets = TicketPoller(cfg, self.db, self.rss_http, self.sender)
+        self._ticket_task: Any = None
+        # 「月曜が近いよ」每周播报。同样单独一个 task。没配 MONDAY_GROUPS 时
+        # `run()` 立刻返回，等于功能关闭。
+        self.monday = MondayPoller(cfg, self.db, self.sender, library=self.library)
+        self._monday_task: Any = None
+        # 每日早安语音。同样单独一个 task，没配 MORNING_GROUPS 时 `run()`
+        # 立刻返回，等于功能关闭。
+        self.morning = MorningPoller(cfg, self.db, self.sender, library=self.library)
+        self._morning_task: Any = None
+        # 偶像生日推送。同样单独一个 task。它和上面几个的**唯一结构差别**是
+        # 要自己去抓推文，所以多收一个 **`media_http`**（带代理的那个）——
+        # 容器直连 x.com / pbs.twimg.com 全不通，见 birthday.py 的模块说明。
+        self.birthday = BirthdayPoller(cfg, self.db, self.sender, self.media_http,
+                                       library=self.library)
+        self._birthday_task: Any = None
+        # 誕生祭贺图：**带 cookie 直接打 X 的 GraphQL**（不是 RSS，也不是爬 HTML），
+        # 所以同样收 `media_http`（带代理的那个）。多一个 `notifier` 是因为
+        # **cookie 失效的症状是「群里今天没图」**，和「今天真没人画」长得一样，
+        # 只能走私聊告警。见 birthday_art.py 的模块说明。
+        #
         self.birthday_art = BirthdayArtPoller(
             cfg, self.db, self.sender, self.media_http, notifier=self.notifier,
             library=self.library,
@@ -757,50 +759,6 @@ class RssBot(botpy.Client):
             media={"file_info": file_info},
         )
 
-    async def send_local_image(self, group_openid: str, content: str, path: Path) -> None:
-        """主动发一条「文字 + 本地图片」（`file_type=1` + `msg_type=7`）。
-
-        和 `send_rich` 的唯一区别是**图片来源**：那个给 URL 让 QQ 自己去下，
-        这个由我们把字节 base64 传上去。本地素材（表情包）没有 URL 可给，
-        所以走这条。
-
-        ⚠️ **`msg_type=7` 带图片时 `content` 是渲染的**（带视频时不渲染，
-        见 `send_video`）—— 这就是「文案 + 表情包」能挤进一条消息的原因。
-
-        ⚠️ 机器人发不了**真·表情包**：QQ 的表情包是客户端的东西，bot API 里
-        没有对应的 `msg_type`。这里发出去的是普通图片。
-        """
-        raw = Path(path).read_bytes()
-        payload = base64.b64encode(raw).decode()
-        # 和 `_upload_image` 同一道闸：`file_data` 官方限 5M，限的是 base64 之后
-        # 那一串。超了直接抛（不像 preview 那条路降级成无图）—— 这里图就是主体，
-        # 悄悄少一张图等于文案白改。
-        if len(payload) > preview.MAX_FILE_DATA_BYTES:
-            raise RuntimeError(
-                f"图片 {Path(path).name} 原始 {len(raw)} 字节、base64 后 {len(payload)} 字节，"
-                f"超 QQ 的 {preview.MAX_FILE_DATA_BYTES} 直传上限"
-            )
-        media = await self.api.post_group_file(
-            group_openid=group_openid,
-            file_type=1,  # 1=图片
-            file_data=payload,
-            srv_send_msg=False,  # 只上传拿 file_info，不单独发一条
-        )
-        file_info = media.get("file_info") if isinstance(media, dict) else None
-        if not file_info:
-            raise RuntimeError(f"上传图片未拿到 file_info: {media!r}")
-
-        resp = await self.api.post_group_message(
-            group_openid=group_openid,
-            msg_type=7,  # 7=富媒体（图文）
-            content=content,
-            media={"file_info": file_info},
-        )
-        # 同 send_markdown：业务错误码是 200 带 code 回来的，不判就会被当成成功。
-        code = resp.get("code") if isinstance(resp, dict) else None
-        if code:
-            raise RuntimeError(f"发送图片失败 code={code}: {resp}")
-
     async def send_markdown(self, group_openid: str, content: str) -> None:
         """主动发 markdown（`msg_type=2`）。
 
@@ -833,8 +791,8 @@ class RssBot(botpy.Client):
         `content` 会渲染，带**视频**时**客户端整个丢掉** —— 实测过：接口回
         HTTP 200、`file_info` 也拿到了，群里就是只有视频、一个字都没有。
         `MediaInfo` 里也只有 `file_info`，没有 caption/title 字段可挂。
-        所以「文案 + 视频」只能拆成**两条消息**（文案跟图走，见
-        `send_local_image`），别想着在这里塞文字。
+        所以「文案 + 视频」只能拆成**两条消息**（文案那条跟图走，见
+        `send_markdown`），别想着在这里塞文字。
 
         **走 base64 而不是 URL**：URL 形态要 QQ 的服务器自己去下载，而它连
         `i.ytimg.com` 都拉不到（`850027`）；本地素材更没有 URL 可给。

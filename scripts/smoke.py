@@ -5267,6 +5267,12 @@ class _MondaySender:
         self.calls.append(("text", group))
         self.captions.append((group, content, None))
 
+    async def send_markdown(self, group: str, content: str) -> None:
+        if group in self.fail:
+            raise RuntimeError("模拟发送失败")
+        self.calls.append(("markdown", group))
+        self.captions.append((group, content, None))
+
     async def send_local_image(self, group: str, content: str, path) -> None:
         if group in self.fail:
             raise RuntimeError("模拟发送失败")
@@ -5533,7 +5539,7 @@ def _check_md_poller() -> None:
                 # --- 库里一个群都没开 = 功能关闭 ---
                 s0 = _MondaySender()
                 check("★ 库里一个群都没开 → 一条都不发",
-                      await _md.MondayPoller(cfg, db, s0).poll_once(now=now) == 0)
+                      await _md.MondayPoller(cfg, db, s0, library=_LibStub()).poll_once(now=now) == 0)
                 check("★ 没开群时不发（sender 没被调用）",
                       s0.videos == [] and s0.captions == [])
 
@@ -5541,22 +5547,24 @@ def _check_md_poller() -> None:
                 _enable(db, "monday", "G1", "G2")
 
                 # --- 正常播报 ---
-                sender = _MondaySender()
-                poller = _md.MondayPoller(cfg, db, sender)
+                sender, lib = _MondaySender(), _LibStub()
+                poller = _md.MondayPoller(cfg, db, sender, library=lib)
                 check("★ 窗口内发到 2 个群",
                       await poller.poll_once(now=now) == 2, str(sender.videos))
                 check("★ 文案就是「月曜が近いよ」（不带「あと N 時間」）",
-                      all(c == "月曜が近いよ" for _, c, _ in sender.captions),
+                      all(c.startswith("月曜が近いよ") for _, c, _ in sender.captions),
                       str(sender.captions))
-                check("★ 文案跟**表情包**走（send_local_image，不是纯文本）",
-                      all(st is not None and st.endswith(".jpg")
-                          for _, _, st in sender.captions), str(sender.captions))
+                check("★ 文案里带表情包（markdown 里的图库地址，不是纯文本）",
+                      all("![图1" in c for _, c, _ in sender.captions)
+                      and len(lib.stored) == 1, str(sender.captions)[:200])
+                check("★ 表情包只入库一次（两个群共用同一个地址）",
+                      len(lib.stored) == 1, str(len(lib.stored)))
                 check("★ **两条消息**：文案一条、视频一条（不是一条）",
-                      sender.calls == [("image", "G1"), ("video", "G1"),
-                                       ("image", "G2"), ("video", "G2")],
+                      sender.calls == [("markdown", "G1"), ("video", "G1"),
+                                       ("markdown", "G2"), ("video", "G2")],
                       str(sender.calls))
                 check("★ 顺序是文案在前、视频在后",
-                      all(c[0] == "image" for c in sender.calls[::2])
+                      all(c[0] == "markdown" for c in sender.calls[::2])
                       and all(c[0] == "video" for c in sender.calls[1::2]),
                       str(sender.calls))
                 check("★ 视频那条**不带文案**（带了客户端也丢掉，只会误导）",
@@ -5572,7 +5580,7 @@ def _check_md_poller() -> None:
                 # --- 幂等：同一个 slot 再跑一次，一条都不发 ---
                 again = _MondaySender()
                 check("★ 同一 slot 第二次 → 0 条",
-                      await _md.MondayPoller(cfg, db, again).poll_once(now=now) == 0)
+                      await _md.MondayPoller(cfg, db, again, library=_LibStub()).poll_once(now=now) == 0)
                 check("★ 第二次真的没调用 sender",
                       again.videos == [] and again.captions == [])
 
@@ -5582,7 +5590,7 @@ def _check_md_poller() -> None:
                 try:
                     s2 = _MondaySender()
                     check("★ 周一才起来 → 不发（不补发）",
-                          await _md.MondayPoller(cfg, db2, s2).poll_once(now=late) == 0)
+                          await _md.MondayPoller(cfg, db2, s2, library=_LibStub()).poll_once(now=late) == 0)
                     check("★ 窗口外真的没调用 sender",
                           s2.videos == [] and s2.captions == [])
                 finally:
@@ -5593,10 +5601,10 @@ def _check_md_poller() -> None:
                 try:
                     s3 = _MondaySender(fail={"G1"})
                     check("★ 一个群失败时其余群照发",
-                          await _md.MondayPoller(cfg, db3, s3).poll_once(now=now) == 1,
+                          await _md.MondayPoller(cfg, db3, s3, library=_LibStub()).poll_once(now=now) == 1,
                           str(s3.videos))
                     check("★ G1 挂了之后 G2 的两条都发出去了",
-                          s3.calls == [("image", "G2"), ("video", "G2")], str(s3.calls))
+                          s3.calls == [("markdown", "G2"), ("video", "G2")], str(s3.calls))
                     check("★ 失败的群**不记账**（窗口内下次 tick 会重试）",
                           db3.monday_posted("2026-10-18T22:00") == {"G2"},
                           str(db3.monday_posted("2026-10-18T22:00")))
@@ -5611,7 +5619,7 @@ def _check_md_poller() -> None:
                     s4 = _MondaySender()
                     cfg4 = replace(cfg, monday_video_dir=empty)
                     check("★ 目录里没有素材 → 0 条、不抛",
-                          await _md.MondayPoller(cfg4, db4, s4).poll_once(now=now) == 0)
+                          await _md.MondayPoller(cfg4, db4, s4, library=_LibStub()).poll_once(now=now) == 0)
                     check("★ 没素材时没调用 sender",
                           s4.videos == [] and s4.captions == [])
                     check("★ 没素材时不记账（下周还能补上）",
@@ -5625,7 +5633,7 @@ def _check_md_poller() -> None:
                     db5.mark_monday_posted("2026-10-11T22:00", "G1", "a.mp4")
                     check("★ 记住了上次发的", db5.monday_last_video() == "a.mp4")
                     s5 = _MondaySender()
-                    await _md.MondayPoller(cfg, db5, s5).poll_once(now=now)
+                    await _md.MondayPoller(cfg, db5, s5, library=_LibStub()).poll_once(now=now)
                     check("★ 这周避开了上周那个",
                           all(Path(p).name == "b.mp4" for _, p in s5.videos),
                           str(s5.videos))
@@ -5636,11 +5644,11 @@ def _check_md_poller() -> None:
                 db6 = _mdb("t6.db")
                 try:
                     s6 = _MondaySender(fail_video={"G1"})
-                    p6 = _md.MondayPoller(cfg, db6, s6)
+                    p6 = _md.MondayPoller(cfg, db6, s6, library=_LibStub())
                     check("★ 视频挂了 → 那个群不算发成功",
                           await p6.poll_once(now=now) == 1, str(s6.videos))
                     check("★ 视频挂了但文案照样发（两条互不连累）",
-                          ("image", "G1") in s6.calls, str(s6.calls))
+                          ("markdown", "G1") in s6.calls, str(s6.calls))
                     check("★ 视频挂了 → 那个群**不记账**（窗口内会重试）",
                           db6.monday_posted("2026-10-18T22:00") == {"G2"},
                           str(db6.monday_posted("2026-10-18T22:00")))
@@ -5665,7 +5673,7 @@ def _check_md_poller() -> None:
                     noimg = _md_dir_with(tmp / "nosticker", appledouble=True)
                     cfg7 = replace(cfg, monday_video_dir=noimg)
                     check("★ 没表情包也照发",
-                          await _md.MondayPoller(cfg7, db7, s7).poll_once(now=now) == 2)
+                          await _md.MondayPoller(cfg7, db7, s7, library=_LibStub()).poll_once(now=now) == 2)
                     check("★ 没表情包时文案走 msg_type=0（send_text）",
                           [c[0] for c in s7.calls] == ["text", "video", "text", "video"],
                           str(s7.calls))
@@ -5701,7 +5709,6 @@ class _MondayBotStub:
     """只借 `RssBot` 的两个发送方法，不真造 botpy Client。"""
 
     send_video = _RssBot.send_video
-    send_local_image = _RssBot.send_local_image
 
     def __init__(self, api) -> None:
         self.api = api
@@ -5763,49 +5770,6 @@ def _check_md_send_video() -> None:
             except RuntimeError as exc:
                 check("★ 200 带 code 也算失败（40093011）",
                       "40093011" in str(exc), str(exc))
-
-            # ---- send_local_image：文案 + 表情包挤进**一条**消息 ----
-            img = tmp / "月曜が近いよ.jpg"
-            img.write_bytes(b"\xff\xd8\xff" + b"j" * 4096)
-            api4 = _MondayApi()
-            await _MondayBotStub(api4).send_local_image("G1", "月曜が近いよ", img)
-            check("★ 图片上传走 file_type=1（图片，不是 2 视频）",
-                  api4.uploads and api4.uploads[0]["file_type"] == 1, str(api4.uploads))
-            check("★ 图片上传带 file_data、不带 url",
-                  "file_data" in api4.uploads[0] and "url" not in api4.uploads[0],
-                  str(list(api4.uploads[0])))
-            check("★ 图片也是 srv_send_msg=False（先传后发，两步）",
-                  api4.uploads[0]["srv_send_msg"] is False, str(api4.uploads[0]))
-            check("★ 图文走 msg_type=7",
-                  api4.sent and api4.sent[0]["msg_type"] == 7, str(api4.sent))
-            check("★ **文案和表情包在同一条消息里**（图片这条路 content 是渲染的）",
-                  api4.sent[0]["content"] == "月曜が近いよ", str(api4.sent))
-            check("★ 图文只发了**一条**消息（不是拆两条）",
-                  len(api4.sent) == 1, str(api4.sent))
-
-            # 图片 base64 后超 5M 要抛，不能静默少一张图
-            huge_img = tmp / "huge.jpg"
-            with huge_img.open("wb") as fh:
-                fh.truncate(_pv.MAX_FILE_DATA_BYTES)   # base64 后必然超
-            api5 = _MondayApi()
-            try:
-                await _MondayBotStub(api5).send_local_image("G1", "x", huge_img)
-                check("★ 图片超 5M 应当抛", False)
-            except RuntimeError as exc:
-                check("★ 图片 base64 后超 5M 抛 RuntimeError（不静默少一张图）",
-                      "上限" in str(exc), str(exc))
-            check("★ 图片超限时一个请求都没发",
-                  api5.uploads == [] and api5.sent == [], str(api5.uploads))
-
-            # 上传拿不到 file_info 也要抛
-            api6 = _MondayApi()
-            api6.no_file_info = True
-            try:
-                await _MondayBotStub(api6).send_local_image("G1", "x", img)
-                check("★ 没拿到 file_info 应当抛", False)
-            except RuntimeError as exc:
-                check("★ 上传没 file_info → 抛（不当成发送成功）",
-                      "file_info" in str(exc), str(exc))
 
     asyncio.run(run())
 
@@ -5908,6 +5872,14 @@ class _MorningSender:
             raise RuntimeError("模拟发图失败")
         self.images.append((group, content, str(path)))
         self.events.append(("image", group))
+
+    async def send_markdown(self, group: str, content: str) -> None:
+        """2026-10-22 起头像走 markdown（不再 base64）。`images` 的第三项是空串 ——
+        图不在本地路径里了，要从假图库的 `stored` 里查 `source_id`。"""
+        if group in self.fail_image:
+            raise RuntimeError("模拟发图失败")
+        self.images.append((group, content, ""))
+        self.events.append(("markdown", group))
 
 
 # 假 manifest 用的角色名。**故意让 `ja` 带 `[softly] ` 语气提示** ——
@@ -6269,27 +6241,29 @@ def _check_mn_card() -> None:
             mdir = _mn_dir(Path(td), idols=("mano", "hiori"), per=2,
                            avatars=True, names=True)
             cfg = dataclasses.replace(base, morning_dir=mdir)
-            db, sender = _enable(_MorningDb(), "morning", "G1"), _MorningSender()
-            n = asyncio.run(_mn.MorningPoller(cfg, db, sender).poll_once(
+            db, sender, lib = _enable(_MorningDb(), "morning", "G1"), _MorningSender(), _LibStub()
+            n = asyncio.run(_mn.MorningPoller(cfg, db, sender, library=lib).poll_once(
                 now=datetime(2026, 10, 20, 7, 30)))
 
             check("★ 一个群发**两条**：图一条、语音一条",
                   n == 1 and len(sender.images) == 1 and len(sender.voices) == 1,
                   f"n={n} images={sender.images} voices={sender.voices}")
-            check("★ 到达顺序是 image → voice（反了群里看着莫名其妙）",
-                  sender.events == [("image", "G1"), ("voice", "G1")],
+            check("★ 到达顺序是 markdown → voice（反了群里看着莫名其妙）",
+                  sender.events == [("markdown", "G1"), ("voice", "G1")],
                   str(sender.events))
-            idol = Path(sender.images[0][2]).stem
+            check("★ 头像入库一次，`source_id` 就是偶像 id",
+                  len(lib.stored) == 1
+                  and lib.stored[0][1]["source_id"].endswith(".png"),
+                  str(lib.stored[0][1] if lib.stored else None))
+            idol = Path(str(lib.stored[0][1]["source_id"])).stem
             check("★ 图和语音是**同一位偶像**（选人在循环外，不会错位）",
                   Path(sender.voices[0][1]).stem.rpartition("_")[0] == idol,
                   f"{sender.images[0][2]} vs {sender.voices[0][1]}")
-            check("★ 正文 = 角色名 + 剥过提示的原文",
-                  sender.images[0][1] == f"{_MN_NAMES[idol]}\n{_MN_JA}",
-                  repr(sender.images[0][1]))
-            check("头像按 id 取 `avatar/<偶像 id>.png`",
-                  Path(sender.images[0][2]).parent.name == "avatar"
-                  and Path(sender.images[0][2]).name == f"{idol}.png",
-                  sender.images[0][2])
+            check("★ 正文 = 角色名 + 剥过提示的原文（后面跟图片那一行）",
+                  sender.images[0][1].startswith(f"{_MN_NAMES[idol]}\n{_MN_JA}"),
+                  repr(sender.images[0][1][:80]))
+            check("★ 图是 markdown 里的图库地址（不是 base64）",
+                  "![图1" in sender.images[0][1], repr(sender.images[0][1][:120]))
             check("记账记的是 **silk 文件名**，不是索引",
                   db.rows[0][3] == Path(sender.voices[0][1]).name, str(db.rows))
 
@@ -6310,7 +6284,7 @@ def _check_mn_card() -> None:
             # ① 发图挂了 → 整轮不算数：不记账，窗口内下一拍重试
             db1 = _enable(_MorningDb(), "morning", "G1", "G2", "G3")
             s1 = _MorningSender(fail_image={"G2"})
-            n1 = asyncio.run(_mn.MorningPoller(cfg, db1, s1).poll_once(now=now))
+            n1 = asyncio.run(_mn.MorningPoller(cfg, db1, s1, library=_LibStub()).poll_once(now=now))
             check("★ 发图失败 → 那个群**不记账**（窗口内下一拍会重试）",
                   n1 == 2 and db1.morning_posted(slot_key) == {"G1", "G3"},
                   f"n={n1} posted={db1.morning_posted(slot_key)}")
@@ -6320,15 +6294,15 @@ def _check_mn_card() -> None:
             # ② 语音挂了 → 只记 WARNING，**照样记账**（图已经发出去了）
             db2 = _enable(_MorningDb(), "morning", "G1", "G2", "G3")
             s2 = _MorningSender(fail={"G2"})
-            n2 = asyncio.run(_mn.MorningPoller(cfg, db2, s2).poll_once(now=now))
+            n2 = asyncio.run(_mn.MorningPoller(cfg, db2, s2, library=_LibStub()).poll_once(now=now))
             check("★ 语音失败 → **仍然记账**（图已发，再退一次就是重复刷屏）",
                   n2 == 3 and db2.morning_posted(slot_key) == {"G1", "G2", "G3"},
                   f"n={n2} posted={db2.morning_posted(slot_key)}")
             check("语音失败的那个群**图照样发出去了**",
                   {g for g, _, _ in s2.images} == {"G1", "G2", "G3"}, str(s2.images))
             check("★ 一个群失败不连累别的群（三群各自独立）",
-                  s1.events == [("image", "G1"), ("voice", "G1"),
-                                ("image", "G3"), ("voice", "G3")],
+                  s1.events == [("markdown", "G1"), ("voice", "G1"),
+                                ("markdown", "G3"), ("voice", "G3")],
                   str(s1.events))
 
         # ---- 缺材料 → 退回**纯语音**（= 加这个功能之前的行为）----
@@ -6360,94 +6334,6 @@ def _check_mn_card() -> None:
           src.count("asyncio.sleep") == 1, str(src.count("asyncio.sleep")))
     check("★ 头像**按 id 取文件，不扫目录**（源码里没有 glob）",
           "avatar_dir /" in src and "glob" not in src, "")
-
-
-def _check_mn_send_local_image() -> None:
-    """`bot.send_local_image` —— 「文字 + 本地图片」那条路（`file_type=1`）。"""
-    import base64  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
-
-    from qq_rss_bot import preview as _pv  # noqa: PLC0415
-    from qq_rss_bot.bot import RssBot as _RB  # noqa: PLC0415
-
-    class Stub:
-        send_local_image = _RB.send_local_image
-
-        def __init__(self, api) -> None:
-            self.api = api
-
-    async def run() -> None:
-        with tempfile.TemporaryDirectory() as td:
-            png = Path(td) / "mano.png"
-            png.write_bytes(_MN_PNG)
-
-            api = _MondayApi()
-            await Stub(api).send_local_image("G1", "櫻木真乃\nおはよう", png)
-            check("★ 上传走 file_type=1（图片）",
-                  api.uploads and api.uploads[0]["file_type"] == 1, str(api.uploads))
-            check("上传带的是 file_data（base64），不是 url",
-                  "file_data" in api.uploads[0] and "url" not in api.uploads[0],
-                  str(list(api.uploads[0])))
-            check("srv_send_msg=False（先传后发，两步）",
-                  api.uploads[0]["srv_send_msg"] is False, str(api.uploads[0]))
-            check("★ base64 的**是文件字节**（不是路径、不是空）",
-                  base64.b64decode(api.uploads[0]["file_data"]) == _MN_PNG)
-            check("★ 正文走 msg_type=7（富媒体）",
-                  api.sent and api.sent[0]["msg_type"] == 7, str(api.sent))
-            check("media 里带上传拿到的 file_info",
-                  api.sent[0]["media"] == {"file_info": "FI-123"}, str(api.sent))
-            check("★ **content 是渲染的** —— 文字就搭在图上（和视频那条正好相反）",
-                  api.sent[0]["content"] == "櫻木真乃\nおはよう",
-                  repr(api.sent[0]["content"]))
-            check("★ 签名里有 content 形参（文字只能从这儿进去）",
-                  "content" in _RB.send_local_image.__code__.co_varnames,
-                  str(_RB.send_local_image.__code__.co_varnames))
-            check("对照：`send_video` 签名里**没有** content（视频的 content 会被丢掉）",
-                  "content" not in _RB.send_video.__code__.co_varnames,
-                  str(_RB.send_video.__code__.co_varnames))
-
-            # 上传没拿到 file_info → 抛，且**一条消息都不发**
-            api2 = _MondayApi()
-            api2.no_file_info = True
-            try:
-                await Stub(api2).send_local_image("G1", "x", png)
-                r2 = False
-            except RuntimeError:
-                r2 = True
-            check("★ 上传没拿到 file_info → 抛 RuntimeError", r2)
-            check("★ 那时**一条消息都没发**（不发空图）",
-                  not api2.sent, str(api2.sent))
-
-            # 200 带业务错误码也算失败
-            api3 = _MondayApi()
-            api3.fail_send = 40093011
-            try:
-                await Stub(api3).send_local_image("G1", "x", png)
-                r3 = False
-            except RuntimeError:
-                r3 = True
-            check("200 带 code 也算失败（不静默当成发送成功）", r3)
-
-            # base64 之后超限 → **一个请求都不发**
-            api4 = _MondayApi()
-            old = _pv.MAX_FILE_DATA_BYTES
-            _pv.MAX_FILE_DATA_BYTES = 16
-            try:
-                try:
-                    await Stub(api4).send_local_image("G1", "x", png)
-                    r4 = False
-                except RuntimeError:
-                    r4 = True
-            finally:
-                _pv.MAX_FILE_DATA_BYTES = old
-            check("★ base64 后超 5 MiB → 抛 RuntimeError（**限的是 base64，不是原始字节**）",
-                  r4)
-            check("★ 超限时**一个请求都没发出去**",
-                  not api4.uploads and not api4.sent, f"{api4.uploads} {api4.sent}")
-            check("对照：`MAX_FILE_DATA_BYTES` 是 5 MiB（= 原图 3.75 MiB 余量）",
-                  old == 5 * 1024 * 1024, str(old))
-
-    asyncio.run(run())
 
 
 def _check_mn_lines_table() -> None:
@@ -6503,7 +6389,6 @@ _check_mn_list_voices()
 _check_mn_poller()
 _check_mn_send_voice()
 _check_mn_card()
-_check_mn_send_local_image()
 _check_mn_lines_table()
 
 # ---------------------------------------------------------------------------
@@ -6576,6 +6461,12 @@ class _BdSender:
         if group in self.fail:
             raise RuntimeError("模拟发送失败")
         self.images.append((group, content, Path(path).read_bytes()))
+
+    async def send_markdown(self, group: str, content: str) -> None:
+        """2026-10-22 起配图走 markdown + 图库，不再 base64。"""
+        if group in self.fail:
+            raise RuntimeError("模拟发送失败")
+        self.images.append((group, content, b""))
 
 
 class _BdResp:
@@ -6752,14 +6643,18 @@ def _check_bd_poller() -> None:
             # ---- 抓图那拍：发图文，两个群同一条 ----
             db = _enable(_BdDb(), "birthday", "G1", "G2")
             sender, http = _BdSender(), _BdHttp(page)
-            p = _bd.BirthdayPoller(cfg, db, sender, http)
+            p = _bd.BirthdayPoller(cfg, db, sender, http, library=_LibStub())
             n = await p.poll_once(now=at_slot)
             check("★ 23:05 准点抓到图，发给两个群", n == 2, str(n))
             check("★ 两个群拿到**同一份文案和同一张图**（多群不会精神分裂）",
                   len({i[1] for i in sender.images}) == 1
                   and len({i[2] for i in sender.images}) == 1, str(sender.images))
-            check("发的是**图文**（`send_local_image`），不是纯文字",
-                  not sender.texts and len(sender.images) == 2, f"{sender.images} {sender.texts}")
+            check("发的是**图文**（markdown，不是纯文字）",
+                  not sender.texts and len(sender.images) == 2,
+                  f"{sender.images} {sender.texts}")
+            check("★ 图是图库地址（不是 base64，也不是推特的 URL）",
+                  all("![图1" in i[1] and "img.test" in i[1] for i in sender.images),
+                  repr(sender.images[0][1][:160]))
             check("★ 文案就是渲染出来的那份",
                   sender.images[0][1].startswith("🎂 2026/10/19"), sender.images[0][1])
             check("★ 落库的键是**被祝福的那天**（10-19），不是推送那天（10-18）",
@@ -6795,20 +6690,20 @@ def _check_bd_poller() -> None:
 
             # ---- 窗口外不补发 ----
             db3, snd3 = _enable(_BdDb(), "birthday", "G1", "G2"), _BdSender()
-            p3 = _bd.BirthdayPoller(cfg, db3, snd3, _BdHttp(page))
+            p3 = _bd.BirthdayPoller(cfg, db3, snd3, _BdHttp(page), library=_LibStub())
             n5 = await p3.poll_once(now=datetime(2026, 10, 18, 23, 20))
             check("★ 窗口外（23:20）不发", n5 == 0 and not snd3.images and not snd3.texts, str(n5))
 
             # ---- 那天没人过生日 ----
             db4, snd4 = _enable(_BdDb(), "birthday", "G1", "G2"), _BdSender()
-            p4 = _bd.BirthdayPoller(cfg, db4, snd4, _BdHttp(page))
+            p4 = _bd.BirthdayPoller(cfg, db4, snd4, _BdHttp(page), library=_LibStub())
             n6 = await p4.poll_once(now=datetime(2026, 10, 19, 23, 5))   # → 祝福 10-20
             check("★ 那天没人过生日 → 静默跳过、不记账、不报错",
                   n6 == 0 and not db4.rows and not snd4.images, f"{n6} {db4.rows}")
 
             # ---- 一个群挂了不连累别的 ----
             db5, snd5 = _enable(_BdDb(), "birthday", "G1", "G2"), _BdSender(fail={"G1"})
-            p5 = _bd.BirthdayPoller(cfg, db5, snd5, _BdHttp(page))
+            p5 = _bd.BirthdayPoller(cfg, db5, snd5, _BdHttp(page), library=_LibStub())
             n7 = await p5.poll_once(now=at_slot)
             check("★ 一个群发不出去，其余群照发",
                   n7 == 1 and db5.birthday_posted("2026-10-19") == {"G2"}, f"{n7} {db5.posted}")
@@ -6893,8 +6788,11 @@ def _check_bd_wiring() -> None:
 
     from qq_rss_bot import quota as _q  # noqa: PLC0415
 
-    check("Pusher 协议里有 send_text / send_local_image（生日两条路都用到）",
-          hasattr(_q.Pusher, "send_text") and hasattr(_q.Pusher, "send_local_image"))
+    check("Pusher 协议里有 send_text / send_markdown（生日两条路都用到）",
+          hasattr(_q.Pusher, "send_text") and hasattr(_q.Pusher, "send_markdown"))
+    check("★ base64 那条路（send_local_image）已经删干净了",
+          not hasattr(_q.Pusher, "send_local_image")
+          and not hasattr(_q.GroupSender, "send_local_image"))
 
 
 _check_bd_parts()

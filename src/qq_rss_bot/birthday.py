@@ -56,14 +56,13 @@ import asyncio
 import html as _html
 import logging
 import re
-import tempfile
 import tomllib
 from dataclasses import dataclass
 from datetime import date as Date
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
-from . import features, preview
+from . import features, imagelib, multiimage, preview
 
 _log = logging.getLogger("qq_rss_bot.birthday")
 
@@ -313,8 +312,10 @@ async def fetch_timeline(client, url: str = X_PROFILE_URL) -> list[Tweet]:
 
 async def fetch_day_image(
     client, tweets: list[Tweet], d: Date
-) -> tuple[str, bytes] | None:
-    """在时间线里找当天的生日推、下它第一张图。返回 `(推文 id, 图片字节)`。
+) -> tuple[str, bytes, str] | None:
+    """在时间线里找当天的生日推、下它第一张图。
+
+    返回 `(推文 id, 图片字节, 图片原始 URL)`。
 
     拿不到就返回 `None` —— **只影响有没有图，不影响这条推发不发**：
     名单是冷数据，和推文一点关系都没有。
@@ -327,11 +328,13 @@ async def fetch_day_image(
     if not tweet.images:
         _log.warning("生日：推文 %s 里没有配图", tweet.id)
         return None
-    raw = await preview.fetch_image(client, tweet.image_url())
+    url = tweet.image_url()
+    raw = await preview.fetch_image(client, url)
     if raw is None:
         _log.warning("生日：推文 %s 的配图下载失败", tweet.id)
         return None
-    return tweet.id, raw
+    # 带上原始 URL —— 入库时要记 `source_url`，事后回答得了「这张从哪来的」。
+    return tweet.id, raw, url
 
 
 # --------------------------------------------------------------------------
@@ -353,10 +356,13 @@ class BirthdayPoller:
     **绝不因为没图就不发** —— 名单是冷数据，推文挂了只是少一张配图。
     """
 
-    def __init__(self, cfg, db, sender, media_http) -> None:
+    def __init__(self, cfg, db, sender, media_http, library=None) -> None:
         self.cfg = cfg
         self.db = db
         self.sender = sender
+        # 配图进图库、用我们自己的地址发（markdown 的图是 QQ 去抓的，
+        # 它够不到 pbs.twimg.com）。没有库时退回纯文字。
+        self.library = library
         # ⚠️ 走 `media_http`（带代理的那个）。容器直连 x.com / pbs.twimg.com
         # **全不通**（实测：SSL 握手超时 / Errno 99），别顺手换成 rss_http。
         self.http = media_http
@@ -472,7 +478,7 @@ class BirthdayPoller:
             # 还没到窗口末尾 —— **留着下一拍再试**。imas_ch 23:00 发推、我们
             # 23:05 起跑，正常第一拍就有；偶尔晚几分钟也等得起。
             return 0
-        tweet_id, image = found if found else ("", None)
+        tweet_id, image, image_url = found if found else ("", None, "")
         if image is None:
             _log.warning(
                 "生日：%s 没抓到配图，等满 %d 秒后发纯文字",
@@ -480,34 +486,47 @@ class BirthdayPoller:
                 self.cfg.birthday_window_sec,
             )
 
+        # 配图先入库（**只做一次**，所有群共用同一个地址）。图库没配或收不下
+        # 就退回纯文字 —— 名单是冷数据，不该因为图的问题不发。
+        ref = None
+        if image is not None and self.library is not None and self.library.enabled:
+            ref = self.library.store(
+                image,
+                kind=imagelib.KIND_FEED,
+                event_date=day_key,
+                source_url=image_url,
+                page_url=f"https://x.com/i/status/{tweet_id}" if tweet_id else "",
+                source_id=tweet_id,
+            )
+        if ref is not None:
+            text = (
+                f"{text}\n"
+                f"{multiimage.image_line(1, ref.url, (ref.width, ref.height), multiimage.SINGLE_W)}"
+            )
+        elif image is not None:
+            _log.warning("生日：配图没进图库（%s），这条发纯文字", day_key)
+
         sent = 0
-        # 图得先落盘 —— `send_local_image` 收的是路径（当初是给 data/monday/
-        # 的表情包写的）。**落临时目录、用完就删**：这里只是要个路径，
-        # 不是素材，不该在 NAS 上留痕。
-        with tempfile.TemporaryDirectory(prefix="birthday-") as tmp:
-            path = Path(tmp) / "birthday.jpg"
-            if image is not None:
-                path.write_bytes(image)
-            for group in targets:
-                # 逐群隔离：一个群发不出去不能连累别的群。失败**不记账**，
-                # 窗口内下一次 tick 会重试；窗口过了就当今天没发。
-                try:
-                    if image is None:
-                        await self.sender.send_text(group, text)
-                    else:
-                        await self.sender.send_local_image(group, text, path)
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("生日：发送失败 → %s: %s", group[:8], exc)
-                    continue
-                self.db.mark_birthday_posted(day_key, group, tweet_id)
-                sent += 1
-                _log.info(
-                    "生日：已推送 %s（%d 位，%s）→ %s",
-                    day_key,
-                    day.total,
-                    f"推文 {tweet_id}" if image is not None else "无图",
-                    group[:8],
-                )
+        for group in targets:
+            # 逐群隔离：一个群发不出去不能连累别的群。失败**不记账**，
+            # 窗口内下一次 tick 会重试；窗口过了就当今天没发。
+            try:
+                if ref is None:
+                    await self.sender.send_text(group, text)
+                else:
+                    await self.sender.send_markdown(group, text)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("生日：发送失败 → %s: %s", group[:8], exc)
+                continue
+            self.db.mark_birthday_posted(day_key, group, tweet_id)
+            sent += 1
+            _log.info(
+                "生日：已推送 %s（%d 位，%s）→ %s",
+                day_key,
+                day.total,
+                f"推文 {tweet_id}" if image is not None else "无图",
+                group[:8],
+            )
         return sent
 
     async def _find_image(self, d: Date, tweets):

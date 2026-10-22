@@ -71,10 +71,12 @@ twstalker / sotwe / twiiit（403）。`api.fxtwitter.com/<screen_name>` **只有
 `self.media_http`（`smoke [4.96]` 有一条只看源码的钉子钉这个）——
 换成 `rss_http` 之后代码照样跑、日志照样正常，只是每天都没配图。
 
-图片**必须我们自己下载再 base64 上传**：不能把 `pbs.twimg.com` 的 URL 交给
-QQ 去抓，**QQ 的服务器在国内，同样够不到 Twitter 的图床**（和
-`i.ytimg.com` 是同一个问题）。所以复用 `preview.fetch_image` +
-`send_local_image` 那条老路。
+图片**必须我们自己托管**：不能把 `pbs.twimg.com` 的 URL 交给 QQ 去抓 ——
+**QQ 的服务器在国内，同样够不到 Twitter 的图床**（和 `i.ytimg.com` 是同一个问题）。
+
+2026-10-22 起走：`preview.fetch_image` 下载 → **存进图库** → 文案和 `![图1 …]`
+拼成**一条 markdown** 发出去。以前是下载后 base64 上传（`send_local_image`，
+`msg_type=7`），现在那条路已经删了；顺带摆脱了它 3.5 MB 的原图上限。
 
 ### ⚠️ 窗口是**抓图的补发窗口**，和早安那个 180 秒不是一个意思
 

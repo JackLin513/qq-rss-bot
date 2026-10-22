@@ -44,8 +44,9 @@
 **只有视频、一个字都没有**（用户原话「好像没看到文案只看到了视频啊」）。
 `MediaInfo` 里也只有一个 `file_info`，**没有 caption/title 字段可挂**。
 
-所以拆成两条：**文案跟图走**（`send_local_image`，`msg_type=7` + `file_type=1`），
-**视频单独发**（`send_video`，`content=""`）。顺序文案在前。
+所以拆成两条：**文案跟图走**（2026-10-22 起是 `send_markdown`，图先入图库再由
+图床发出去；之前是 `send_local_image` 的 base64 上传），**视频单独发**
+（`send_video`，`content=""`）。顺序文案在前。
 `RssBot.send_video` 的签名里**根本没有 `content` 形参** —— 从根上不给塞，
 smoke 用 `co_varnames` 钉了这条。
 

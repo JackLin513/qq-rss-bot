@@ -17,11 +17,12 @@
 
 原本只发一条语音。**群里没人点开听**，所以改成：
 
-    ① msg_type=7：头像 + 「角色名\n日语原文」     ← send_local_image
+    ① msg_type=2：头像 + 「角色名\n日语原文」     ← send_markdown（图走图库）
     ② msg_type=7：语音                            ← send_voice
 
-`msg_type=7` 的 `MediaInfo` 只有一个 `file_info`，一条只能带一个媒体，
-所以必然是两条。**图片那条的 `content` 是渲染的**（实测过），文字就搭在图上。
+语音没法塞进 markdown（`file_type=3` 是富媒体），所以必然是两条。
+（2026-10-22 之前头像是 base64 上传 + `msg_type=7`，改成图库 + markdown 之后
+顺带摆脱了 3.5 MB 的原图上限。）
 
 **不走 markdown**：markdown 的图必须公网 URL，QQ 自己派服务器去拉，
 本地文件一个字节都送不进去 —— 而头像就是本地文件。180×180 在 `msg_type=7`
@@ -95,7 +96,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
 
-from . import features
+from . import features, imagelib, multiimage
 
 _log = logging.getLogger("qq_rss_bot.morning")
 
@@ -294,10 +295,12 @@ class MorningPoller:
     —— 数据源、节奏、失败语义都不一样。
     """
 
-    def __init__(self, cfg, db, sender) -> None:
+    def __init__(self, cfg, db, sender, library=None) -> None:
         self.cfg = cfg
         self.db = db
         self.sender = sender
+        # 头像也走图库（内容寻址，同一张只存一份），消息用 markdown 发。
+        self.library = library
         self._stopped = asyncio.Event()
         # 同一个 slot 只警告一次。窗口内会醒好几次，不记的话会每分钟刷一条。
         # 三条各自记 —— 用同一个 key 的话，「目录空」会把「缺头像」盖掉。
@@ -438,6 +441,21 @@ class MorningPoller:
                 )
             avatar = None
 
+        # 头像入库**只做一次**（所有群共用同一个地址）。
+        ref = None
+        if avatar is not None and self.library is not None and self.library.enabled:
+            ref = self.library.store(
+                avatar.read_bytes(),
+                kind=imagelib.KIND_FEED,
+                event_date=slot.date().isoformat(),
+                source_id=f"{idol}.png",
+            )
+        if ref is not None:
+            content = (
+                f"{content}\n"
+                f"{multiimage.image_line(1, ref.url, (ref.width, ref.height), multiimage.SINGLE_W)}"
+            )
+
         sent = 0
         for group in targets:
             # 逐群隔离：一个群发不出去（配额、权限、接口抖动）不能连累别的群。
@@ -445,9 +463,13 @@ class MorningPoller:
                 if avatar is None:
                     await self.sender.send_voice(group, line)
                 else:
-                    # ① 头像 + 文字。这一条挂了整轮不算数 —— 不记账，
-                    # 窗口内下一拍会重试。
-                    await self.sender.send_local_image(group, content, avatar)
+                    # ① 头像 + 文字（一条 markdown）。这一条挂了整轮不算数 ——
+                    # 不记账，窗口内下一拍会重试。图库不可用时退回纯文字，
+                    # 别把文字也一起丢了。
+                    if ref is not None:
+                        await self.sender.send_markdown(group, content)
+                    else:
+                        await self.sender.send_text(group, content)
                     await asyncio.sleep(MESSAGE_GAP_SEC)
                     # ② 语音。这一条挂了**只记 WARNING、照样记账** ——
                     # 头像已经发出去了，再退一次就是重复刷屏。
@@ -466,7 +488,7 @@ class MorningPoller:
             _log.info(
                 "早安：已推送 %s（%s，%s）→ %s",
                 idol, line.name,
-                "头像+文字+语音" if avatar is not None else "纯语音",
+                "头像+文字+语音" if ref is not None else "纯语音",
                 group[:8],
             )
         return sent

@@ -71,7 +71,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Sequence
 
-from . import features
+from . import features, imagelib, multiimage
 
 _log = logging.getLogger("qq_rss_bot.monday")
 
@@ -240,10 +240,13 @@ class MondayPoller:
     单独一个 task，不塞进 `FeedPoller` —— 数据源、节奏、失败语义都不一样。
     """
 
-    def __init__(self, cfg, db, sender) -> None:
+    def __init__(self, cfg, db, sender, library=None) -> None:
         self.cfg = cfg
         self.db = db
         self.sender = sender
+        # 表情包也走图库（内容寻址，同一张反复用只存一份），
+        # 消息用 markdown 发 —— 不再 base64 上传。
+        self.library = library
         self._stopped = asyncio.Event()
         # 同一个 slot 只警告一次。窗口内会醒好几次，不记的话
         # 「目录空 / 全超限」会每分钟刷一条。
@@ -328,6 +331,21 @@ class MondayPoller:
         video = pick_video(videos, self.db.monday_last_video())
         sticker = find_sticker(self.cfg.monday_video_dir)
         text = render_text(now)
+        # 表情包入库**只做一次**（所有群共用同一个地址）。
+        ref = None
+        if sticker is not None and self.library is not None and self.library.enabled:
+            raw = sticker.read_bytes()
+            ref = self.library.store(
+                raw,
+                kind=imagelib.KIND_FEED,
+                event_date=slot.date().isoformat(),
+                source_id=sticker.name,
+            )
+        if ref is not None:
+            text = (
+                f"{text}\n"
+                f"{multiimage.image_line(1, ref.url, (ref.width, ref.height), multiimage.SINGLE_W)}"
+            )
         sent = 0
         for group in targets:
             # 逐群隔离：一个群发不出去（配额、权限、接口抖动）不能连累别的群。
@@ -342,8 +360,8 @@ class MondayPoller:
             # 的重试；重启后窗口只剩几十秒，真撞上也就是多一条一样的文案）。
             if (slot_key, group) not in self._caption_sent:
                 try:
-                    if sticker:
-                        await self.sender.send_local_image(group, text, sticker)
+                    if ref is not None:
+                        await self.sender.send_markdown(group, text)
                     else:
                         await self.sender.send_text(group, text)
                     self._caption_sent.add((slot_key, group))
