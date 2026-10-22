@@ -9,14 +9,17 @@
 
 `40034003` 是**超时**，不是 404 也不是 DNS 失败 —— QQ 的机房够得到域名、
 但拉不下内容。也就是说「能不能用 URL 形态」取决于 QQ 机房到那个图床的
-连通性，**我们控制不了**。所以这两个站点走另一条路：
+连通性，**我们控制不了**。所以这两个站点的图走另一条路：
 
-    我们自己下载（走 media_proxy）→ base64 → 交给 QQ 的 /files 接口
+    我们自己下载（走 media_proxy）→ **存进图库** → markdown 里用图库的地址
 
-这条路也实测过（32771 字节的图 → 43696 字节 base64 → 上传成功拿到
-`file_info`），代价是**我们这边必须能出网**：容器直连 youtube.com / x.com
-全部超时，所以 `MEDIA_PROXY` 是必需的（见 config.py）。代理没配或不通时，
-`lookup()` 会返回 None，调用方静默不发 —— 不会连累 bilibili 和 RSS 推送。
+（2026-10-22 之前是「下载 → base64 → 交给 QQ 的 /files 接口」，一条消息只能带
+一张图，所以多图要连发 1+N 条。换成自建图床之后这两件事一起解决了：
+**一个分享只发一条 markdown**，图全在正文里，也不再受 base64 那 3.5 MB 上限。）
+
+代价是**我们这边必须能出网**：容器直连 youtube.com / x.com 全部超时，所以
+`MEDIA_PROXY` 是必需的（见 config.py）。代理没配或不通时，`lookup()` 会返回
+None，调用方静默不发 —— 不会连累 bilibili 和 RSS 推送。
 
 **接口选型**（2026-10-17 本机实测确认的字段，别凭直觉换）：
 
@@ -47,6 +50,7 @@ import httpx
 
 # 计数和时长的格式化**复用 bilibili 那份** —— 两边的口径必须一致
 # （「3.1万」的边界在哪、`03:07` 还是 `3:07`），各写一份迟早会漂。
+from . import multiimage
 from .bilibili import fmt_count, fmt_duration
 
 _log = logging.getLogger("qq_rss_bot.preview")
@@ -401,12 +405,25 @@ def render_text(card: Card) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def render_markdown(card: Card) -> str:
-    """markdown 卡片（`msg_type=2`）。
+# 合并成一条之后，图可以比原来的 208 封面宽一档 —— 手机上一屏放得下，
+# 又明显比现在的卡片好看。
+PREVIEW_IMAGE_W = 320
 
-    ⚠️ 图片那行只在**封面 URL 是 QQ 够得到的域名**时才有意义 —— 直接塞
-    `i.ytimg.com` 会渲染成一张裂图。所以这里默认不出图，由调用方决定要不要
-    换成 `media` 那条路（见模块 docstring）。
+
+def render_markdown(
+    card: Card, images: tuple[tuple[str, int, int], ...] = ()
+) -> str:
+    """markdown 卡片（`msg_type=2`）。`images` 是 `(URL, 宽, 高)`，按显示顺序。
+
+    **一个分享只发一条消息**，图全放在正文里（以前是"首条带正文 + 每图一条"，
+    1+N 条消息，刷屏还吃额度）。
+
+    ⚠️ `images` 里的 URL **必须来自我们自己的图库**。直接把 `i.ytimg.com` /
+    `pbs.twimg.com` 塞进来会渲染成裂图 —— QQ 的服务器在大陆机房拉不到那些域名
+    （2026-10-22 实测）。图先入库、再由图床用自己的地址发，这条才成立。
+
+    ⚠️ 尺寸提示**必填**且**比例必须和原图一致**（`multiimage.box_for` 负责，
+    它只缩宽度、绝不夹高度）。
     """
     lines: list[str] = []
     title = _MD_STRIP_RE.sub("", card.title).strip()
@@ -414,6 +431,12 @@ def render_markdown(card: Card) -> str:
     if card.author:
         lines.append(card.author)
     lines.extend(card.extra)
+    for index, (url, width, height) in enumerate(images, start=1):
+        if width <= 0 or height <= 0:
+            # 读不出宽高就不放 —— 缺尺寸提示手机端整条都不渲染（见 multiimage）。
+            continue
+        dw, dh = multiimage.box_for((width, height), PREVIEW_IMAGE_W)
+        lines.append(f"![图{index} #{dw}px #{dh}px]({url})")
     lines.append(f"[打开原文]({card.url})")
     return "\n".join(lines)
 
@@ -433,11 +456,18 @@ _MD_STRIP_RE = re.compile(r"[*_`~\\]")
 
 
 async def fetch_image(
-    http: httpx.AsyncClient, url: str, *, timeout: float = IMAGE_TIMEOUT
+    http: httpx.AsyncClient,
+    url: str,
+    *,
+    timeout: float = IMAGE_TIMEOUT,
+    max_bytes: int = MAX_IMAGE_BYTES,
 ) -> bytes | None:
-    """把封面接下来，交给调用方走 base64 上传。
+    """把封面接下来，交给调用方（入库或 base64 上传）。
 
     超限或失败都返回 None —— **只影响有没有图，不影响这张卡片发不发**。
+
+    `max_bytes` 默认是 base64 那条路的 3.5 MB 上限；**存进图库的调用方要传
+    更大的值**（图床的上限），否则会白白丢掉本来存得下的原图。
     """
     try:
         resp = await http.get(url, headers={"User-Agent": BROWSER_UA}, timeout=timeout)
@@ -448,8 +478,8 @@ async def fetch_image(
     raw = resp.content
     if not raw:
         return None
-    if len(raw) > MAX_IMAGE_BYTES:
-        _log.info("preview：封面 %d 字节超过上限，这张不发图", len(raw))
+    if len(raw) > max_bytes:
+        _log.info("preview：封面 %d 字节超过上限 %d，这张不发图", len(raw), max_bytes)
         return None
     return raw
 

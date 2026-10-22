@@ -121,6 +121,7 @@ import httpx
 from . import birthday as birthday_module
 from . import features
 from . import imagelib
+from . import imgsrv
 from . import multiimage
 from . import preview
 from . import seiyuu
@@ -885,14 +886,14 @@ class BirthdayArtPoller:
         实测一轮 5 张里就有 1 张原图超限。这里的产品优先级是
         **图真的能显示** —— 无损是 `preview.py` 那条路的要求，不是这条。
         """
-        raw = await preview.fetch_image(self.http, url)
+        raw = await preview.fetch_image(self.http, url, max_bytes=imgsrv.MAX_BYTES)
         if raw is not None:
             return raw
         alt = _with_name(url, "large")
         if alt == url:
             return None
         _log.info("贺图：原图下不来或太大，退到 large：%s", url)
-        return await preview.fetch_image(self.http, alt)
+        return await preview.fetch_image(self.http, alt, max_bytes=imgsrv.MAX_BYTES)
 
     async def _download_by_idol(
         self, head: list[Art], rest: list[Art], want: int

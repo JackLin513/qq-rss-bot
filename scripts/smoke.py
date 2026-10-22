@@ -2757,45 +2757,48 @@ class _FakeMediaHttp:
         raise AssertionError("没预期的 GET: %s" % url)
 
 
-class _MediaApi:
-    """假的 QQ 接口，把「上传」和「发消息」分开记 —— 两者是两条独立的路。
+class _LibStub:
+    """假图库。`fail=True` 模拟「收不下」（比如超过体积上限）。"""
 
-    `fail_after` / `msg_fail_after` 用来模拟「第 N 次之后开始失败」，
-    多图的部分失败全靠它。
+    enabled = True
+
+    def __init__(self, fail: bool = False) -> None:
+        self.stored: list[tuple[int, dict]] = []
+        self.fail = fail
+
+    def store(self, raw: bytes, **kw):
+        self.stored.append((len(raw), kw))
+        if self.fail:
+            return None
+        n = len(self.stored)
+        return _types.SimpleNamespace(
+            sha256="a" * 64, ext=".jpg", url=f"http://img.test/i/{n}.jpg",
+            width=1200, height=1600, fresh=True)
+
+
+class _MediaApi:
+    """假的 QQ 接口。
+
+    `code` 非 0 模拟**业务错误码**（比如 304036 没有 markdown 模板权限）——
+    这个平台「HTTP 200 但用户看不见」就从这儿来，所以必须能测。
     """
 
-    def __init__(self, upload_ok=True, upload_raises=False,
-                 fail_after=None, msg_fail_after=None):
+    def __init__(self, code: int = 0, raises: bool = False) -> None:
         self.sent: list[dict] = []
-        self.uploaded: list[dict] = []
-        self._ok, self._raises = upload_ok, upload_raises
-        self._fail_after, self._msg_fail_after = fail_after, msg_fail_after
-        self._rich_sent = 0
+        self._code, self._raises = code, raises
 
     async def post_group_message(self, **kw):
         self.sent.append(kw)
-        # `msg_fail_after` **只数富媒体（msg_type=7）**。按「所有消息」数的话，
-        # 兜底的 markdown 卡片会跟着一起挂，就测不出「退回卡片」那条路了。
-        if kw.get("msg_type") == 7:
-            self._rich_sent += 1
-            if self._msg_fail_after is not None and self._rich_sent > self._msg_fail_after:
-                raise RuntimeError("send boom")
-        return {"code": 0}
-
-    async def post_group_file(self, **kw):
-        self.uploaded.append(kw)
         if self._raises:
-            raise RuntimeError("upload boom")
-        if self._fail_after is not None and len(self.uploaded) > self._fail_after:
-            return {}  # 没拿到 file_info = 这张传不上去
-        return {"file_info": "FI"} if self._ok else {}
+            raise RuntimeError("send boom")
+        return {"code": self._code}
 
 
 class _SpyNotifier:
     """记账用的 notifier 替身 —— `notify` 只把 (群, 文案, key) 收进列表。
 
     **不实现冷却**：冷却逻辑属于 `C2CNotifier` 自己，这里要断言的是
-    「该不该报、报了什么、key 用的是什么」，把冷却混进来只会让用例难读。
+    「该不该报、报了什么、key 用的是什么」。
     """
 
     def __init__(self) -> None:
@@ -2810,18 +2813,23 @@ class _MediaBotStub:
     """只借 RssBot 的预览出口，不真造 botpy Client（那要事件循环和网络）。"""
 
     _preview_media = _RssBot._preview_media
-    _upload_image = _RssBot._upload_image
     _make_repliers = _RssBot._make_repliers
 
-    def __init__(self, cfg, media_http, api, notifier=None):
+    def __init__(self, cfg, media_http, api, notifier=None, library=None):
         self.cfg, self.media_http, self.api = cfg, media_http, api
-        # 配图失败要私聊告警 —— 这里给个真的 `C2CNotifier` 替身，
-        # 否则「失败了到底有没有报」这件事测不了。
+        # 配图失败要私聊告警 —— 给个替身，否则「失败到底有没有报」测不了。
         self.notifier = notifier or _SpyNotifier()
+        self.library = library or _LibStub()
 
 
 _YT_TEXT = "看看这个 https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _X_TEXT = "https://x.com/BarackObama/status/896523232098078720"
+
+
+def _md_of(sent: dict) -> str:
+    return (sent.get("markdown") or {}).get("content") or ""
+
+
 
 
 async def _check_media_preview() -> None:
@@ -2842,7 +2850,7 @@ async def _check_media_preview_inner() -> None:
     api = _MediaApi()
     bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
     check("闲聊返回「没回」", await bot._preview_media(_FakeMsg("测试123")) is False)
-    check("★ 闲聊一条都没发", api.sent == [] and api.uploaded == [], repr(api.sent))
+    check("★ 闲聊一条都没发", api.sent == [], repr(api.sent))
 
     # bilibili 链接必须**留给 bilibili 那条路**，不能被这里截胡
     api = _MediaApi()
@@ -2851,110 +2859,149 @@ async def _check_media_preview_inner() -> None:
           await bot._preview_media(_FakeMsg("https://www.bilibili.com/video/BV15eJt6pEam")) is False)
     check("★ 认领失败时也一条都没发", api.sent == [], repr(api.sent))
 
-    # 开关关掉
     api = _MediaApi()
-    bot = _MediaBotStub(dataclasses.replace(cfg, youtube_preview=False), _FakeMediaHttp(yti=_YTI_OK), api)
+    bot = _MediaBotStub(dataclasses.replace(cfg, youtube_preview=False),
+                        _FakeMediaHttp(yti=_YTI_OK), api)
     check("YOUTUBE_PREVIEW=false 时返回「没回」",
           await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
-    check("★ 开关关掉时一条都没发", api.sent == [] and api.uploaded == [], repr(api.sent))
+    check("★ 开关关掉时一条都没发", api.sent == [], repr(api.sent))
 
-    # --- YouTube 正常路径：上传字节 + 富媒体 ---
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK, image=b"\xff\xd8yt"), api)
+    # --- ★ YouTube：一条 markdown，图走图库 ---
+    api, lib = _MediaApi(), _LibStub()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK, image=b"\xff\xd8yt"), api, library=lib)
     check("YouTube 返回「回了」", await bot._preview_media(_FakeMsg(_YT_TEXT)) is True)
-    check("恰好上传一次", len(api.uploaded) == 1, repr(api.uploaded))
-    up = api.uploaded[0]
-    check("file_type=1（图片）", up.get("file_type") == 1, repr(up))
-    check("srv_send_msg=False（只上传，不单独发一条）", up.get("srv_send_msg") is False, repr(up))
-    check("★ 走 file_data 而不是 url", "file_data" in up and "url" not in up, repr(list(up)))
-    check("★ file_data 是图片的 base64", _b64.b64decode(up["file_data"]) == b"\xff\xd8yt")
-    check("恰好发一条消息", len(api.sent) == 1, repr(api.sent))
+    check("★★ 一个分享只发一条消息（以前是 1+N）", len(api.sent) == 1, repr(len(api.sent)))
     sent = api.sent[0]
-    check("★ msg_type=7（富媒体）", sent.get("msg_type") == 7, repr(sent))
-    check("★ 带 media.file_info", (sent.get("media") or {}).get("file_info") == "FI", repr(sent))
+    check("★ msg_type=2（markdown）", sent.get("msg_type") == 2, repr(sent.get("msg_type")))
     check("被动回复：带 msg_id", sent.get("msg_id") == "M1", repr(sent))
     check("被动回复：msg_seq=1", sent.get("msg_seq") == 1, repr(sent))
-    body = sent.get("content") or ""
-    check("正文含标题", "Rick Astley" in body, repr(body))
-    check("★ 时长和播放量在同一行", "03:33 · 播放 18.3亿" in body, repr(body))
-    check("正文含原链接", "youtube.com/watch?v=dQw4w9WgXcQ" in body, repr(body))
-    check("富媒体消息不带 keyboard", "keyboard" not in sent, repr(list(sent)))
+    md = _md_of(sent)
+    check("正文含标题", "Rick Astley" in md, repr(md))
+    check("★ 时长和播放量在同一行", "03:33 · 播放 18.3亿" in md, repr(md))
+    check("正文含原链接", "youtube.com/watch?v=dQw4w9WgXcQ" in md, repr(md))
+    check("★ 图用的是图库地址，正文里不出现第三方图床",
+          "img.test" in md and "ytimg.com" not in md, repr(md))
+    check("★ 图带尺寸提示且比例没被拉扁", "#300px #400px" in md, repr(md))
+    check("★ 图库收到一次入库", len(lib.stored) == 1, str(len(lib.stored)))
+    check("入库带着来源页面与来源 id",
+          lib.stored[0][1]["source_id"] == "dQw4w9WgXcQ"
+          and lib.stored[0][1]["kind"] == "preview", str(lib.stored[0][1]))
+    check("★ 这条路不再上传 base64（接口上已经没有这个方法）",
+          not hasattr(api, "post_group_file"))
 
-    # --- X：有配图 → 富媒体；且配图要换成 name=small ---
-    api = _MediaApi()
-    http = _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw")
-    bot = _MediaBotStub(cfg, http, api)
-    check("X 返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    fetched = [u for kind, u in http.calls if kind == "get" and "twimg.com" in u]
-    check("★ 下载的是原图 name=orig", fetched and "name=orig" in fetched[0], repr(fetched))
-    sent = api.sent[0]
-    check("X 也走 msg_type=7", sent.get("msg_type") == 7, repr(sent))
-    body = sent.get("content") or ""
-    check("正文含作者", "Barack Obama (@BarackObama)" in body, repr(body))
-    check("★ 互动数每行最多两项", "点赞 340.1万 · 转发 121.6万" in body, repr(body))
-
-    # --- ★ 多图：一条推文配 3 张图 ---
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+    # --- ★ X 多图：3 张图合成一条 ---
+    api, lib = _MediaApi(), _LibStub()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"),
+                        api, library=lib)
     check("多图推文返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    check("★ 3 张图各上传一次", len(api.uploaded) == 3, repr(len(api.uploaded)))
-    check("★ 3 张图发 3 条消息", len(api.sent) == 3, repr(len(api.sent)))
-    check("★ 每条都是 msg_type=7",
-          all(m.get("msg_type") == 7 for m in api.sent),
-          repr([m.get("msg_type") for m in api.sent]))
-    check("★ msg_seq 递增（同一个 msg_id 下撞号会被静默丢弃）",
-          [m.get("msg_seq") for m in api.sent] == [1, 2, 3],
-          repr([m.get("msg_seq") for m in api.sent]))
-    check("第一条带完整正文",
-          "Barack Obama" in (api.sent[0].get("content") or ""),
-          repr(api.sent[0].get("content")))
-    check("★ 后续条只带占位文案",
-          api.sent[1].get("content") == "（图 2/3）", repr(api.sent[1].get("content")))
-    check("★ 每条各带一个 file_info",
-          all((m.get("media") or {}).get("file_info") for m in api.sent), repr(api.sent))
+    check("★★ 3 张图仍然只发一条消息", len(api.sent) == 1, repr(len(api.sent)))
+    md = _md_of(api.sent[0])
+    check("★ markdown 里有 3 张图", md.count("![") == 3, repr(md))
+    check("★ 3 张图各入库一次", len(lib.stored) == 3, str(len(lib.stored)))
+    check("★ 没有「（图 i/N）」这种占位消息",
+          not any("（图" in _md_of(m) for m in api.sent), repr(md))
+    check("署名信息在正文里", "Barack Obama (@BarackObama)" in md, repr(md))
+    check("★ 互动数每行最多两项", "点赞 340.1万 · 转发 121.6万" in md, repr(md))
 
-    # --- 开关关掉 → 回到单图（旧行为，必须一模一样）---
-    api = _MediaApi()
+    # --- 开关关掉 → 只用第一张 ---
+    api, lib = _MediaApi(), _LibStub()
     bot = _MediaBotStub(dataclasses.replace(cfg, preview_multi_image=False),
-                        _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+                        _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"),
+                        api, library=lib)
     await bot._preview_media(_FakeMsg(_X_TEXT))
-    check("★ PREVIEW_MULTI_IMAGE=false 时只发 1 条", len(api.sent) == 1, repr(len(api.sent)))
-    check("★ 关掉时只上传 1 次（不多下多传）", len(api.uploaded) == 1, repr(len(api.uploaded)))
+    check("★ PREVIEW_MULTI_IMAGE=false 时只入库 1 张", len(lib.stored) == 1, str(len(lib.stored)))
+    check("★ 关掉时也还是 1 条消息", len(api.sent) == 1, repr(len(api.sent)))
 
-    # --- 中间某张传不上去 → 少那一张，其余照发 ---
-    api = _MediaApi(fail_after=1)
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
-    check("第 2、3 张上传失败仍返回「回了」",
-          await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    check("★ 传不上去的那几张不发，成功的照发", len(api.sent) == 1, repr(len(api.sent)))
+    # --- 某张下不来 → 只丢那一张，消息照发 ---
+    api, lib = _MediaApi(), _LibStub()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image_status=404),
+                        api, library=lib)
+    check("图 404 时仍返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 一张都没入库", lib.stored == [], str(lib.stored))
+    check("★ 仍然发一条（文字不丢）", len(api.sent) == 1, repr(len(api.sent)))
+    check("★ 没有图就不放图行", "![" not in _md_of(api.sent[0]), repr(_md_of(api.sent[0])))
 
-    # --- 第 2 条发送失败 → 不能把整条拖回去 ---
-    api = _MediaApi(msg_fail_after=1)
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
-    check("★ 后续条发送失败时仍算「回了」（不误报成预览失败）",
-          await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    check("★ 第 2 条挂了以后第 3 条照样尝试发",
-          any("图 3/3" in (m.get("content") or "") for m in api.sent),
-          repr([m.get("content") for m in api.sent]))
-    check("★ 后续条失败时**不**退回 markdown（否则正文会重复刷屏）",
-          all(m.get("msg_type") == 7 for m in api.sent),
-          repr([m.get("msg_type") for m in api.sent]))
+    # --- 图库收不下（超体积）→ 同样只丢那一张 ---
+    api, lib = _MediaApi(), _LibStub(fail=True)
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8"), api, library=lib)
+    check("图库拒绝时仍返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 入库被拒 → 那条消息里没有图", "![" not in _md_of(api.sent[0]))
+    check("★ 并且私聊告警（群里看不见的失败必须报）", bool(bot.notifier.calls),
+          str(bot.notifier.calls))
 
-    # 第一条（带正文那条）挂了 → 退回 markdown 卡片，不能让分享变成「什么都没回」
-    api = _MediaApi(msg_fail_after=0)
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
-    check("★ 第一条发不出去时退回 markdown 卡片",
-          await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    check("★ 退回的那条是 msg_type=2（markdown）",
-          api.sent and api.sent[-1].get("msg_type") == 2,
-          repr([m.get("msg_type") for m in api.sent]))
+    # --- ★ 业务错误码 → 退回纯文字，且只多一条 ---
+    # （「发送直接抛异常」是另一回事：连降级那条也发不出去，见本节的 _BoomApi 用例）
+    for label, api in (("业务错误码 304036（没有 markdown 模板权限）", _MediaApi(code=304036)),):
+        bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_MULTI, image=b"\xff\xd8m"), api)
+        check(f"{label} 时仍返回「回了」",
+              await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+        check(f"★ {label} → 退回纯文字（msg_type=0），不是另一种 markdown",
+              api.sent and api.sent[-1].get("msg_type") == 0,
+              repr([m.get("msg_type") for m in api.sent]))
+        check(f"★ {label} → 纯文字里有原链接",
+              "status/896523232098078720" in (api.sent[-1].get("content") or ""),
+              repr(api.sent[-1].get("content")))
+        check(f"★ {label} → 总共只发两条（一次尝试 + 一次降级）",
+              len(api.sent) == 2, repr(len(api.sent)))
 
-    # --- ★ 成功日志必须带封面尺寸和档位 ---
-    # 这条钉的是**可观测性**，不是功能：推文的图分 orig/large/medium/small
-    # 四档（实测 943KB / 434KB / 180KB / 70KB），而「已回图文卡片」四种情况
-    # 长得一模一样。日志里不写尺寸的话，「发出去的到底是不是原图」在事后
-    # 无法回答 —— 这个已经真发生过一次，只能靠让用户重发来补证据。
-    import logging  # noqa: PLC0415 —— 这个文件按节就近 import
+    # --- 无图推文 ---
+    api, lib = _MediaApi(), _LibStub()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_PHOTO), api, library=lib)
+    check("无图推文也返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    check("★ 无图时不入库", lib.stored == [], str(lib.stored))
+    check("★ 无图时发一条 markdown", len(api.sent) == 1 and api.sent[0].get("msg_type") == 2)
+    check("markdown 是外层 content 包裹", "content" in (api.sent[0].get("markdown") or {}))
+    check("markdown 里没有 media", "media" not in api.sent[0])
+
+    # --- ★★ 纯图推（没有正文）：绝不能把 raw_text 那个 dict 打出来 ---
+    check("★ 纯图推：_tweet_text 拿不到正文就返回空串，**不是 dict 的 repr**",
+          _pv._tweet_text(_FX_NO_TEXT["tweet"]) == "",
+          repr(_pv._tweet_text(_FX_NO_TEXT["tweet"])))
+    check("★ 正文非空时照常取 text（回退根本不该走到）",
+          _pv._tweet_text(_FX_OK["tweet"]).startswith("No one is born"))
+    check("老版 API 的 raw_text 是字符串，也要吃",
+          _pv._tweet_text({"raw_text": "老版正文"}) == "老版正文")
+    check("text 缺失但 raw_text 是对象时，取里面的 text",
+          _pv._tweet_text({"raw_text": {"text": "对象里的正文"}}) == "对象里的正文")
+    check("★ 整段只有 t.co 链接 → 当没有正文（纯图推的 raw_text 就是它）",
+          _pv._tweet_text({"raw_text": {"text": "https://t.co/abc123"}}) == "")
+    check("★ raw_text 是 null / 缺字段 / 数字 都不炸",
+          [_pv._tweet_text({"raw_text": v}) for v in (None, 42, [], {})] == ["", "", "", ""])
+
+    api, lib = _MediaApi(), _LibStub()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_TEXT, image=b"\xff\xd8t"),
+                        api, library=lib)
+    check("纯图推也返回「回了」（图照发）", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
+    md = _md_of(api.sent[0])
+    check("★ 卡片正文里没有 `{`（dict 的痕迹）", "{" not in md, repr(md))
+    check("★ 也没有 raw_text / display_text_range / facets 这些字段名",
+          not any(k in md for k in ("raw_text", "display_text_range", "facets")), repr(md))
+    check("★ 正文退化成「作者 + 数据 + 链接」，图还在",
+          "Barack Obama (@BarackObama)" in md and "点赞" in md
+          and "status/896523232098078720" in md and "![" in md, repr(md))
+    check("★ 纯图推的图照常入库", len(lib.stored) == 1, str(len(lib.stored)))
+
+    # --- 下载上限：入库那条路要放宽（图床上限 > base64 的 3.5 MB）---
+    small = b"\xff\xd8" + b"x" * 100
+    check("★ 超过 max_bytes 的图被丢弃",
+          await _pv.fetch_image(_FakeMediaHttp(image=small),
+                                "https://i.ytimg.com/a.jpg", max_bytes=50) is None)
+    check("上限内正常返回",
+          await _pv.fetch_image(_FakeMediaHttp(image=small),
+                                "https://i.ytimg.com/a.jpg", max_bytes=200) is not None)
+
+    # --- 解析失败 → 一条都不发 ---
+    api = _MediaApi()
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti={}, oembed=None), api)
+    check("YouTube 解析失败返回「没回」",
+          await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
+    check("★ 解析失败时一条都没发", api.sent == [], repr(api.sent))
+
+    # --- ★ 成功日志必须带配图张数和字节数 ---
+    # 这条钉的是**可观测性**：推文的图分 orig/large/medium/small 四档，
+    # 「已回 markdown 卡片」四种情况长得一模一样，不写尺寸的话事后回答不了
+    # 「发出去的到底是不是原图」—— 这个真发生过一次。
+    import logging  # noqa: PLC0415
 
     class _Grab(logging.Handler):
         def __init__(self):
@@ -2980,111 +3027,15 @@ async def _check_media_preview_inner() -> None:
     done = [ln for ln in grab.lines if "已回" in ln]
     check("★ 成功日志带配图张数和字节数",
           bool(done) and "配图 1 张" in done[-1] and "KB" in done[-1], repr(done[-1:]))
-    check("★ 成功日志带配图 URL（档位写在 ?name= 里）",
-          bool(done) and "name=orig" in done[-1], repr(done[-1:]))
-
-    # --- X：没配图 → 退回 markdown 卡片（不传 media）---
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_PHOTO), api)
-    check("无图推文也返回「回了」", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    check("★ 无图时不上传", api.uploaded == [], repr(api.uploaded))
-    sent = api.sent[0]
-    check("★ 无图时 msg_type=2（markdown）", sent.get("msg_type") == 2, repr(sent))
-    check("markdown 是外层 content 包裹", "content" in (sent.get("markdown") or {}), repr(sent))
-    check("markdown 里没有 media", "media" not in sent, repr(list(sent)))
-
-    # --- ★★ 纯图推（没有正文）：绝不能把 raw_text 那个 dict 打出来 ---
-    # 实测 2026-10-20 群里 @latiechi 那条（9913 赞、一张图）就是被这个坑到的：
-    # 卡片第一行是
-    #   {'text': 'https://t.co/61cVhplQpn', 'display_text_range': [0, 0], 'facets': [...]}
-    check("★ 纯图推：_tweet_text 拿不到正文就返回空串，**不是 dict 的 repr**",
-          _pv._tweet_text(_FX_NO_TEXT["tweet"]) == "",
-          repr(_pv._tweet_text(_FX_NO_TEXT["tweet"])))
-    check("★ 正文非空时照常取 text（回退根本不该走到）",
-          _pv._tweet_text(_FX_OK["tweet"]).startswith("No one is born"))
-    check("老版 API 的 raw_text 是字符串，也要吃",
-          _pv._tweet_text({"raw_text": "老版正文"}) == "老版正文")
-    check("text 缺失但 raw_text 是对象时，取里面的 text",
-          _pv._tweet_text({"raw_text": {"text": "对象里的正文"}}) == "对象里的正文")
-    check("★ 整段只有 t.co 链接 → 当没有正文（纯图推的 raw_text 就是它）",
-          _pv._tweet_text({"raw_text": {"text": "https://t.co/abc123"}}) == "")
-    check("★ raw_text 是 null / 缺字段 / 数字 都不炸",
-          [_pv._tweet_text({"raw_text": v}) for v in (None, 42, [], {})] == ["", "", "", ""])
-
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_TEXT, image=b"\xff\xd8t"), api)
-    check("纯图推也返回「回了」（图照发）", await bot._preview_media(_FakeMsg(_X_TEXT)) is True)
-    body = (api.sent[0].get("content") or "")
-    check("★ 卡片正文里没有 `{`（dict 的痕迹）", "{" not in body, repr(body))
-    check("★ 也没有 `raw_text` / `display_text_range` / `facets` 这些字段名",
-          not any(k in body for k in ("raw_text", "display_text_range", "facets")), repr(body))
-    check("★ 正文退化成「作者 + 数据 + 链接」，图还在",
-          "Barack Obama (@BarackObama)" in body and "点赞" in body
-          and body.rstrip().endswith("status/896523232098078720"),
-          repr(body))
-    check("★ 纯图推的图还是照传（图走 media，和正文无关）", len(api.uploaded) == 1)
-
-    # --- QQ 的 5M 直传上限 ---
-    # 官方对 `file_data` 的原话是「直接上传二进制有大小限制，需要在 5M 以内」，
-    # 而**这个 5M 限的是 base64 之后那一串**，不是原始字节。所以
-    # 「原始图能有多大」= 5MiB × 3/4，这条关系必须钉死：它一旦被违反，日常
-    # 撞到的是平台拒绝，而日志里看着像「上传失败」，排查方向就全错了。
-    b64_len = len(_b64.b64encode(b"\x00" * _pv.MAX_IMAGE_BYTES))
-    check(
-        "★ MAX_IMAGE_BYTES 的图 base64 后不超 5M 直传上限",
-        b64_len <= _pv.MAX_FILE_DATA_BYTES,
-        f"{_pv.MAX_IMAGE_BYTES} 字节 → base64 {b64_len}，上限 {_pv.MAX_FILE_DATA_BYTES}",
-    )
-
-    # 闸门本身：直接喂超限字节，必须在上传**之前**就放弃
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
-    oversize = b"\xff\xd8" + b"\x00" * (4 * 1024 * 1024)  # base64 后 ~5.6MB
-    check("★ base64 超 5M 时 _upload_image 返回 None",
-          await bot._upload_image("G1", oversize) is None)
-    check("★ 超限时根本没发上传请求", api.uploaded == [], repr(api.uploaded))
-
-    # 边界内侧必须能过：3MiB → base64 4MiB
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(), api)
-    check("3MiB 的图能过闸",
-          await bot._upload_image("G1", b"\xff\xd8" + b"\x00" * (3 * 1024 * 1024)) == "FI")
-    check("过闸时确实发了上传请求", len(api.uploaded) == 1, repr(api.uploaded))
-
-    # --- 上传失败 / 上传抛异常 → 都要降级，但**文字必须照发** ---
-    for label, api in (("上传没拿到 file_info", _MediaApi(upload_ok=False)),
-                       ("上传抛异常", _MediaApi(upload_raises=True))):
-        bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK), api)
-        check(f"{label} 时仍返回「回了」",
-              await bot._preview_media(_FakeMsg(_YT_TEXT)) is True)
-        check(f"★ {label} 时降级成 markdown", api.sent and api.sent[0].get("msg_type") == 2,
-              repr(api.sent))
-
-    # --- 图片下载失败（404）→ 同样降级，不发裂图 ---
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK, image_status=404), api)
-    check("封面 404 时仍返回「回了」", await bot._preview_media(_FakeMsg(_YT_TEXT)) is True)
-    check("★ 封面下载失败时不上传", api.uploaded == [], repr(api.uploaded))
-    check("★ 封面下载失败时降级成 markdown", api.sent[0].get("msg_type") == 2, repr(api.sent))
-
-    # --- 解析失败 → 一条都不发 ---
-    api = _MediaApi()
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti={}, oembed=None), api)
-    check("YouTube 解析失败返回「没回」",
-          await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
-    check("★ 解析失败时一条都没发", api.sent == [] and api.uploaded == [], repr(api.sent))
 
     # --- ★ 异常要被吃掉：不能冒到 botpy 的 _run_event ---
     class _BoomApi:
         async def post_group_message(self, **kw):
             raise RuntimeError("boom")
 
-        async def post_group_file(self, **kw):
-            return {"file_info": "FI"}
-
-    bot = _MediaBotStub(cfg, _FakeMediaHttp(yti=_YTI_OK), _BoomApi())
+    bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_NO_PHOTO), _BoomApi())
     check("★ 发送异常被吞掉并返回「没回」",
-          await bot._preview_media(_FakeMsg(_YT_TEXT)) is False)
+          await bot._preview_media(_FakeMsg(_X_TEXT)) is False)
 
 
 asyncio.run(_check_media_preview())
@@ -8251,7 +8202,7 @@ def _rp_end_to_end() -> None:
         def _make_repliers(self, message):
             async def reply(text: str) -> None:
                 self.replied.append(text)
-            return reply, None, None
+            return reply, None
 
     async def run() -> None:
         s = _Stub(_rp.Repeater(["G1"]))
@@ -8278,7 +8229,7 @@ def _rp_end_to_end() -> None:
             def _make_repliers(self, message):
                 async def reply(text: str) -> None:
                     raise RuntimeError("模拟发送失败")
-                return reply, None, None
+                return reply, None
 
         b = _Boom(_rp.Repeater(["G1"]))
         await b._maybe_repeat(_Msg("X", "A"), skip=False)

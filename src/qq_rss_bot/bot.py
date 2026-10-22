@@ -8,6 +8,7 @@ import itertools
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,6 @@ from .scheduler import (
     IMAGE_FAILURE_KEY_PREFIX,
     FeedPoller,
     image_failure_message,
-    send_with_retry,
 )
 from . import monday as monday_module
 from . import morning as morning_module
@@ -403,7 +403,7 @@ class RssBot(botpy.Client):
                 # 配了 NOTIFY_OPENIDS 时登记表本来就不参与投递，这段是给默认路径兜底的。
                 _log.info("群 %s 摘掉已非管理员的通知对象 %s", message.group_openid, member_openid[:8])
                 self.db.remove_notify_target(message.group_openid, member_openid)
-        reply, reply_card, _ = self._make_repliers(message)
+        reply, reply_card = self._make_repliers(message)
 
         # 「不发」：人工否决预览，挡下这一条不进正式群。
         #
@@ -462,7 +462,7 @@ class RssBot(botpy.Client):
         )
         if body is None:
             return False
-        reply, _, _ = self._make_repliers(message)
+        reply, _ = self._make_repliers(message)
         try:
             await reply(body)
         except Exception as exc:  # noqa: BLE001
@@ -513,7 +513,7 @@ class RssBot(botpy.Client):
                 )
                 return False
             # 非 @ 的消息不会有别人回，所以这条必定消耗 msg_seq=1，没有撞号风险
-            _reply, reply_card, _ = self._make_repliers(message)
+            _reply, reply_card = self._make_repliers(message)
             await reply_card(bilibili.render(data))
         except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
             # 对**群里**静默，但日志要留痕：没有这个栈，线上出问题只能靠猜
@@ -559,65 +559,51 @@ class RssBot(botpy.Client):
                 )
                 return False
 
-            _reply, reply_card, reply_rich = self._make_repliers(message)
-            infos: list[str] = []
-            # 和 `infos` 一一对应：上传成功的那些 URL。少了它就没法说清
-            # 「失败的是哪一张」—— `infos[k]` 是第 k 个**成功**的，不是 `urls[k]`。
-            ok_urls: list[str] = []
+            _reply, reply_card = self._make_repliers(message)
+            # **一条 markdown 带全部配图**（ticket #9）。以前是「首条带正文 +
+            # 每图一条」，1+N 条消息：刷屏，还吃掉 N+1 份消息额度。
+            #
+            # ⚠️ 图必须先入图库再渲染 —— markdown 的 `![](url)` 是 **QQ 的服务器**
+            # 去下载的，而它在大陆机房够不到 i.ytimg.com / pbs.twimg.com（实测）。
+            # 走图库之后，图是我们自己托管的，也顺带摆脱了 base64 那条 3.5 MB 上限。
+            urls = card.covers if self.cfg.preview_multi_image else card.covers[:1]
+            # 下载并发（走代理，4 张串行要十几秒）；入库是本地写盘，很快。
+            raws = await asyncio.gather(
+                *(preview.fetch_image(self.media_http, u, max_bytes=imgsrv.MAX_BYTES)
+                  for u in urls)
+            )
+            today = datetime.now().date().isoformat()
+            images: list[tuple[str, int, int]] = []  # (图库地址, 宽, 高)
             failed: list[str] = []
             cover_bytes = 0
-            if card.covers:
-                urls = card.covers if self.cfg.preview_multi_image else card.covers[:1]
-                # **并发下载、串行上传。** 下载走代理，4 张 1MB 的原图串行要
-                # 十几秒；上传是打 QQ 的接口，并发既没必要也可能触发频控。
-                # `fetch_image` 自己吞异常返回 None，所以 gather 不会炸。
-                raws = await asyncio.gather(
-                    *(preview.fetch_image(self.media_http, u) for u in urls)
+            for url, raw in zip(urls, raws):
+                if not raw:
+                    failed.append(url)  # 下载失败 / 超体积上限
+                    continue
+                ref = self.library.store(
+                    raw,
+                    kind=imagelib.KIND_PREVIEW,
+                    event_date=today,
+                    source_url=url,
+                    page_url=card.url,
+                    source_id=target.vid,
                 )
-                for url, raw in zip(urls, raws):
-                    if not raw:
-                        failed.append(url)  # 下载失败 / 超 MAX_IMAGE_BYTES
-                        continue
-                    cover_bytes += len(raw)
-                    info = await self._upload_image(message.group_openid, raw)
-                    if info:
-                        infos.append(info)
-                        ok_urls.append(url)
-                    else:
-                        failed.append(url)  # base64 超 5M 或 /files 被拒
+                if ref is None:
+                    failed.append(url)  # 超过图库的体积上限
+                    continue
+                cover_bytes += len(raw)
+                images.append((ref.url, ref.width, ref.height))
 
-            if infos:
-                # 第一条带正文，其余每条一张图。`reply_rich` 共用同一个 msg_seq
-                # 计数器（见 `_make_repliers`），所以这里顺序发就行。
-                # 每条都走 `send_with_retry`：QQ 会用 500 +「请稍后重试」拒掉
-                # 连发里的某一条（多图时实测撞上过）。
-                try:
-                    await send_with_retry(reply_rich, preview.render_text(card), infos[0])
-                except Exception:  # noqa: BLE001
-                    # 正文这条重试过还是发不出去 → 退回 markdown 卡片。
-                    # **别让这次分享变成「什么都没回」** —— 图丢了，文字还在。
-                    _log.warning("图文回复失败，退回 markdown 卡片", exc_info=True)
-                    await reply_card(preview.render_markdown(card))
-                    failed.extend(ok_urls)  # 一张都没送出去
-                else:
-                    for index, (info, url) in enumerate(
-                        zip(infos[1:], ok_urls[1:]), start=2
-                    ):
-                        try:
-                            await send_with_retry(
-                                reply_rich, f"（图 {index}/{len(infos)}）", info
-                            )
-                        except Exception:  # noqa: BLE001
-                            # **正文已经发出去了**，这里再抛会把整条拖去走
-                            # `except` 的「没回」分支，日志也跟着变成误导性的
-                            # 「预览失败」。后续某张图掉了就只丢那一张。
-                            _log.warning("第 %d 张配图回复失败，跳过", index, exc_info=True)
-                            failed.append(url)
-            else:
-                # 没有封面（推文本来就没图 / 下载失败 / 上传失败）→ markdown
-                # 卡片。这条路**不能带图**：markdown 的图片要 QQ 自己去下载，
-                # 而它够不到这两个站点的图床。
-                await reply_card(preview.render_markdown(card))
+            try:
+                await reply_card(preview.render_markdown(card, images))
+            except Exception:  # noqa: BLE001
+                # **只对能观测到的错误降级。** 业务错误码非 0（比如没有 markdown
+                # 模板权限 304036）会抛出来；退回纯文字 + 链接，而不是退回另一种
+                # markdown —— markdown 本身没权限时，那个兜底也是白的。
+                # 「发出去但用户看不见」观测不到，不做自动降级。
+                _log.warning("markdown 卡片发不出去，退回纯文字", exc_info=True)
+                await _reply(preview.render_text(card))
+                failed.extend([u for u in urls])
         except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
             _log.warning("YouTube/X 预览失败", exc_info=True)
             return False
@@ -640,8 +626,8 @@ class RssBot(botpy.Client):
         # **无法回答**（这个已经发生过一次，只能靠重发来补证据）。
         # URL 也带上：档位就写在 `?name=` 里，扫一眼就能确认。
         detail = (
-            f"，配图 {len(infos)} 张 {cover_bytes // 1024}KB {card.covers[0]}"
-            if infos
+            f"，配图 {len(images)} 张 {cover_bytes // 1024}KB"
+            if images
             else ""
         )
         _log.info(
@@ -649,45 +635,10 @@ class RssBot(botpy.Client):
             message.group_openid,
             target.site,
             target.vid,
-            "图文卡片" if infos else "纯文字卡片",
+            "markdown 卡片" if images else "纯文字卡片",
             detail,
         )
         return True
-
-    async def _upload_image(self, group_openid: str, raw: bytes) -> str | None:
-        """把图片字节交给 QQ，拿回 `file_info`。失败返回 None（调用方降级）。
-
-        **走 base64 而不是 URL**，原因见 preview.py 的模块说明：QQ 的服务器
-        拉不到 i.ytimg.com / pbs.twimg.com。`post_group_file` 能收 `file_data`
-        是靠 compat.py 的补丁三 —— botpy 原版签名里没有这个形参。
-
-        `file_data` 官方限 5M，**限的是 base64 之后那一串**，不是原始字节。
-        正常路径上 `preview.MAX_IMAGE_BYTES` 已经卡过一道，这里再挡一次是为了
-        让超限在日志里读作「图太大」而不是「上传失败」—— 两者的排查方向不同。
-        """
-        payload = base64.b64encode(raw).decode()
-        if len(payload) > preview.MAX_FILE_DATA_BYTES:
-            _log.warning(
-                "preview：原图 %d 字节 base64 后 %d 字节，超 QQ 的 5M 直传上限，这张不发图",
-                len(raw),
-                len(payload),
-            )
-            return None
-        try:
-            resp = await self.api.post_group_file(
-                group_openid=group_openid,
-                file_type=1,  # 1=图片
-                file_data=payload,
-                srv_send_msg=False,  # 只上传拿 file_info，不单独发一条
-            )
-        except Exception:  # noqa: BLE001 —— 上传失败只该让这张卡片没图
-            _log.warning("preview：上传封面失败", exc_info=True)
-            return None
-        file_info = resp.get("file_info") if isinstance(resp, dict) else None
-        if not file_info:
-            _log.warning("preview：上传封面没拿到 file_info: %r", resp)
-            return None
-        return str(file_info)
 
     def _make_repliers(self, message: GroupMessage):
         """被动回复的两个出口：纯文本 / 带按钮的 markdown。
@@ -734,30 +685,7 @@ class RssBot(botpy.Client):
             if code:
                 raise RuntimeError(f"发送按钮卡片失败 code={code}: {resp}")
 
-        async def reply_rich(content: str, file_info: str) -> None:
-            """富媒体（图文）被动回复。
-
-            **必须和上面两个共用同一个 seq 计数器** —— 同一个 msg_id 下重复的
-            msg_seq 会被平台静默丢弃，症状是「偶尔不回复」，日志里什么都看不到。
-
-            走这条路而不是 markdown 卡片，是因为 **markdown 的 `![](url)` 要求
-            QQ 的服务器自己去下载那张图**，而它拉不到 i.ytimg.com /
-            pbs.twimg.com（见 preview.py 的模块说明）。富媒体的图是我们上传的
-            字节，不经过 QQ 的下载环节。
-            """
-            resp = await self.api.post_group_message(
-                group_openid=message.group_openid,
-                msg_type=7,  # 7=富媒体（图文）
-                msg_id=message.id,
-                msg_seq=next(seq),
-                content=content,
-                media={"file_info": file_info},
-            )
-            code = resp.get("code") if isinstance(resp, dict) else None
-            if code:
-                raise RuntimeError(f"发送富媒体消息失败 code={code}: {resp}")
-
-        return reply, reply_card, reply_rich
+        return reply, reply_card
 
     async def on_c2c_message_create(self, message) -> None:
         """私聊。
