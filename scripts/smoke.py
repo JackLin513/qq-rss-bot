@@ -7523,16 +7523,34 @@ def _ba_three() -> None:
     lines = md.splitlines()
     check("★ markdown 首行是标题", lines[0] == "🎨 **杜野凛世** 誕生祭 2026", lines[0])
     check("★ 图带尺寸提示（缺了手机端整条不渲染）",
-          lines[1].startswith("![画师 #320px #400px](http://img.test/abc123/x.jpg)"), lines[1])
+          lines[1].startswith("![画师 #320px #480px](http://img.test/abc123/x.jpg)"), lines[1])
     check("★ 图下面是可点击的署名（点赞 + 类别 + handle）",
           lines[2].startswith("[♥ 3.2k · 画师 @someartist](https://x.com/"), lines[2])
-    check("尺寸是按真实宽高算的（320x480 → 320x400，被 MAX_H 夹住）",
-          "#320px #400px" in lines[1])
+    # 2026-10-22：这里原来被 `multiimage.MAX_H`(400) 夹住，320x480 的图写成
+    # `#320px #400px` —— **比例被拉扁了**。尺寸提示里两个数的比例就是 QQ
+    # 缩放用的比例，夹高度 = 拉伸。所以只许缩**宽度**。
+    check("★ 比例按原图来（320x480 → 320x480，**不许**被 MAX_H 夹成 400）",
+          "#320px #480px" in lines[1], lines[1])
     bad = ba.render_markdown(
         "某人", [(_ba_art(1, likes=1), b"not an image", "画师", "http://img.test/x.jpg")],
         2026)
     check("★ 读不出宽高的图直接跳过（宁可不放，也不放被压扁的）",
           "![" not in bad, bad)
+
+    # ---- display_size：比例必须和原图一致，只允许缩放 ----
+    for (w, h) in [(1000, 1500), (1000, 2500), (1920, 1080), (3000, 500),
+                   (800, 3200), (600, 600), (320, 480)]:
+        dw, dh = ba.display_size(w, h)
+        want = w / h
+        got = dw / dh
+        check(f"★ 比例不变：{w}x{h} → {dw}x{dh}",
+              abs(got - want) / want < 0.02 and dw <= ba.MARKDOWN_IMAGE_W,
+              f"{got:.3f} vs {want:.3f}")
+    check("普通比例就用满 320 宽", ba.display_size(1000, 1500) == (320, 480))
+    check("★ 超长图缩的是**宽度**，不是高度",
+          ba.display_size(1000, 2500) == (256, 640), str(ba.display_size(1000, 2500)))
+    check("宽图不被撑高", ba.display_size(3000, 500) == (320, 53),
+          str(ba.display_size(3000, 500)))
 
     # ---------- 名额按偶像各算一份 ----------
     two = [A(11, 9000, "official_x", idol="角色A"), A(12, 8000, "seiyuu_a", idol="角色A"),

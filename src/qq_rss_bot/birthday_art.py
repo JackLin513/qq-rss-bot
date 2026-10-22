@@ -516,6 +516,26 @@ def _id_of(text: str) -> str:
 
 # markdown 里一张图的显示宽度。6 张挤在一条里，320 差不多一屏半。
 MARKDOWN_IMAGE_W = 320
+# 长条图（高度超过这个）缩小**显示宽度**，但比例一个字都不动。
+MARKDOWN_IMAGE_MAX_H = 640
+
+
+def display_size(w: int, h: int) -> tuple[int, int]:
+    """→ (显示宽, 显示高)，**比例和原图严格一致**。
+
+    ⚠️ 别拿 `multiimage.MAX_H`（400）去夹高度。那个常数是给 208 宽的资讯多图
+    定的，320 宽下 2:3 的插图画出来是 480，一夹就被拉扁 ——
+    2026-10-22 实测就是这样：6 张里 2 张变成 `#320px #400px`，肉眼一看比例就不对。
+    **比例永远不动，只动缩放**：太长的图缩窄显示宽度。
+    """
+    if w <= 0 or h <= 0:
+        return MARKDOWN_IMAGE_W, MARKDOWN_IMAGE_MAX_H
+    width = MARKDOWN_IMAGE_W
+    height = max(1, round(width * h / w))
+    if height > MARKDOWN_IMAGE_MAX_H:
+        height = MARKDOWN_IMAGE_MAX_H
+        width = max(1, round(height * w / h))
+    return width, height
 
 
 def render_markdown(
@@ -538,10 +558,8 @@ def render_markdown(
         if size is None:
             _log.info("贺图：%s 的图读不出宽高，markdown 里跳过", art.id)
             continue
-        w, h = size
-        disp_h = max(multiimage.MIN_H,
-                     min(multiimage.MAX_H, round(MARKDOWN_IMAGE_W * h / w)))
-        lines.append(f"![{label} #{MARKDOWN_IMAGE_W}px #{disp_h}px]({url})")
+        width, height = display_size(*size)
+        lines.append(f"![{label} #{width}px #{height}px]({url})")
         lines.append(f"[♥ {_likes(art.likes)} · {label} @{art.author}]({art.url})")
     return "\n".join(lines)
 
