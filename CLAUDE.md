@@ -313,7 +313,7 @@ sudo /usr/local/bin/docker-compose up -d --force-recreate bot
 | 小偶像的每日早安语音 | `morning.py` | [`docs/morning.md`](docs/morning.md) |
 | 偶像生日推送（23:05） | `birthday.py` | [`docs/birthday.md`](docs/birthday.md) |
 | 誕生祭 贺图聚合（22:30） | `birthday_art.py` | [`docs/birthday-art.md`](docs/birthday-art.md) |
-| **自建图床**（markdown 的图 QQ 抓不到推特，得自己托管） | `imgsrv.py` | [`docs/imgsrv.md`](docs/imgsrv.md) |
+| **图库 + 图床**（markdown 的图 QQ 抓不到推特，得自己托管；按内容寻址存） | `imagelib.py` `imgsrv.py` | [`docs/imgsrv.md`](docs/imgsrv.md) |
 | 限流、配额与出错通知 | `quota.py` `notify.py` | [`docs/quota-notify.md`](docs/quota-notify.md) |
 | 群复读机（连着两个人发同样的话就跟一句） | `repeat.py` | [`docs/repeat.md`](docs/repeat.md) |
 | **声优库**（角色→现任声优 / X 账号 / 官号，进仓库；贺图三分类的数据底座） | `seiyuu.toml` `scripts/fetch_seiyuu*.py` | [`docs/seiyuu-db.md`](docs/seiyuu-db.md) |

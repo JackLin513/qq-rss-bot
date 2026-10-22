@@ -38,7 +38,7 @@ from . import monday as monday_module
 from . import morning as morning_module
 from .birthday import BirthdayPoller
 from .birthday_art import BirthdayArtPoller
-from . import imgsrv
+from . import imagelib, imgsrv
 from .monday import MondayPoller
 from .morning import MorningPoller
 from .tickets import TicketPoller
@@ -134,16 +134,14 @@ class RssBot(botpy.Client):
         # `imgsrv` 是**自建图床**：markdown 的图由 QQ 的服务器去抓，而它在大陆机房
         # 够不到 pbs.twimg.com —— 所以图先落本地、用我们自己的公网地址给它抓。
         # 端口开不起来不拖垮机器人（`start()` 只打 WARNING）。
+        lib_dir = cfg.imagelib_dir or (cfg.db_path.parent / "library")
+        self.library = imagelib.Library(self.db, lib_dir, cfg.imgsrv_base)
         self.imgsrv = imgsrv.ImageServer(
-            cfg.imgsrv_dir or (cfg.db_path.parent / "imgserve"),
-            cfg.imgsrv_base,
-            port=cfg.imgsrv_port,
-            ttl_days=cfg.imgsrv_ttl_days,
-        )
+            self.library.root, cfg.imgsrv_base, port=cfg.imgsrv_port)
         self.imgsrv.start()
         self.birthday_art = BirthdayArtPoller(
             cfg, self.db, self.sender, self.media_http, notifier=self.notifier,
-            imgsrv=self.imgsrv,
+            library=self.library,
         )
         self._birthday_art_task: Any = None
         # 群复读机：连着两个人发同样的话，跟着复读一句。**没有 task** ——

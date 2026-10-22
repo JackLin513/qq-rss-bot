@@ -139,6 +139,42 @@ CREATE TABLE IF NOT EXISTS birthday_art_posts (
     PRIMARY KEY (day, group_openid)
 );
 
+-- 图库（见 docs/adr/0002）。物理文件按内容寻址：`blobs/<sha 前两位>/<sha>.<ext>`。
+-- 这里两张表的分工：`images` 是**内容本身的属性**，`image_refs` 是
+-- **这张图在某个上下文里出现过一次**。同一份字节被两个功能引用 → 一行 images、
+-- 两行 image_refs。
+CREATE TABLE IF NOT EXISTS images (
+    sha256    TEXT PRIMARY KEY,
+    ext       TEXT NOT NULL,
+    mime      TEXT NOT NULL,
+    bytes     INTEGER NOT NULL,
+    width     INTEGER NOT NULL,
+    height    INTEGER NOT NULL,
+    stored_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS image_refs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256           TEXT NOT NULL REFERENCES images(sha256),
+    kind             TEXT NOT NULL,   -- art / preview / feed（见 imagelib 的常量）
+    role             TEXT,            -- 角色名；只有贺图有，其余为空
+    brand            TEXT,            -- 品牌快照（生日表会改）
+    author_handle    TEXT,
+    author_name      TEXT,            -- 当时的显示名（会改名，必须快照）
+    author_category  TEXT,            -- 公式 / 本人 / 声優 / 画师
+    likes_at_capture INTEGER,         -- 点赞快照（会一直涨）
+    posted_at        TEXT,            -- 原始发表时间
+    event_date       TEXT NOT NULL,   -- 业务日期，分类用它（不要用入库时间）
+    source_url       TEXT,            -- 图片原始 URL
+    page_url         TEXT,            -- 推文 / 视频 / 条目的页面
+    source_id        TEXT,            -- 推文 id / 视频 id / 条目 id
+    captured_at      TEXT NOT NULL,
+    UNIQUE (sha256, kind, event_date, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_image_refs_role ON image_refs (role, event_date);
+CREATE INDEX IF NOT EXISTS idx_image_refs_kind ON image_refs (kind, event_date);
+
 -- 按群的「功能开关」—— 每个群单独决定收不收某个功能的推送。
 -- **这是群列表的唯一来源**（`.env` 里没有群参数，`Config` 里也没有 `*_groups`）。
 -- 见 features.py 的模块说明：为什么落库、为什么不留半个在 .env 里。
@@ -681,6 +717,80 @@ class Database:
             (day, group_openid, sent, tweets, utcnow()),
         )
         self._conn.commit()
+
+    # ---------- 图库（见 imagelib.py）----------
+
+    def image_put(self, *, sha256: str, ext: str, mime: str, size: int,
+                  width: int, height: int) -> bool:
+        """记一份**内容本身**的属性。返回 True 表示这份内容以前没见过。
+
+        ⚠️ 只用 `INSERT OR IGNORE`：同一份字节第二次入库时，宽这些字段不该被
+        后来者覆盖（它是同一份内容，属性必然一样）。
+        """
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO images (sha256, ext, mime, bytes, width, height, stored_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sha256, ext, mime, size, width, height, utcnow()),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def image_ref_add(self, *, sha256: str, kind: str, event_date: str,
+                      role: str = "", brand: str = "", author_handle: str = "",
+                      author_name: str = "", author_category: str = "",
+                      likes_at_capture: int | None = None, posted_at: str = "",
+                      source_url: str = "", page_url: str = "",
+                      source_id: str = "") -> bool:
+        """记一次「出现」。返回 True 表示这是新的一条引用。
+
+        `UNIQUE(sha256, kind, event_date, source_id)` 挡掉重复入库 —— 同一张图
+        在同一天被同一个功能重复处理时，不该堆出一串一模一样的行。
+        """
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO image_refs (
+                sha256, kind, role, brand, author_handle, author_name,
+                author_category, likes_at_capture, posted_at, event_date,
+                source_url, page_url, source_id, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sha256, kind, role or None, brand or None, author_handle or None,
+             author_name or None, author_category or None, likes_at_capture,
+             posted_at or None, event_date, source_url or None, page_url or None,
+             source_id or None, utcnow()),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def image_has(self, sha256: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM images WHERE sha256 = ?", (sha256,)
+        ).fetchone() is not None
+
+    def image_refs(self, *, role: str | None = None, kind: str | None = None,
+                   date: str | None = None, limit: int = 200) -> list[dict]:
+        """按角色 / 类别 / 日期查引用。**分类是查询，不是目录**（ADR 0002）。
+
+        日期是按 `event_date` 的前缀比（传 `2026` 就是这一年），因为业务上更常问
+        「某年」而不是「某天」。
+        """
+        sql = ["SELECT r.*, i.ext, i.width, i.height, i.bytes FROM image_refs r",
+               "JOIN images i ON i.sha256 = r.sha256 WHERE 1=1"]
+        args: list[object] = []
+        if role is not None:
+            sql.append("AND r.role = ?")
+            args.append(role)
+        if kind is not None:
+            sql.append("AND r.kind = ?")
+            args.append(kind)
+        if date:
+            sql.append("AND r.event_date LIKE ?")
+            args.append(f"{date}%")
+        sql.append("ORDER BY r.event_date DESC, r.id DESC LIMIT ?")
+        args.append(limit)
+        return [dict(r) for r in self._conn.execute(" ".join(sql), args)]
 
     # ---------- 出错时私聊谁 ----------
 

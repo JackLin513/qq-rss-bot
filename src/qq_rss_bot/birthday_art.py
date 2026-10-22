@@ -120,6 +120,7 @@ import httpx
 
 from . import birthday as birthday_module
 from . import features
+from . import imagelib
 from . import multiimage
 from . import preview
 from . import seiyuu
@@ -772,16 +773,16 @@ class BirthdayArtPoller:
 
     def __init__(self, cfg, db, sender, media_http, notifier=None, *,
                  groups_override: tuple[str, ...] | None = None,
-                 imgsrv=None) -> None:
+                 library=None) -> None:
         self.cfg = cfg
         self.db = db
         self.sender = sender
         self.http = media_http
         self.notifier = notifier
-        # 自建图床（`imgsrv.ImageServer`）。**必须有** —— markdown 的图是 QQ 的
-        # 服务器去抓的，它在大陆机房够不到 pbs.twimg.com。没有它就只能退回
-        # 发不出去的原始 URL（探针/单测里就是这么跑的）。
-        self.imgsrv = imgsrv
+        # 图库（`imagelib.Library`）。**必须有** —— markdown 的图是 QQ 的服务器
+        # 去抓的，它在大陆机房够不到 pbs.twimg.com。没有它就只能退回发不出去的
+        # 原始 URL（探针/单测里就是这么跑的）。
+        self.library = library
         # 只给探针/测试用：把「发哪些群」钉死，不去动库里的开关。
         # 生产路径永远是 None，走 `groups` 属性（每拍重查库）。
         self._groups_override = groups_override
@@ -1012,12 +1013,11 @@ class BirthdayArtPoller:
         # 去抓**的，而 `pbs.twimg.com` 在大陆机房根本够不到（预热两遍 45s / 180s
         # 群里都没有图）。落盘只做一次，所有群共用同一批 URL。
         leaked = 0
-        if self.imgsrv is None or not self.imgsrv.enabled:
+        if self.library is None or not self.library.enabled:
             _log.warning(
                 "贺图：没有配图床（IMGSRV_BASE 为空）—— markdown 里会用推特原始 URL，"
                 "**QQ 抓不到，群里不会有图**")
-        else:
-            self.imgsrv.cleanup()
+        brands = {i.name: i.brand for i in day.idols}
         messages: list[tuple[str, list[str]]] = []
         for idol in idols:
             items = picked.get(idol) or []
@@ -1025,11 +1025,28 @@ class BirthdayArtPoller:
                 continue
             rows: list[tuple[Art, bytes, str, str]] = []
             for a, raw in items:
-                url = self.imgsrv.publish(raw, a.id) if self.imgsrv else None
-                if url is None:
+                label = classify(a)[1]
+                ref = self.library.store(
+                    raw,
+                    kind=imagelib.KIND_ART,
+                    event_date=day_key,
+                    role=idol,
+                    brand=brands.get(idol, ""),
+                    author_handle=a.author,
+                    author_name=a.author_name,
+                    author_category=label,
+                    likes=a.likes,
+                    posted_at=a.posted_at,
+                    source_url=a.image,
+                    page_url=a.url,
+                    source_id=a.id,
+                ) if self.library is not None else None
+                if ref is None:
                     url = a.image
                     leaked += 1
-                rows.append((a, raw, classify(a)[1], url))
+                else:
+                    url = ref.url
+                rows.append((a, raw, label, url))
             md = render_markdown(idol, rows, d.year)
             messages.append((md, [_id_of(a.url) for a, _ in items]))
         if leaked:

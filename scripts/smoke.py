@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import time
+import types as _types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -7036,24 +7037,21 @@ class _BaSender:
         self.sent.append((group, content, Path(path).read_bytes()))
 
 
-class _BaImg:
-    """假图床。只记下发布了什么，返回一个**明显不是推特**的地址 ——
+class _BaFakeLib:
+    """假图库。只记下存了什么，返回一个**明显不是推特**的地址 ——
     这样「markdown 里到底是哪条 URL」一眼就能钉。"""
 
     enabled = True
 
     def __init__(self, fail: bool = False) -> None:
-        self.published: list[str] = []
+        self.stored: list[dict] = []
         self.fail = fail
 
-    def cleanup(self, *, force: bool = False) -> int:
-        return 0
-
-    def publish(self, raw: bytes, stem: str) -> str | None:
-        self.published.append(stem)
+    def store(self, raw: bytes, **kw):
+        self.stored.append(kw)
         if self.fail:
             return None
-        return f"http://img.test/{stem}.jpg"
+        return _types.SimpleNamespace(url=f"http://img.test/{kw.get('source_id')}.jpg")
 
 
 class _BaResp:
@@ -7598,8 +7596,8 @@ async def _ba_poller() -> None:
             check(f"  {why}时不发也不炸", n == 0)
 
         # ---- 正常一轮 ----
-        db, sender, img = _ba_db(), _BaSender(), _BaImg()
-        p = ba.BirthdayArtPoller(_ba_cfg(tmp), db, sender, _BaHttp(), imgsrv=img)
+        db, sender, img = _ba_db(), _BaSender(), _BaFakeLib()
+        p = ba.BirthdayArtPoller(_ba_cfg(tmp), db, sender, _BaHttp(), library=img)
         now = datetime(2026, 10, 19, 22, 30, 30)
         arts = [_ba_art(i, likes=1000 - i * 10) for i in range(1, 4)]
         n = await p.poll_once(now=now, arts=arts)
@@ -7615,14 +7613,14 @@ async def _ba_poller() -> None:
         #   markdown 的图是 **QQ 的服务器**去抓的，它在大陆机房够不到 pbs.twimg.com。
         check("★★ 图走自建图床，**不是** pbs.twimg.com",
               "pbs.twimg.com" not in md1 and "http://img.test/" in md1, md1[:200])
-        check("★ 每张图都真的发布过一次（3 张 → 3 次）", len(img.published) == 3)
+        check("★ 每张图都真的入库过一次（3 张 → 3 次）", len(img.stored) == 3)
         check("落库了，记了条数和推文 id",
               db.rows and db.rows[0][2] == 3 and len(db.rows[0][3].split(",")) == 3, str(db.rows))
 
         # ---- 图床拒绝发布时退回原始 URL（会显示不出来，但前端不能崩）----
         s0 = _BaSender()
         q0 = ba.BirthdayArtPoller(
-            _ba_cfg(tmp), _ba_db(), s0, _BaHttp(), imgsrv=_BaImg(fail=True))
+            _ba_cfg(tmp), _ba_db(), s0, _BaHttp(), library=_BaFakeLib(fail=True))
         n0 = await q0.poll_once(now=now, arts=arts)
         check("★ 图床发布失败 → 仍然发（退回原始 URL），不抛",
               n0 == 3 and "pbs.twimg.com" in s0.sent[0][1], str(n0))
@@ -7794,8 +7792,10 @@ def _ba_wiring() -> None:
           "self.birthday_art.run()" in inspect.getsource(RssBot.on_ready))
     check("close() 里停了它", "self.birthday_art.stop()" in inspect.getsource(RssBot.close))
     # ★ 图床必须接进线上进程 —— 光有 imgsrv.py 不算功能（markdown 的图是 QQ 去抓的）
-    check("★ bot 里建了图床并 start()", "imgsrv.ImageServer(" in init and "self.imgsrv.start()" in init)
-    check("★ 图床传进了轮询器", "imgsrv=self.imgsrv" in init)
+    check("★ bot 里建了图库和图床", "imagelib.Library(" in init and "imgsrv.ImageServer(" in init)
+    check("★ 图床 start() 了（不 start 等于群里没图）", "self.imgsrv.start()" in init)
+    check("★ 图床服务的是图库的 blobs 目录", "self.library.root" in init)
+    check("★ 图库传进了轮询器", "library=self.library" in init)
     check("close() 里关了它", "self.imgsrv.stop()" in inspect.getsource(RssBot.close))
 
     # ★ 三分类真的接进轮询器了（源码钉子 —— 光有纯函数不算功能）
@@ -7889,23 +7889,26 @@ _ba_wiring()
 # 自建图床
 # ---------------------------------------------------------------------------
 
-print("[4.97.1] 自建图床 imgsrv（真开端口，全本机）")
+print("[4.97.1] 图库 + 图床（真开端口、真写盘、真建索引）")
 
 
 def _imgsrv() -> None:
-    """⚠️ 这一节**真的会 bind 一个端口**（内核分配的临时端口，`port=0`）。
+    """⚠️ 这一节**真的会 bind 一个端口**（内核分配的临时端口，`port=0`），
+    并且真的往磁盘写文件、真的用 SQLite 建索引。
 
-    为什么值得真跑：2026-10-22 那次「预热两遍群里都没图」，根因就是 markdown 的
-    图是 **QQ 的服务器**去抓的，而 `pbs.twimg.com` 在大陆机房够不到。图床这条路
-    一旦有洞（路径穿越、404 写成 200、Content-Type 错了），现象还是「群里没图」，
-    和当初一模一样 —— 所以这里把 HTTP 行为也钉住。
+    为什么值得真跑：2026-10-22 那次「预热两遍群里都没图」，根因是 markdown 的
+    图是 **QQ 的服务器**去抓的，而 `pbs.twimg.com` 在大陆机房够不到。图库/图床
+    这条路一旦有洞（去重失效、路径穿越、404 写成 200、Content-Type 错了），
+    现象还是「群里没图」，和当初一模一样。
     """
 
     import tempfile as _tf  # noqa: PLC0415
     import urllib.error as _urle  # noqa: PLC0415
     import urllib.request as _urlr  # noqa: PLC0415
 
+    from qq_rss_bot import imagelib as _il  # noqa: PLC0415
     from qq_rss_bot import imgsrv as _is  # noqa: PLC0415
+    from qq_rss_bot.db import Database as _DB  # noqa: PLC0415
 
     def get(url: str):
         try:
@@ -7916,23 +7919,49 @@ def _imgsrv() -> None:
 
     jpeg = _BaHttp._FAKE_JPEG
     with _tf.TemporaryDirectory() as td:
-        root = Path(td) / "imgserve"
-        srv = _is.ImageServer(root, "http://img.test:18080", port=0, ttl_days=7)
-        check("没配 base → 关闭（生产里那等于贺图没图，所以启动会 WARNING）",
-              not _is.ImageServer(root, "").enabled)
-        check("配了 base → 开启", srv.enabled)
+        db = _DB(Path(td) / "bot.db")
+        root = Path(td) / "library"
+        lib = _il.Library(db, root, "http://img.test:18080")
+        check("没配 base → 图床关闭（启动会 WARNING，群里等于没图）",
+              not _il.Library(db, Path(td) / "lib2", "").enabled)
+
+        ref = lib.store(jpeg, kind=_il.KIND_ART, event_date="2026-10-19",
+                        role="杜野凛世", brand="シャイニーカラーズ",
+                        author_handle="eluthel1", author_name="える",
+                        author_category="画师", likes=8924,
+                        posted_at="2026-10-19T20:53:00+09:00",
+                        source_url="https://pbs.twimg.com/media/X.jpg?name=orig",
+                        page_url="https://x.com/eluthel1/status/1", source_id="1")
+        check("★ 入库返回图库地址（/i/<sha>.<ext>）",
+              ref.url == f"http://img.test:18080/i/{ref.sha256}.jpg", ref.url)
+        check("★ URL 里没有任何 query 参数（加了 QQ 就抓不到）", "?" not in ref.url)
+        check("★ 文件按内容哈希分桶落盘", lib.path_of(ref.sha256, ".jpg").is_file())
+        check("宽高从字节解析并入库", (ref.width, ref.height) == (320, 480),
+              f"{ref.width}x{ref.height}")
+
+        # ---- 去重：同一份字节第二次入库只多一条引用 ----
+        again = lib.store(jpeg, kind=_il.KIND_ART, event_date="2026-10-19",
+                          role="杜野凛世", source_id="2")
+        check("★ 同一份内容 → 同一个地址", again.url == ref.url)
+        check("★ 第二次入库不算新内容（fresh=False）", again.fresh is False)
+        blobs = list((root / "blobs").rglob("*.jpg"))
+        check("★ 磁盘上只有一个文件（去重生效）", len(blobs) == 1, str(blobs))
+
+        # ---- 查询：分类是查询，不是目录（ADR 0002）----
+        got = db.image_refs(role="杜野凛世")
+        check("★ 按角色能查回来，而且两条引用都在", len(got) == 2, str(len(got)))
+        check("  引用的元数据是入库那一刻的快照",
+              "える" in [g["author_name"] for g in got])
+        check("按类别 + 日期前缀能查",
+              len(db.image_refs(kind=_il.KIND_ART, date="2026")) == 2)
+        check("查不到就是空", db.image_refs(kind=_il.KIND_FEED) == [])
+        check("★ 两条引用指向同一个 sha",
+              {g["sha256"] for g in got} == {ref.sha256})
+
+        # ---- 图床：真的发一次 HTTP ----
+        srv = _is.ImageServer(lib.root, "http://img.test:18080", port=0)
         check("★ start() 真的把端口开起来了", srv.start() is True, str(srv.port))
         try:
-            url = srv.publish(jpeg, "1900000000000000001")
-            check("publish 返回的是我们自己的公网地址",
-                  url is not None and url.startswith("http://img.test:18080/")
-                  and url.endswith(".jpg"), url or "None")
-            token = url.split("/")[-2] if url else ""
-            check("★ 路径段是 32 位随机十六进制（猜不到）",
-                  len(token) == 32 and all(c in "0123456789abcdef" for c in token), token)
-            check("两张图拿到**不同**的 token", srv.publish(jpeg, "x") != url)
-
-            # 真发一次 HTTP
             base = f"http://127.0.0.1:{srv.port}"
             import logging as _lg  # noqa: PLC0415
 
@@ -7945,53 +7974,33 @@ def _imgsrv() -> None:
             cap = _Cap()
             _lg.getLogger("qq_rss_bot.imgsrv").addHandler(cap)
             _lg.getLogger("qq_rss_bot.imgsrv").setLevel(_lg.INFO)
-            status, ctype, body = get(base + url[len("http://img.test:18080"):])
+            status, ctype, body = get(base + f"/i/{ref.sha256}.jpg")
             _lg.getLogger("qq_rss_bot.imgsrv").removeHandler(cap)
             check("★ 能取回图片，字节一模一样", status == 200 and body == jpeg,
                   f"{status} {len(body)}")
-            # 「群里没图」时第一个要回答的是 **QQ 到底有没有来抓** —— 全靠这行。
-            info = [r for r in seen if r.levelno == _lg.INFO]
-            check("★ 每次取图都留一行 INFO 访问日志（含状态码）",
-                  bool(info) and "200" in info[0].getMessage(), str([r.getMessage() for r in info]))
-            check("  日志里只有 token 前缀，不是完整 key",
-                  info and token not in " ".join(r.getMessage() for r in info),
-                  str([r.getMessage() for r in info]))
             check("★ Content-Type 按扩展名给对（错了 QQ 不渲染）",
                   ctype == "image/jpeg", str(ctype))
+            info = [r for r in seen if r.levelno == _lg.INFO]
+            check("★ 每次取图都留一行 INFO 访问日志（含状态码）",
+                  bool(info) and "200" in info[0].getMessage(),
+                  str([r.getMessage() for r in info]))
+            check("  日志里只有哈希前缀，不是完整文件名",
+                  bool(info) and ref.sha256 not in " ".join(r.getMessage() for r in info))
 
-            # 404 的各种姿势
             for path, why in [
-                (f"/{token}/", "目录（不给列表）"),
                 ("/", "根"),
-                ("/" + "0" * 32 + "/x.jpg", "不存在的 token"),
-                (f"/{token}/../../etc/passwd", "路径穿越"),
-                (f"/{token}/x.exe", "非图片扩展名"),
-                (f"/{'A' * 32}/x.jpg", "大写 token（正则只认小写）"),
+                ("/i/", "空文件名"),
+                (f"/i/{ref.sha256}", "没有扩展名"),
+                (f"/i/{ref.sha256}.exe", "非图片扩展名"),
+                (f"/i/{ref.sha256.upper()}.jpg", "大写哈希（正则只认小写）"),
+                ("/i/" + "0" * 64 + ".jpg", "不存在的哈希"),
+                (f"/i/{ref.sha256[:32]}.jpg", "哈希长度不对（旧 token 那种）"),
+                ("/i/../../etc/passwd", "路径穿越"),
             ]:
                 st, _ct, _b = get(base + path)
                 check(f"★ 404：{why}", st == 404, str(st))
         finally:
             srv.stop()
-
-        # ---- 魔数定扩展名（推特 URL 上的后缀经常骗人）----
-        check("魔数 jpeg", _is.suffix_of(b"\xff\xd8\xff\xe0rest") == ".jpg")
-        check("魔数 png", _is.suffix_of(b"\x89PNG\r\n\x1a\nrest") == ".png")
-        check("认不出的退成 .jpg（能显示比精确更重要）", _is.suffix_of(b"???") == ".jpg")
-
-        # ---- TTL 清理（**另起一个空目录** —— 上面那个已经发过好几张了）----
-        troot = Path(td) / "ttl"
-        srv2 = _is.ImageServer(troot, "http://img.test", port=0, ttl_days=1)
-        srv2.publish(jpeg, "old1")
-        srv2.publish(jpeg, "old2")
-        dirs = [d for d in troot.iterdir() if d.is_dir()]
-        check("发布两个文件 → 两个 token 目录", len(dirs) == 2, str(len(dirs)))
-        old = 2 * 86400
-        for d in dirs:
-            os.utime(d, (time.time() - old, time.time() - old))
-        check("★ 过期目录被清掉", srv2.cleanup(force=True) == 2)
-        check("清完目录真的空了", not [d for d in troot.iterdir() if d.is_dir()])
-        fresh = srv2.publish(jpeg, "new")
-        check("★ 没过期的不动", srv2.cleanup(force=True) == 0 and fresh is not None)
 
         # ---- 端口被占：不抛，只打 WARNING ----
         srv_busy = _is.ImageServer(Path(td) / "busy", "http://img.test", port=0)
@@ -8000,10 +8009,21 @@ def _imgsrv() -> None:
             srv3 = _is.ImageServer(Path(td) / "busy2", "http://img.test",
                                    port=srv_busy.port)
             check("★ 端口被占 → start() 返回 False，不抛异常", srv3.start() is False)
-            check("  ……而且 publish() 照样能写文件（图床挂了不该拖垮贺图）",
-                  srv3.publish(jpeg, "x") is not None)
         finally:
             srv_busy.stop()
+
+        # ---- 魔数定类型 ----
+        check("魔数 jpeg", _is.suffix_of(b"\xff\xd8\xff\xe0rest") == ".jpg")
+        check("魔数 png", _is.suffix_of(b"\x89PNG\r\n\x1a\nrest") == ".png")
+        check("认不出的退成 .jpg（能显示比精确更重要）", _is.suffix_of(b"???") == ".jpg")
+        check("mime 跟着扩展名", _is.mime_of(".png") == "image/png")
+
+        # ---- 超限的图不入库（否则等于留一个永远打不开的地址）----
+        giant = b"\xff\xd8\xff" + b"\0" * (_is.MAX_BYTES + 1)
+        check("★ 超过上限的图不入库",
+              lib.store(giant, kind=_il.KIND_ART, event_date="2026-10-19",
+                        source_id="huge") is None)
+        db.close()
 
 
 _imgsrv()
