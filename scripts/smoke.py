@@ -7814,6 +7814,10 @@ def _ba_wiring() -> None:
     #   这个 bug 只有真按 --send 才会现形（离线 smoke 和 --search 都照不出来），
     #   所以在这儿用源码缩进把它钉死。
     probe = (Path(__file__).resolve().parents[1] / "scripts" / "probe_birthday_art.py").read_text()
+    # 2026-10-22 踩过：.env 里留着 SKIP_OFFICIAL=true，官方号被整个丢掉，
+    # 而探针不打印这个开关 —— 「为什么没有官方图」查了一轮才看出来。
+    check("★ 探针会打印 skip_official（否则「为什么没有官方图」看不出来）",
+          "skip_official={cfg.birthday_art_skip_official}" in probe)
     plines = probe.splitlines()
     iw = next((n for n, ln in enumerate(plines) if "async with preview.make_client" in ln), -1)
     ip = next((n for n, ln in enumerate(plines) if "await poller.poll_once(" in ln), -1)

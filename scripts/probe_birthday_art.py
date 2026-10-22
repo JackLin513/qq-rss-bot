@@ -206,7 +206,15 @@ async def main() -> int:
     cfg = load_config()
     print(f"配置：enabled={cfg.birthday_art_enabled} time={cfg.birthday_art_time} "
           f"window={cfg.birthday_art_window_sec}s max={cfg.birthday_art_max} "
-          f"min_likes={cfg.birthday_art_min_likes}")
+          f"min_likes={cfg.birthday_art_min_likes} "
+          f"skip_official={cfg.birthday_art_skip_official}")
+    # ⚠️ `skip_official=True` 会把官方号**整个丢掉**（名额回流给画师），
+    # 而这条规则只在 `select()` 里打 INFO 日志 —— 探针没配 logging，等于看不见。
+    # 2026-10-22 就是这么绕了一轮：测试群里没有官方图，查了半天才发现是 .env 里
+    # 还留着 `BIRTHDAY_ART_SKIP_OFFICIAL=true`。
+    if cfg.birthday_art_skip_official:
+        print("  ⚠️ 官方号会被**整个丢掉**（BIRTHDAY_ART_SKIP_OFFICIAL=true）"
+              " —— 想按「官号 1 格」发就改成 false")
     print(f"  代理 media_proxy={cfg.media_proxy or '（空 = 直连）'}")
     print(f"  图床 imgsrv_base={cfg.imgsrv_base or '（空 = 关闭！markdown 里的图 QQ 抓不到）'}"
           f" port={cfg.imgsrv_port} dir={cfg.imgsrv_dir}")
@@ -313,6 +321,13 @@ async def main() -> int:
             skip_official=cfg.birthday_art_skip_official,
             classify=classify,
         )
+        n_off = sum(1 for a in arts if classify(a)[0] == seiyuu.CATEGORY_OFFICIAL)
+        if n_off:
+            in_head = sum(1 for a in head
+                          if classify(a)[0] == seiyuu.CATEGORY_OFFICIAL)
+            print(f"  官方号候选 {n_off} 条，选中 {in_head} 条"
+                  + ("（⚠️ skip_official=true，全被丢掉）"
+                     if cfg.birthday_art_skip_official else ""))
         print(f"过滤后合格 {len(head) + len(rest)} 条；按偶像分组"
               f"（每个偶像最多 {cfg.birthday_art_max} 张，一人一条 markdown）：")
         per_idol: dict[str, list] = {}
