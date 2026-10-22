@@ -1040,7 +1040,7 @@ class BirthdayArtPoller:
                     source_url=a.image,
                     page_url=a.url,
                     source_id=a.id,
-                ) if self.library is not None else None
+                ) if (self.library is not None and self.library.enabled) else None
                 if ref is None:
                     url = a.image
                     leaked += 1
