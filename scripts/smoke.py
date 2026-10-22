@@ -8698,6 +8698,14 @@ def _sy_handles() -> None:
               and (persons.get(n) or {}).get("source") == "manual"
               for n in ("原由実", "佐藤亜美菜")),
           str([persons.get(n) for n in ("原由実", "佐藤亜美菜")]))
+    # ⚠️ 这五个人的原号已删，现在的账号是**冒名/戏耍号** —— 存活校验和昵称
+    # 比对都拦不住（号是活的、昵称还能伪装）。只有人工能发现。
+    troll = ("成海瑠奈", "照井春佳", "高田憂希", "八代拓", "佳村はるか")
+    check("★ 已删号的五个人留空 —— 现在的号是冒名的，不是本人",
+          all((persons.get(n) or {}).get("handle") == ""
+              and (persons.get(n) or {}).get("source") == "manual"
+              for n in troll),
+          str([(n, (persons.get(n) or {}).get("handle")) for n in troll]))
 
 
 _sy_birthday_page()

@@ -60,9 +60,9 @@ officials = 11
 "佐倉薫" = { "handle" = "s_a_k_u_r_a_k", "source" = "wikidata" }
 "佐藤亜美菜" = { "handle" = "", "source" = "manual", "note" = "查到的是广播节目号（アミメン！），不是本人" }
 "佐藤利奈" = { "handle" = "rinasatoh", "source" = "wikidata" }
-"佳村はるか" = { "handle" = "lulucan_himitsu", "source" = "wikidata", "note" = "账号虽在但昵称/bio 无本人信息，用户说可能已退网" }
+"佳村はるか" = { "handle" = "", "source" = "manual", "note" = "原账号已删除，@lulucan_himitsu 现在是冒名/戏耍号（2026-10-22 用户确认）" }
 "児玉卓也" = { "handle" = "kodama0623", "source" = "wikidata" }
-"八代拓" = { "handle" = "yashiro_taku", "source" = "wikidata", "note" = "账号虽在但昵称/bio 无本人信息，用户说可能已退网" }
+"八代拓" = { "handle" = "", "source" = "manual", "note" = "原账号已删除，@yashiro_taku 现在是冒名/戏耍号（2026-10-22 用户确认）" }
 "八巻アンナ" = { "handle" = "annakoto117", "source" = "wikidata" }
 "内田真礼" = { "handle" = "MaayaUchida", "source" = "wikidata" }
 "内田雄馬" = { "handle" = "i_am_yumauchida", "source" = "manual" }
@@ -135,7 +135,7 @@ officials = 11
 "徳丸完" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "徳武竜也" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "愛美" = { "handle" = "aimi_sound", "source" = "manual" }
-"成海瑠奈" = { "handle" = "runaNOakami", "source" = "wikidata" }
+"成海瑠奈" = { "handle" = "", "source" = "manual", "note" = "原账号已删除，@runaNOakami 现在是冒名/戏耍号（2026-10-22 用户确认）" }
 "戸松遥" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "戸田めぐみ" = { "handle" = "todamegumi", "source" = "wikidata" }
 "斉藤佑圭" = { "handle" = "yuka_s1113", "source" = "wikidata" }
@@ -194,7 +194,7 @@ officials = 11
 "滝田樹里" = { "handle" = "jurieedom", "source" = "wikidata" }
 "濱健人" = { "handle" = "020762Kent", "source" = "wikidata" }
 "濱野大輝" = { "handle" = "daikiteasy", "source" = "wikidata" }
-"照井春佳" = { "handle" = "teruiharuka", "source" = "wikidata" }
+"照井春佳" = { "handle" = "", "source" = "manual", "note" = "原账号已删除，@teruiharuka 现在是冒名/戏耍号（2026-10-22 用户确认）" }
 "熊谷健太郎" = { "handle" = "k_kumagaihk", "source" = "wikidata" }
 "牧野由依" = { "handle" = "yuiyui_makino", "source" = "wikidata" }
 "狩野翔" = { "handle" = "Sho_karino", "source" = "wikidata" }
@@ -277,7 +277,7 @@ officials = 11
 "高森奈津美" = { "handle" = "takamori_723", "source" = "wikidata" }
 "高橋李依" = { "handle" = "taka8rie", "source" = "wikidata" }
 "高橋花林" = { "handle" = "karin_takahashi", "source" = "wikidata" }
-"高田憂希" = { "handle" = "sunflower930316", "source" = "wikidata", "note" = "bio 自称「サブ」（副号），昵称无本人信息" }
+"高田憂希" = { "handle" = "", "source" = "manual", "note" = "原账号已删除，@sunflower930316 现在是冒名/戏耍号（2026-10-22 用户确认）" }
 "髙橋ミナミ" = { "handle" = "miiiiiina_cat", "source" = "wikidata" }
 "髙野麻美" = { "handle" = "", "source" = "manual", "note" = "用户确认没有个人 X 账号" }
 "麻倉もも" = { "handle" = "Asakura_Staff", "source" = "wikidata" }
