@@ -8670,11 +8670,42 @@ def _sy_file() -> None:
               set(no_off) <= all_brands, str(sorted(set(no_off) - all_brands)))
 
 
+def _sy_handles() -> None:
+    """查号脚本的判据（纯函数）+ 三个实测踩到的坑。"""
+    import sys as _sys  # noqa: PLC0415
+
+    _sys.path.insert(0, str(_SY_ROOT / "scripts"))
+    import fetch_seiyuu_handles as _fh  # noqa: PLC0415
+
+    check("★ bio 里「→ @新号」能识别（Wikidata 的 P2002 会过期）",
+          bool(_fh.bio_warning("→ @Amamiyastaff", "sora_haruyasumi")))
+    check("指向自己不算",
+          _fh.bio_warning("→ @sameone", "sameone") == "")
+    check("★ 广播节目的账号能被识别（查到的是节目，不是本人）",
+          bool(_fh.bio_warning("この番組の公式アカウントです", "haramaru_radio")))
+    check("普通 bio 不误报",
+          _fh.bio_warning("声優です。よろしくお願いします。", "someone") == "")
+
+    import tomllib as _tl  # noqa: PLC0415
+    data = _tl.loads((_SY_ROOT / "src" / "qq_rss_bot" / "seiyuu.toml")
+                     .read_text(encoding="utf-8"))
+    persons = data.get("persons") or {}
+    check("★ 雨宮天 用的是现在的官号（旧号 bio 指向它）",
+          (persons.get("雨宮天") or {}).get("handle") == "Amamiyastaff",
+          str(persons.get("雨宮天")))
+    check("★ 原由実 / 佐藤亜美菜 留空（查到的是节目号），且标了 manual 防止被重新填错",
+          all((persons.get(n) or {}).get("handle") == ""
+              and (persons.get(n) or {}).get("source") == "manual"
+              for n in ("原由実", "佐藤亜美菜")),
+          str([persons.get(n) for n in ("原由実", "佐藤亜美菜")]))
+
+
 _sy_birthday_page()
 _sy_parse()
 _sy_build()
 _sy_render_merge()
 _sy_file()
+_sy_handles()
 
 print("[5] 真实抓取 RSSHub")
 cfg = load_config()

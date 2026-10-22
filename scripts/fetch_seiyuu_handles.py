@@ -168,6 +168,44 @@ def x_status(opener, handle: str) -> tuple[int, str]:
         return 0, ""
 
 
+REDIRECT_RE = re.compile(r"^\s*(?:→|⇨|->|⇒)\s*@([A-Za-z0-9_]+)\s*$")
+
+
+def bio_warning(bio: str, handle: str) -> str:
+    """bio 里露出的「这个号不对」信号。空串 = 没发现问题。
+
+    2026-10-22 实测抓到过三种：`→ @新号`（雨宮天，Wikidata 的 P2002 过期）、
+    `番組のアカウントです`（原由実 / 佐藤亜美菜，查到的是广播节目号）。
+    """
+    m = REDIRECT_RE.match(bio)
+    if m and m.group(1).lower() != handle.lower():
+        return f"bio 指向 @{m.group(1)}（这个号多半是旧的）"
+    if "番組" in bio and "アカウント" in bio:
+        return "这看起来是**节目**账号，不是本人"
+    if "公式アカウントです" in bio and "スタッフ" not in bio and "本人" not in bio:
+        return "自称公式账号 —— 确认一下是不是本人的"
+    return ""
+
+
+def x_profile(opener, handle: str) -> tuple[int, str, str]:
+    """→ (状态, 显示名, bio)。✓ 只读前 150 KB。"""
+    req = urllib.request.Request(f"https://x.com/{handle}", headers={"User-Agent": X_UA})
+    try:
+        with opener.open(req, timeout=20) as resp:
+            head = resp.read(150000).decode("utf-8", "replace")
+            code = resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code, "", ""
+    except Exception:  # noqa: BLE001
+        return 0, "", ""
+    import html as _html
+    t = re.search(r"<title>(.*?)</title>", head, re.S)
+    b = re.search(r'description\\?":\\?"(.*?)\\?"', head)
+    return (code,
+            _html.unescape(t.group(1)).strip() if t else "",
+            b.group(1) if b else "")
+
+
 def name_hint(name: str, title: str) -> bool:
     """昵称里有没有名字的痕迹（整名，或任意连续两个字）。"""
     n, t = _norm(name), _norm(title)
@@ -271,12 +309,42 @@ def _write_library(path: Path, data: dict, persons: dict, now: datetime) -> None
     tmp.replace(path)
 
 
+def _render_checklist(rows: list[tuple[str, str, str, bool]],
+                      warnings: list[tuple[str, str, str]], fetched_at: datetime) -> str:
+    good = [r for r in rows if r[3]]
+    bad = [r for r in rows if not r[3]]
+    out = [
+        "# 声优 X 账号复核清单（库里已填的全部）",
+        "",
+        f"生成于 {fetched_at.isoformat(timespec='seconds')}。共 {len(rows)} 个。",
+        "",
+        "每一行都是**真的请求过 x.com/<handle>**（200 才留下）并抓了页面昵称与 bio。",
+        "",
+    ]
+    if warnings:
+        out += [f"## ⚠️ bio 露出的可疑信号（{len(warnings)}）", "",
+                "这些不一定是错的，但**优先看**：", "",
+                "| 声优 | handle | 信号 |", "|---|---|---|"]
+        out += [f"| {n} | @{h} | {w} |" for n, h, w in warnings]
+        out.append("")
+    out += [f"## 昵称里能找到名字（{len(good)}）", "", "| 声优 | handle | 昵称 |",
+            "|---|---|---|"]
+    out += [f"| {n} | @{h} | {t[:60] or '（空）'} |" for n, h, t, _ in good]
+    out += ["", f"## 昵称里找不到名字（{len(bad)}）—— 建议逐个点开看一眼", "",
+            "| 声优 | handle | 昵称 |", "|---|---|---|"]
+    out += [f"| {n} | @{h} | {t[:60] or '（空）'} |" for n, h, t, _ in bad]
+    out.append("")
+    return "\n".join(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--only", action="append", default=[], help="只查这些人（可重复）")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--proxy", default=None)
     ap.add_argument("--limit", type=int, default=0, help="只查前 N 个（调试用）")
+    ap.add_argument("--recheck", action="store_true",
+                    help="不查新的，只复核库里已有的 handle 并写完整清单")
     args = ap.parse_args()
 
     proxy = args.proxy or fs.fb._env_proxy()
@@ -284,7 +352,37 @@ def main() -> int:
     data = tomllib.loads(LIB.read_text(encoding="utf-8"))
     persons = {k: dict(v) for k, v in (data.get("persons") or {}).items()}
 
-    todo = [n for n, v in persons.items() if not v.get("handle")]
+    if args.recheck:
+        have = [(n, v["handle"]) for n, v in persons.items() if v.get("handle")]
+        print(f"复核库里已有的 {len(have)} 个 handle…")
+
+        def _rc(item):
+            name, handle = item
+            code, title, bio = x_profile(opener, handle)
+            return name, handle, title if code == 200 else f"HTTP {code}", \
+                code == 200 and name_hint(name, title), bio
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            raw = list(pool.map(_rc, have))
+        rows = [(n, h, t, ok) for n, h, t, ok, _ in raw]
+        warnings = [(n, h, w) for n, h, _, ok, bio in raw
+                    if ok and (w := bio_warning(bio, h))]
+        dead = [r for r in rows if not r[3] and r[2].startswith("HTTP")]
+        print(f"  存活 {len(rows) - len(dead)} / {len(rows)}；"
+              f"昵称对得上 {sum(1 for r in rows if r[3])}；"
+              f"bio 可疑 {len(warnings)}")
+        for n, h, t, ok in dead:
+            print(f"  ❌ {n} @{h} {t}")
+        for n, h, w in warnings:
+            print(f"  ⚠️  {n} @{h} — {w}")
+        path = REVIEW.with_name("seiyuu-handles-checklist.md")
+        path.write_text(_render_checklist(rows, warnings, datetime.now(fs.CST)),
+                        encoding="utf-8")
+        print(f"写出 {path}（不进 git）")
+        return 1 if dead else 0
+
+    todo = [n for n, v in persons.items()
+            if not v.get("handle") and v.get("source") != "manual"]
     if args.only:
         todo = [n for n in args.only if n in persons]
     if args.limit:

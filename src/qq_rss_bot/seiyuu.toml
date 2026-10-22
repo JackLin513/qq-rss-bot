@@ -58,7 +58,7 @@ officials = 11
 "会沢紗弥" = { "handle" = "_saya_aizawa", "source" = "wikidata" }
 "佐倉綾音" = { "handle" = "", "source" = "auto" }
 "佐倉薫" = { "handle" = "s_a_k_u_r_a_k", "source" = "wikidata" }
-"佐藤亜美菜" = { "handle" = "amimen_agqr", "source" = "wikidata" }
+"佐藤亜美菜" = { "handle" = "", "source" = "manual", "note" = "查到的是广播节目号（アミメン！），不是本人" }
 "佐藤利奈" = { "handle" = "rinasatoh", "source" = "wikidata" }
 "佳村はるか" = { "handle" = "lulucan_himitsu", "source" = "wikidata" }
 "児玉卓也" = { "handle" = "kodama0623", "source" = "wikidata" }
@@ -77,7 +77,7 @@ officials = 11
 "原涼子" = { "handle" = "suzuko_hara", "source" = "wikidata" }
 "原田ひとみ" = { "handle" = "vhitomin", "source" = "wikidata" }
 "原田彩楓" = { "handle" = "sayaka_harada_", "source" = "wikidata" }
-"原由実" = { "handle" = "haramaru_radio", "source" = "wikidata" }
+"原由実" = { "handle" = "", "source" = "manual", "note" = "查到的是广播节目号（はらまる大盛），不是本人" }
 "原紗友里" = { "handle" = "harasayuri_81", "source" = "wikidata" }
 "古川慎" = { "handle" = "", "source" = "auto" }
 "古畑恵介" = { "handle" = "KSK__F", "source" = "wikidata" }
@@ -265,7 +265,7 @@ officials = 11
 "阿部里果" = { "handle" = "", "source" = "auto" }
 "陽高真白" = { "handle" = "hitaka_mashiro", "source" = "wikidata" }
 "集貝はな" = { "handle" = "HN_TMGI_", "source" = "wikidata" }
-"雨宮天" = { "handle" = "sora_haruyasumi", "source" = "wikidata" }
+"雨宮天" = { "handle" = "Amamiyastaff", "source" = "manual", "note" = "旧号 @sora_haruyasumi 的 bio 指向这里" }
 "青木志貴" = { "handle" = "eerieXeery", "source" = "wikidata" }
 "青木瑠璃子" = { "handle" = "", "source" = "auto" }
 "飯田ヒカル" = { "handle" = "Iida_Hikaru_828", "source" = "wikidata" }
