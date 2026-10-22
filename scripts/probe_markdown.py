@@ -1,6 +1,15 @@
 """实测 markdown（`msg_type=2`）的渲染边界 —— **只发测试群**。
 
-三个数在离线永远测不出来，只能真发：
+## 结论（2026-10-22）：**横排放弃**
+
+`--case row` / `--case widths` 这两组是当时为了「两张竖图并排放」做的实验。
+结论是**没有可用的统一参数** —— 一行能并排几张、每张多大，完全取决于设备：
+同一组图在手机端两列能挤进去、三列不行，等宽 / 等高 / 总宽 240–300 四档也
+各不相同。所以**图一张一行**，别再试横排（CLAUDE.md 的平台硬事实里也记了一条）。
+
+`row` / `widths` 两个 case 保留着，万一以后想复测，参数都在。
+
+## 三个数在离线永远测不出来，只能真发：
 
 1. **一条消息最多渲染几张图**（库里没有这个数据，`multiimage.MAX_IMAGES` 是猜的）
 2. **正文能有多长**（`multiimage.MAX_CHARS = 4000` 是软上限，不是实测值）
@@ -30,6 +39,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import httpx  # noqa: E402
 
+from qq_rss_bot import multiimage  # noqa: E402
 from qq_rss_bot.config import load_config  # noqa: E402
 
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
@@ -93,6 +103,80 @@ class _Sender:
         await self.client.aclose()
 
 
+async def _row_md_total(client, urls: list[str], total: int) -> str:
+    """**等高 + 按比例分宽**，让这一行两张图的**总宽**尽量接近 `total`。
+
+    先定高：`H = 总宽 / Σ(宽高比)`，再让每张宽 = `H × 各自的宽高比`。
+    这样两张**高度完全一样**（整齐），宽度各自不同（比例不变）。
+    """
+    sizes = []
+    for url in urls:
+        resp = await client.get(url)
+        wh = multiimage.image_size(resp.content) if resp.status_code == 200 else None
+        sizes.append(wh)
+    ratios = [(w / h) for wh in sizes if wh for w, h in [wh]]
+    if len(ratios) != len(urls) or not ratios:
+        return "**读不到宽高，跳过**"
+    height = max(1, round(total / sum(ratios)))
+    parts = []
+    for index, (url, wh) in enumerate(zip(urls, sizes), start=1):
+        w, h = wh
+        dw = max(1, round(height * w / h))
+        parts.append(f"![图{index} #{dw}px #{height}px]({url})")
+    real = sum(round(height * w / h) for w, h in sizes)
+    lines = [f"**等高横排：目标总宽 {total}px（实际 {real}px），高 {height}px**"]
+    lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+async def _row_md_height(client, urls: list[str], height: int) -> str:
+    """**等高**的一行：定高度，宽度各自按比例算。
+
+    等宽（`_row_md`）在宽高比接近的图上看着还行，差得多就参差不齐。
+    等高才是整齐的排法 —— 代价是每张宽度不同。
+    """
+    lines = [f"**等高横排：{len(urls)} 张，高 {height}px**"]
+    parts: list[str] = []
+    for index, url in enumerate(urls, start=1):
+        resp = await client.get(url)
+        wh = multiimage.image_size(resp.content) if resp.status_code == 200 else None
+        if wh is None:
+            lines.append(f"（图 {index} 读不到宽高，跳过）")
+            continue
+        w, h = wh
+        dw = max(1, round(height * w / h))
+        parts.append(f"![图{index} #{dw}px #{height}px]({url})")
+    if parts:
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
+async def _row_md(client, urls: list[str], width: int, *, separate: bool) -> str:
+    """同一行摆 N 张图（`separate=True` 就是各占一行，做对照）。
+
+    **尺寸提示必须按每张的真实宽高算** —— 比例写错图会被拉扁，那样就分不清
+    「横排失败」和「比例错了」。
+    """
+    lines = [f"**{'各占一行' if separate else '横排'}：{len(urls)} 张，宽 {width}px**"]
+    parts: list[str] = []
+    for index, url in enumerate(urls, start=1):
+        resp = await client.get(url)
+        wh = multiimage.image_size(resp.content) if resp.status_code == 200 else None
+        if wh is None:
+            lines.append(f"（图 {index} 读不到宽高，跳过）")
+            continue
+        w, h = wh
+        dh = max(1, round(width * h / w))
+        parts.append(f"![图{index} #{width}px #{dh}px]({url})")
+    if separate:
+        lines.extend(parts)
+    elif parts:
+        # ⚠️ 关键就是这一行：**同一行、空格分隔**。markdown 里图片是行内元素，
+        # 同一个段落里的多张图理论上会并排渲染 —— 但 QQ 的渲染器认不认，只能试。
+        lines.append(" ".join(parts))
+    return "\n".join(lines)
+
+
 def _md(urls: list[str], *, head: str, tail: str = "") -> str:
     lines = [head]
     for i, u in enumerate(urls, start=1):
@@ -138,6 +222,33 @@ async def main() -> int:
             for n in (2000, 4000, 8000):
                 filler = "测" * n
                 plan.append((f"正文 {n} 字", _md(urls[:1], head=f"**【长度】{n} 字**\n{filler}")))
+        if case in ("all", "row"):
+            import httpx as _hx  # noqa: PLC0415
+
+            async with _hx.AsyncClient(timeout=30, follow_redirects=True) as hc:
+                plan.append(("横排 140px",
+                             await _row_md(hc, urls[:2], 140, separate=False)))
+                plan.append(("横排 110px",
+                             await _row_md(hc, urls[:2], 110, separate=False)))
+                if len(urls) >= 3:
+                    plan.append(("横排 3 张 110px",
+                                 await _row_md(hc, urls[:3], 110, separate=False)))
+                plan.append(("对照：各占一行",
+                             await _row_md(hc, urls[:2], 140, separate=True)))
+                plan.append(("等高横排 200px",
+                             await _row_md_height(hc, urls[:2], 200)))
+                plan.append(("等高横排 260px",
+                             await _row_md_height(hc, urls[:2], 260)))
+                if len(urls) >= 2:
+                    plan.append(("3 张横排 140px",
+                                 await _row_md(hc, urls + urls[:1], 140, separate=False)))
+        if case in ("all", "widths"):
+            import httpx as _hx  # noqa: PLC0415
+
+            async with _hx.AsyncClient(timeout=30, follow_redirects=True) as hc:
+                for total in (240, 260, 280, 300):
+                    plan.append((f"总宽 {total}px",
+                                 await _row_md_total(hc, urls[:2], total)))
         if case in ("all", "fresh"):
             # 用没发过的图（调用方保证这些 URL 是新生成的）**不预热**直接发
             fresh = urls[-1:]
