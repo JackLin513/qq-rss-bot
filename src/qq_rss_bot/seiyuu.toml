@@ -571,13 +571,15 @@ officials = 11
 # 企划 / 品牌 / 游戏的官号。last_post_at 是**事实**，只用于人工维护，
 # 运行时**不读** —— 别把它当成「活跃/不活跃」的判断。
 [officials]
-"SideM_GS" = { "brand" = "sidem", "kind" = "brand", "source" = "manual", "last_post_at" = "2023-08-01T20:36:03+09:00" }
+"SideM_GS" = { "brand" = "sidem", "kind" = "brand", "source" = "manual", "last_post_at" = "2023-08-01T20:36:03+09:00", "note" = "游戏已停服，账号停止运营（官方品牌号是 @SideM_official）" }
+"SideM_official" = { "brand" = "sidem", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-20T12:01:38+09:00" }
 "gkmas_official" = { "brand" = "gakuen", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T21:55:00+09:00" }
+"imas_CGofficial" = { "brand" = "cinderella", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T18:00:00+09:00" }
 "imas_ch" = { "brand" = "others", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T21:53:58+09:00" }
 "imas_official" = { "brand" = "765as", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T18:39:07+09:00" }
-"imas_poplinks" = { "brand" = "others", "kind" = "brand", "source" = "manual", "last_post_at" = "2022-08-06T15:00:01+09:00" }
-"imascg_chihiro" = { "brand" = "cinderella", "kind" = "brand", "source" = "manual", "last_post_at" = "2023-03-27T19:48:33+09:00" }
-"imasml_official" = { "brand" = "million", "kind" = "brand", "source" = "manual", "last_post_at" = "2018-03-19T12:04:30+09:00" }
+"imas_poplinks" = { "brand" = "others", "kind" = "brand", "source" = "manual", "last_post_at" = "2022-08-06T15:00:01+09:00", "note" = "游戏已停服，账号停止运营" }
+"imascg_chihiro" = { "brand" = "cinderella", "kind" = "brand", "source" = "manual", "last_post_at" = "2023-03-27T19:48:33+09:00", "note" = "ID 保管用，2023-04 起已移转到 @imas_CGofficial" }
+"imasml_official" = { "brand" = "million", "kind" = "brand", "source" = "manual", "last_post_at" = "2018-03-19T12:04:30+09:00", "note" = "游戏已停服，账号停止运营（现行是 @imasml_theater）" }
 "imasml_theater" = { "brand" = "million", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T10:30:00+09:00" }
 "imassc_official" = { "brand" = "shinycolors", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T15:01:00+09:00" }
 "shinyc_official" = { "brand" = "shinycolors", "kind" = "brand", "source" = "manual", "last_post_at" = "2026-10-21T19:00:01+09:00" }
