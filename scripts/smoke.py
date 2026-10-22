@@ -7302,13 +7302,14 @@ def _ba_official() -> None:
         _ba_art(10, likes=7878, author="BossMonkey0112", name="ボスモンキー"),
         _ba_art(11, likes=6195, author="eluthel1", name="アイルル"),
     ]
-    got = ba.rank_art(arts, ["杜野凛世"], min_likes=50)
-    check("★ 排掉官方号之后，第一名是画师 @BossMonkey0112（不是那个 8596 赞的官推）",
-          [a.author for a in got] == ["BossMonkey0112", "eluthel1"],
+    got = ba.rank_art(arts, ["杜野凛世"], min_likes=50, max_n=6)
+    check("★ 官方号**单列一格**、排第一（不再整个丢掉）",
+          [a.author for a in got][:3] == ["imassc_official", "BossMonkey0112", "eluthel1"],
           str([a.author for a in got]))
-    got2 = ba.rank_art(arts, ["杜野凛世"], min_likes=50, skip_official=False)
-    check("★ skip_official=False 就放回来（这个开关真起作用，不是摆设）",
-          got2[0].author == "imassc_official", str([a.author for a in got2]))
+    got2 = ba.rank_art(arts, ["杜野凛世"], min_likes=50, skip_official=True)
+    check("★ skip_official=True 是逃生门：官方号一条都不要",
+          [a.author for a in got2] == ["BossMonkey0112", "eluthel1"],
+          str([a.author for a in got2]))
 
 
 def _ba_rank() -> None:
@@ -7361,6 +7362,120 @@ def _ba_render() -> None:
     check("文案里带原推链接（署名是礼节也是实用）", "/status/" in got)
     check("_id_of 能从文案里取回推文 id", ba._id_of(got) == a.id, ba._id_of(got))
     check("_id_of 取不到时给空串", ba._id_of("没有链接") == "")
+
+
+def _ba_three() -> None:
+    """三分类 / 名额 / 回流 / 本人优先（全离线，分类接缝用假库）。"""
+    from qq_rss_bot import seiyuu  # noqa: PLC0415
+    from qq_rss_bot import birthday_art as ba  # noqa: PLC0415
+
+    book = seiyuu.Book(
+        roles={"角色A": "甲"},
+        handles={"甲": "seiyuu_a"},
+        character_handles={"角色V": "vtuber_v"},
+        officials=frozenset({"official_x"}),
+    )
+    check("★ 现任声优 → 声優",
+          seiyuu.classify(book, "seiyuu_a", "角色A") == ("person", "声優"))
+    check("★ A 的声优给 B 画 → 画师（人 × 角色 × 现任，缺一不可）",
+          seiyuu.classify(book, "seiyuu_a", "角色B") == ("artist", "画师"))
+    check("★ 角色本人的号 → 本人（和声优同一格）",
+          seiyuu.classify(book, "vtuber_v", "角色V") == ("person", "本人"))
+    check("★ 官号 → 公式",
+          seiyuu.classify(book, "official_x", "角色A") == ("official", "公式"))
+    check("handle 比较不分大小写",
+          seiyuu.classify(book, "SEIYUU_A", "角色A") == ("person", "声優"))
+    check("库为 None / handle 为空 → 画师",
+          seiyuu.classify(None, "x", "角色A") == ("artist", "画师")
+          and seiyuu.classify(book, "", "角色A") == ("artist", "画师"))
+
+    real = seiyuu.load()
+    check("★ 真库读得出来（进 git 的那份）", bool(real and real.roles and real.officials))
+    if real:
+        check("★ 真库：浅倉杏美 是 萩原雪歩 的现任",
+              seiyuu.classify(real, "azumi__asakura8", "萩原雪歩")
+              == ("person", "声優"))
+        check("★ 真库：上水流宇宙 的本人号",
+              seiyuu.classify(real, "kamizurucosmo", "上水流宇宙")
+              == ("person", "本人"))
+        check("★ 真库：前任声优算画师（former_roles 不参与判定）",
+              seiyuu.classify(real, "yurikacanary", "萩原雪歩")[0] == "artist")
+    check("★ 库文件不存在时 load 返回 None（不抛）",
+          seiyuu.load(Path("/nonexistent/seiyuu.toml")) is None)
+    check("★ 库读不到时退回「名字含公式」兜底",
+          ba.make_classifier(None)(
+              _ba_art(1, likes=1, author="x", name="某某公式"))[0] == "official")
+
+    c = ba.make_classifier(book)
+
+    def A(i: int, likes: int, author: str, idol: str = "角色A") -> object:
+        return _ba_art(i, likes=likes, author=author, idol=idol,
+                       name="某某公式" if author.startswith("official") else "某人")
+
+    # ---------- 名额 ----------
+    arts = [A(1, 9000, "official_x"), A(2, 8000, "seiyuu_a"),
+            A(3, 7000, "fan1"), A(4, 6000, "fan2"), A(5, 5000, "fan3"),
+            A(6, 4000, "fan4"), A(7, 3000, "fan5")]
+    got = ba.rank_art(arts, ["角色A"], min_likes=0, max_n=6, classify=c)
+    head = got[:6]
+    check("★ 名额 1+1+4：公式 → 声優 → 画师×4",
+          [c(a)[1] for a in head] == ["公式", "声優", "画师", "画师", "画师", "画师"],
+          str([(a.author, c(a)[1]) for a in head]))
+    check("同类别内按点赞降序",
+          [a.likes for a in head[2:]] == [7000, 6000, 5000, 4000],
+          str([a.likes for a in head[2:]]))
+
+    got = ba.rank_art([a for a in arts if a.author != "official_x"],
+                      ["角色A"], min_likes=0, max_n=6, classify=c)
+    check("★ 没有官号 → 空出的名额回流给画师（5 画师 + 1 声优）",
+          [c(a)[1] for a in got[:6]] == ["声優", "画师", "画师", "画师", "画师", "画师"],
+          str([c(a)[1] for a in got[:6]]))
+
+    got = ba.rank_art([a for a in arts if a.author != "seiyuu_a"],
+                      ["角色A"], min_likes=0, max_n=6, classify=c)
+    check("★ 没有声优 → 画师拿 5 个",
+          [c(a)[1] for a in got[:6]] == ["公式", "画师", "画师", "画师", "画师", "画师"],
+          str([c(a)[1] for a in got[:6]]))
+
+    got = ba.rank_art([a for a in arts if a.author.startswith("fan")],
+                      ["角色A"], min_likes=0, max_n=6, classify=c)
+    check("★ 只有画师 → 有几条发几条，全是画师",
+          [c(a)[1] for a in got] == ["画师"] * 5, str([c(a)[1] for a in got]))
+
+    # ---------- 官号名额只有 1（第二个进补位段） ----------
+    b_two = seiyuu.Book(roles={"角色A": "甲"}, handles={"甲": "seiyuu_a"},
+                        character_handles={},
+                        officials=frozenset({"official_x", "official_y"}))
+    c_two = ba.make_classifier(b_two)
+    two = arts + [A(8, 10000, "official_y")]
+    got = ba.rank_art(two, ["角色A"], min_likes=0, max_n=6, classify=c_two)
+    check("★ 官号名额只有 1 —— 第二个官方号进补位段，不占前 6",
+          [c_two(a)[1] for a in got[:6]].count("公式") == 1
+          and "official_x" in [a.author for a in got[6:]],
+          str([(a.author, c_two(a)[1]) for a in got[:8]]))
+
+    # ---------- 本人优先于声优 ----------
+    b_same = seiyuu.Book(roles={"角色A": "甲"}, handles={"甲": "seiyuu_a"},
+                         character_handles={"角色A": "vtuber_v"},
+                         officials=frozenset())
+    c_same = ba.make_classifier(b_same)
+    same = [_ba_art(1, likes=8000, author="seiyuu_a", idol="角色A"),
+            _ba_art(2, likes=100, author="vtuber_v", idol="角色A")]
+    got = ba.rank_art(same, ["角色A"], min_likes=0, max_n=6, classify=c_same)
+    check("★ 本人和声优同一天都发 → 本人优先（哪怕赞少很多）",
+          got[0].author == "vtuber_v", str([a.author for a in got]))
+
+    # ---------- 回流之后仍然每位作者最多一张 ----------
+    dup_fan = [A(1, 900, "fan1"), A(2, 800, "fan1"), A(3, 700, "fan2")]
+    got = ba.rank_art(dup_fan, ["角色A"], min_likes=0, max_n=6, classify=c)
+    check("回流之后仍然每位作者最多一张",
+          [a.author for a in got].count("fan1") == 1, str([a.author for a in got]))
+
+    # ---------- 署名 ----------
+    line = ba.render(_ba_art(1, likes=100, author="vtuber_v"), 1, 6, 2026,
+                     label="本人").splitlines()[1]
+    check("★ 署名用类别词（公式 / 本人 / 声優 / 画师）",
+          line == "♥ 100 · 本人 @vtuber_v", line)
 
 
 async def _ba_poller() -> None:
@@ -7550,8 +7665,18 @@ def _ba_wiring() -> None:
           "self.birthday_art.run()" in inspect.getsource(RssBot.on_ready))
     check("close() 里停了它", "self.birthday_art.stop()" in inspect.getsource(RssBot.close))
 
-    # ★ cookie 绝不进日志
+    # ★ 三分类真的接进轮询器了（源码钉子 —— 光有纯函数不算功能）
     src = Path(ba.__file__).read_text()
+    check("★ 轮询器每拍读一次声优库", "seiyuu.load()" in src)
+    check("★ 分类器传进了 rank_art（不是摆设）", "classify=classify" in src, "")
+    check("★ 文案的类别词来自分类器，不是写死「画师」",
+          "label=classify(a)[1]" in src)
+    from qq_rss_bot import config as _cfg_mod  # noqa: PLC0415
+    cfg_src = Path(_cfg_mod.__file__).read_text()
+    check("★ BIRTHDAY_ART_SKIP_OFFICIAL 默认 False（官号单列，不再整个丢）",
+          '_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", False)' in cfg_src)
+
+    # ★ cookie 绝不进日志
     log_src = "\n".join(ln for ln in src.splitlines() if "_log." in ln)
     check("★ 日志里只出现长度，不出现 cookie 内容",
           "x_auth_token" not in log_src and "x_ct0" not in log_src and "_auth" not in log_src)
@@ -7617,6 +7742,7 @@ _ba_product()
 _ba_official()
 _ba_rank()
 _ba_render()
+_ba_three()
 asyncio.run(_ba_poller())
 asyncio.run(_ba_fetch_fallback())
 _ba_real_table()

@@ -294,7 +294,9 @@ class Config:
     # 「别发一堆 0 赞垃圾」的兜底。想让冷门偶像一张都不发就往上调。
     birthday_art_min_likes: int = birthday_art_module.DEFAULT_MIN_LIKES
     birthday_art_exclude: tuple[str, ...] = ()
-    birthday_art_skip_official: bool = True
+    # ⚠️ 2026-10-22 起默认 **False**：官方号不再整个丢掉，而是**单列一格**
+    # （官号 1 + 本人/声优 1 + 画师 4）。设成 True 是逃生门 = 官方号一条都不要。
+    birthday_art_skip_official: bool = False
 
     # ===== X 搜索凭据（誕生祭 贺图用）=====
     # ⚠️ **真实凭据**：只从 `.env` / 环境变量读，**绝不打印**（日志里只出现长度）、
@@ -490,7 +492,7 @@ def load_config() -> Config:
             "BIRTHDAY_ART_MIN_LIKES", birthday_art_module.DEFAULT_MIN_LIKES
         ),
         birthday_art_exclude=_env_list("BIRTHDAY_ART_EXCLUDE"),
-        birthday_art_skip_official=_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", True),
+        birthday_art_skip_official=_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", False),
         x_auth_token=_env_str("auth_token", ""),
         x_ct0=_env_str("ct0", ""),
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),

@@ -121,6 +121,7 @@ import httpx
 from . import birthday as birthday_module
 from . import features
 from . import preview
+from . import seiyuu
 from .tickets import JST
 
 _log = logging.getLogger("qq_rss_bot.birthday_art")
@@ -164,6 +165,12 @@ OFFICIAL_HANDLES: tuple[str, ...] = (
     "imas_official",    # アイドルマスター公式
     "imas_ch",          # アイマスch（生日推送那条链路用的也是它）
 )
+# 名额分配：**官号 1 + 本人/声优 1 + 画师 4 = 6**（总数仍由 BIRTHDAY_ART_MAX 控制）。
+# 某一类当天没有合格作品，空出来的名额**回流给画师** —— 总数不会因此变少。
+# 「本人」和「声优」是同一格（vα-liv 那种角色自己开号，没有另一个配音的人）。
+OFFICIAL_QUOTA = 1
+PERSON_QUOTA = 1
+
 # 每位画师最多几张。实测 79 条里 77 个不同作者，这个上限平时咬不到，
 # 但热门 idol 会出现一个高产画师刷屏的情况。
 MAX_PER_AUTHOR = 1
@@ -372,22 +379,52 @@ def is_official(
     return any(m in art.author_name for m in marks)
 
 
+def make_classifier(
+    book: seiyuu.Book | None, *, exclude: Iterable[str] = ()
+):
+    """→ `Art -> (类别, 标签)`。**整个改动唯一的新接缝**（测试里换成假实现）。
+
+    库优先；库不认的再退回「显示名含『公式』」这个关键词兜底 —— 新官号随时
+    会出现，库不可能永远最新。库读不到时（`book is None`）只剩关键词这一条。
+    """
+
+    def classify(art: Art) -> tuple[str, str]:
+        category, label = seiyuu.classify(book, art.author, art.idol)
+        if category != seiyuu.CATEGORY_ARTIST:
+            return category, label
+        if is_official(art, exclude=exclude):
+            return seiyuu.CATEGORY_OFFICIAL, seiyuu.LABEL_OFFICIAL
+        return seiyuu.CATEGORY_ARTIST, seiyuu.LABEL_ARTIST
+
+    return classify
+
+
 def rank_art(
     arts: Iterable[Art],
     idols: list[str],
     *,
     min_likes: int,
+    max_n: int = DEFAULT_MAX,
     per_author: int = MAX_PER_AUTHOR,
     exclude: Iterable[str] = (),
-    skip_official: bool = True,
+    skip_official: bool = False,
+    classify: Any = None,
 ) -> list[Art]:
-    """过滤 + 排序 + 公平性，**不截断**（截多少由调用方按下载成功数决定）。
+    """过滤 + 分类 + 排序 + 名额，**返回全部合格候选**（截多少由下载那一步决定）。
 
-    规则见模块说明。`idols` 的顺序就是保底顺序。
+    顺序 = 官号 → 本人/声优 → 画师；同类别内点赞降序、同分按 id。
+    名额见 `OFFICIAL_QUOTA` / `PERSON_QUOTA`，**某类不够就把名额让给画师**。
+    前 `max_n` 条就是这次该发的内容，后面的用来在下图失败时补位。
 
-    `skip_official` 为真时排掉官方号（见 `is_official`）；`exclude` 是额外
-    要排掉的 handle（来自 `BIRTHDAY_ART_EXCLUDE`）。
+    `skip_official=True` 是配置里的逃生门：官方号**整个**不要（不是「不占名额」）。
     """
+    def _classify(a: Art) -> tuple[str, str]:
+        if classify is not None:
+            return classify(a)
+        if is_official(a, exclude=exclude):
+            return seiyuu.CATEGORY_OFFICIAL, seiyuu.LABEL_OFFICIAL
+        return seiyuu.CATEGORY_ARTIST, seiyuu.LABEL_ARTIST
+
     keep: list[Art] = []
     seen: set[str] = set()
     for a in arts:
@@ -397,29 +434,51 @@ def rank_art(
         if a.sensitive or a.likes < min_likes or not a.image:
             continue
         if skip_official and is_official(a, exclude=exclude):
-            _log.info("贺图：@%s（%s）是官方号，不占名额", a.author, a.author_name)
+            _log.info("贺图：@%s（%s）是官方号，按配置跳过", a.author, a.author_name)
             continue
         keep.append(a)
     keep.sort(key=lambda a: (-a.likes, a.id))  # 同分按 id → 结果确定，可复现
 
-    picked: list[Art] = []
+    buckets: dict[str, list[Art]] = {
+        seiyuu.CATEGORY_OFFICIAL: [],
+        seiyuu.CATEGORY_PERSON: [],
+        seiyuu.CATEGORY_ARTIST: [],
+    }
     budget: dict[str, int] = {}
     for a in keep:
         if budget.get(a.author, 0) >= per_author:
             continue
         budget[a.author] = budget.get(a.author, 0) + 1
-        picked.append(a)
+        buckets[_classify(a)[0]].append(a)
 
-    # 每位偶像至少保一张（一天最多 6 位，不保底的话最火的那位会把名额吃光）。
-    # 保底的那张放在**该偶像自己那批的最前面**，不动全局的点赞序。
+    # ⚠️ **本人优先于声优**：两者抢同一格，本人才是过生日的那个人，
+    # 哪怕赞少很多。先按类别内小序排，再让「每位偶像保底」去挪。
+    buckets[seiyuu.CATEGORY_PERSON].sort(
+        key=lambda a: (0 if _classify(a)[1] == seiyuu.LABEL_CHARACTER else 1,
+                       -a.likes, a.id))
+
+    # 每位偶像至少保一张：把这个偶像在**它自己那一类**里的第一名挪到该类最前
+    # （不保底的话，最火的那位会把名额吃光）。一天最多 6 位偶像。
     for idol in idols:
-        group = [a for a in picked if a.idol == idol]
-        if not group:
-            continue
-        top = group[0]
-        picked.remove(top)
-        picked.insert(0, top)
-    return picked
+        for cat in (seiyuu.CATEGORY_OFFICIAL, seiyuu.CATEGORY_PERSON,
+                    seiyuu.CATEGORY_ARTIST):
+            group = [a for a in buckets[cat] if a.idol == idol]
+            if group:
+                top = group[0]
+                buckets[cat].remove(top)
+                buckets[cat].insert(0, top)
+                break
+
+    off = buckets[seiyuu.CATEGORY_OFFICIAL]
+    per = buckets[seiyuu.CATEGORY_PERSON]
+    art = buckets[seiyuu.CATEGORY_ARTIST]
+    off_n = min(len(off), OFFICIAL_QUOTA)
+    per_n = min(len(per), PERSON_QUOTA)
+    # ⚠️ 回流就发生在这行：某一类空出来的名额自动落到画师头上。
+    art_n = max(0, max_n - off_n - per_n)
+    head = off[:off_n] + per[:per_n] + art[:art_n]
+    tail = art[art_n:] + off[off_n:] + per[per_n:]
+    return head + tail
 
 
 def _likes(n: int) -> str:
@@ -439,12 +498,16 @@ def _id_of(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def render(art: Art, index: int, total: int, year: int) -> str:
+def render(art: Art, index: int, total: int, year: int, *,
+           label: str = seiyuu.LABEL_ARTIST) -> str:
     """一条贺图的文案。**署名和原推链接是必须的** —— 既是礼节，
-    也让群里看到喜欢的那张能直接找到人。"""
+    也让群里看到喜欢的那张能直接找到人。
+
+    `label` 是类别词：`公式` / `本人` / `声優` / `画师`（见 seiyuu.py）。
+    """
     return (
         f"🎨 {art.idol} 誕生祭 {year}（{index}/{total}）\n"
-        f"♥ {_likes(art.likes)} · 画师 @{art.author}\n"
+        f"♥ {_likes(art.likes)} · {label} @{art.author}\n"
         f"{art.url}"
     )
 
@@ -818,12 +881,18 @@ class BirthdayArtPoller:
                     f"生日贺图：X cookie 好像失效了，今天搜不到东西。\n"
                     f"（{day_key}）更新 .env 里的 auth_token / ct0 后重启容器。"
                 )
+        # 库只读文件，每拍读一次（几十 KB，可忽略）—— 改完库重启都不用，
+        # 下一拍就生效。读不到时 load() 自己打 WARNING，这里退回「全是画师」。
+        classify = make_classifier(
+            seiyuu.load(), exclude=self.cfg.birthday_art_exclude)
         ranked = rank_art(
             arts,
             idols,
             min_likes=self.cfg.birthday_art_min_likes,
+            max_n=self.cfg.birthday_art_max,
             exclude=self.cfg.birthday_art_exclude,
             skip_official=self.cfg.birthday_art_skip_official,
+            classify=classify,
         )
         if not ranked:
             _log.info(
@@ -833,6 +902,13 @@ class BirthdayArtPoller:
                 self.cfg.birthday_art_min_likes,
             )
             return 0
+        head = ranked[:self.cfg.birthday_art_max]
+        counts: dict[str, int] = {}
+        for a in head:
+            label = classify(a)[1]
+            counts[label] = counts.get(label, 0) + 1
+        _log.info("贺图：%s 选中 %d 条（%s）", day_key, len(head),
+                  " / ".join(f"{k} {v}" for k, v in counts.items()))
 
         picked = await self._download(ranked, self.cfg.birthday_art_max)
         if not picked:
@@ -841,7 +917,8 @@ class BirthdayArtPoller:
             return 0
 
         total = len(picked)
-        texts = [render(a, i + 1, total, d.year) for i, (a, _) in enumerate(picked)]
+        texts = [render(a, i + 1, total, d.year, label=classify(a)[1])
+                 for i, (a, _) in enumerate(picked)]
         sent = 0
         # 图片落临时目录、用完就删 —— `send_local_image` 收的是路径，
         # 这里只是要个路径，不是素材，不该在 NAS 上留痕。

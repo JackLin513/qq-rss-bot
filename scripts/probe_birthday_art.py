@@ -57,7 +57,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import httpx  # noqa: E402
 
-from qq_rss_bot import birthday, birthday_art, preview  # noqa: E402
+from qq_rss_bot import birthday, birthday_art, features, preview, seiyuu  # noqa: E402
 from qq_rss_bot.config import load_config  # noqa: E402
 from qq_rss_bot.db import Database  # noqa: E402
 
@@ -173,8 +173,6 @@ async def main() -> int:
     print(f"配置：enabled={cfg.birthday_art_enabled} time={cfg.birthday_art_time} "
           f"window={cfg.birthday_art_window_sec}s max={cfg.birthday_art_max} "
           f"min_likes={cfg.birthday_art_min_likes}")
-    print(f"  目标群 {len(cfg.birthday_art_groups)} 个："
-          f"{[g[:8] + '…' for g in cfg.birthday_art_groups] or '（空 = 功能关闭）'}")
     print(f"  代理 media_proxy={cfg.media_proxy or '（空 = 直连）'}")
     have = (bool(cfg.x_auth_token), bool(cfg.x_ct0))
     print(f"  cookie：auth_token {'✅ %d 字符' % len(cfg.x_auth_token) if have[0] else '❌ 缺'} / "
@@ -210,6 +208,9 @@ async def main() -> int:
             print(f"  {idol.name:<12} {birthday_art.tags_for(idol.name, d.year)}")
 
     db = Database(cfg.db_path)
+    groups = features.groups_for(db, "birthday_art")
+    print(f"  目标群 {len(groups)} 个："
+          f"{[g[:8] + '…' for g in groups] or '（空 = 功能关闭）'}")
     if do_reset:
         # ⚠️ poll_once 有「同日同群不重复发」的记账。不清账的话，改完规则重测
         #    永远是「发出去 0 条」，看起来像坏了。
@@ -257,16 +258,23 @@ async def main() -> int:
             print(f"  点赞：min={likes[0]} 中位={likes[len(likes) // 2]} max={likes[-1]}；"
                   f"≥{cfg.birthday_art_min_likes} 的 "
                   f"{sum(1 for x in likes if x >= cfg.birthday_art_min_likes)} 条")
+        book = seiyuu.load()
+        classify = birthday_art.make_classifier(book, exclude=cfg.birthday_art_exclude)
+        print(f"声优库：{'已加载' if book else '读不到（全部按画师）'}"
+              + (f"（{len(book.roles)} 角色 / {len(book.handles)} 人 / "
+                 f"{len(book.officials)} 官号）" if book else ""))
         ranked = birthday_art.rank_art(
             arts,
             [i.name for i in day.idols],
             min_likes=cfg.birthday_art_min_likes,
+            max_n=cfg.birthday_art_max,
             exclude=cfg.birthday_art_exclude,
             skip_official=cfg.birthday_art_skip_official,
+            classify=classify,
         )
         print(f"过滤 + 排序后 {len(ranked)} 条，将要发前 {cfg.birthday_art_max} 条：")
         for i, a in enumerate(ranked[: cfg.birthday_art_max]):
-            print(f"  [{i + 1}] ♥{a.likes:<6} @{a.author:<18} "
+            print(f"  [{i + 1}] ♥{a.likes:<6} {classify(a)[1]:<3} @{a.author:<18} "
                   f"{a.posted_at.astimezone(birthday_art.JST):%m-%d %H:%M}JST {a.idol}")
             print(f"      {a.image}")
         if len(ranked) > cfg.birthday_art_max:
@@ -318,7 +326,8 @@ async def main() -> int:
         print("\n将要发出去的文案原文：")
         for i, (a, _raw) in enumerate(got):
             print("  ┌" + "─" * 46)
-            for line in birthday_art.render(a, i + 1, len(got), d.year).splitlines():
+            for line in birthday_art.render(a, i + 1, len(got), d.year,
+                                            label=classify(a)[1]).splitlines():
                 print(f"  │ {line}")
         print("  └" + "─" * 46)
 
