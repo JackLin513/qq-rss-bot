@@ -1,6 +1,6 @@
 # 自建图床（喂给 QQ 的 markdown）
 
-2026-10-22 加。代码在 `src/qq_rss_bot/imgsrv.py`，DDNS 在 `scripts/ddns_update.py`。
+2026-10-22 加。代码在 `src/qq_rss_bot/imgsrv.py`。
 常驻要点在 [`../CLAUDE.md`](../CLAUDE.md)，这里记来龙去脉。
 
 ## 为什么非要有它
@@ -29,34 +29,25 @@
 
 - 公网 IP 在**路由器后面**那一侧（NAS 的 LAN 2，`192.168.0.6`）。
 - PPPoE 那条是 `100.101.80.44`（`100.64/10` = **CGNAT，不是公网**），
-  所以 DSM 里选它是没用的。`ddns_update.py` 的 `_is_public()` 用
-  `ipaddress.is_global` 一并挡掉私网 / 回环 / 链路本地 / CGNAT。
+  选它是没用的。
 
-## ⚠️ DSM 自带的 DDNS 两种选法都是错的
+## ⚠️ DDNS 用 DSM 设置里的那个，但两个坑要记住
 
-2026-10-22 排查结论：
+**2026-10-22 排查出过两个都错的选法**（现在都避开了，留着当判据）：
 
 | DSM 里的选法 | 它干了什么 |
 |---|---|
 | 「自动」 | 去外部回显服务问 IP，**请求被全局代理接管** → 写进去的是代理出口（日本/香港） |
 | 「局域网 2」 | 直接把网卡地址 `192.168.0.6` 写进 A 记录 |
 
-于是那个域名**几个月都指不到家里的宽带**，也就是「最近几个月都不可达」的原因。
-（关掉全局代理之后「自动」是对的，但只要哪天再开回去就又会错 —— 所以不要依赖它。）
+**这两个是「最近几个月都不可达」的真正原因。**「自动」在**关掉全局代理之后是对的**
+（实测回显服务和宽带的真实公网 IP 一致），但只要哪天再开回全局代理就又会写错 ——
+所以图床突然不可达时，**第一个怀疑对象就是代理**。
 
-## 所以改成自己更新：`scripts/ddns_update.py`
-
-- 问**三家**回显服务取票（`ip.3322.net` / `myip.ipip.net` / `4.ipw.cn`），
-  要**多数一致**才写。**别「拿到第一个就用」** —— `api.ipify.org` 实测返回代理出口。
-- 只改 DNSPod 上那条 A 记录（`Record.List` → `Record.Modify`），
-  `record_line` 沿用原记录的（新线必须先在后台建）。
-- `.env`：`DNSPOD_TOKEN_ID` / `DNSPOD_TOKEN` / `DDNS_DOMAIN` / `DDNS_SUBDOMAIN`
-  ⚠️ token 只给「改 DNS」权限，**绝不提交、绝不打印**（日志里只有长度）。
-- NAS 上挂 DSM 任务计划（root 跑，`JackLin` 没有 docker 权限），每 5 分钟：
-
-  ```
-  /usr/local/bin/docker exec qq-rss-bot-bot-1 python /app/scripts/ddns_update.py
-  ```
+⚠️ **DDNS 只更新它自己那个域名。** `<id>.synology.me` 会跟着 IP 变，但 DNSPod 上
+手写的 A 记录（`www.jacklin513.top`）**不会**。要么把 `IMGSRV_BASE` 指向
+`synology.me`，要么在 DNSPod 里建一条 **CNAME** 指向它 —— 否则换 IP 那天
+图床静默失效，群里表现和「今天没人画」一模一样。
 
 ## ⚠️ 最后一公里：路由器必须做端口转发（**只能用户本人做**）
 

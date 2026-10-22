@@ -37,7 +37,9 @@ _log = logging.getLogger("qq_rss_bot.multiimage")
 
 # 渲染宽度固定 208（和 bilibili 封面一致），高度按真实比例算，夹在 [40, 400]。
 COVER_W = 208
-MIN_H, MAX_H = 40, 400
+# 高度上限。超过它就**缩窄显示宽度**（比例不变）—— **绝不夹高度**，夹了就是拉伸。
+# （原来的 MIN_H 下限也是同一个错误：把极宽的图撑到 40 高，等于纵向拉伸。）
+MAX_H = 400
 
 # 一条消息最多渲染几张。和 `rss.MAX_IMAGES`（摄入上限）对齐 —— 两个数不一致
 # 的话，多出来的图会在某一层被静默砍掉，症状是「这条明明有 6 张只出来 4 张」。
@@ -135,15 +137,24 @@ async def measure(
 
 
 def box_for(wh: "tuple[int, int]", width: int = COVER_W) -> "tuple[int, int]":
-    """真实宽高 → 渲染框。宽度给定，高度按比例，夹在 [MIN_H, MAX_H]。
+    """真实宽高 → 渲染框。**比例永远等于原图**，只调缩放。
 
-    `width` 默认还是 `COVER_W`（208）—— bilibili 封面和 RSS 多图一直在用，
-    **别动那两条路**。QQ **不会**把小于气泡宽度的图放大，定多少就渲染多少，
-    所以想让图占满就得传一个接近气泡宽度的值（抽票列表传 `TICKET_IMAGE_W`）。
+    `width` 默认还是 `COVER_W`（208）—— bilibili 封面和 RSS 多图一直在用。
+    QQ **不会**把小于气泡宽度的图放大，定多少就渲染多少，所以想让图占满就得
+    传一个接近气泡宽度的值（抽票列表传 `TICKET_IMAGE_W`）。
+
+    ⚠️ **不许夹高度**。尺寸提示里那两个数就是 QQ 缩放用的比例，把高度夹到
+    `MAX_H` 等于把图横向拉扁 —— 2026-10-22 贺图那条路就是这么错的
+    （320 宽下 2:3 的插图画出来 480，被夹成 400）。太长的图要**缩窄显示宽度**。
     """
     w, h = wh
-    out_h = round(width * h / w) if w > 0 else width
-    return width, max(MIN_H, min(MAX_H, out_h))
+    if w <= 0 or h <= 0:
+        return width, MAX_H
+    out_h = max(1, round(width * h / w))
+    if out_h > MAX_H:
+        out_h = MAX_H
+        width = max(1, round(out_h * w / h))
+    return width, out_h
 
 
 def image_line(

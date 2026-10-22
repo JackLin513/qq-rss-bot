@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import httpx  # noqa: E402
 
-from qq_rss_bot import idolmaster  # noqa: E402
+from qq_rss_bot import idolmaster, multiimage  # noqa: E402
 from qq_rss_bot.rss import fetch_feed, resolve_url  # noqa: E402
 
 TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
@@ -57,7 +57,8 @@ RSSHUB = "http://100.91.151.20:1200"
 #   · 电脑端：带不带都行；
 #   · 所以尺寸提示是**必填**的，而且比例必须对。
 COVER_W = 208
-MIN_H, MAX_H = 40, 400
+# ⚠️ 比例算法**只有一份**（multiimage.box_for）。以前这里抄了一份带 MIN_H/MAX_H
+# 夹的旧逻辑，2026-10-22 修拉伸时差点漏掉 —— 探针量出来的尺寸会和线上不一致。
 
 
 def pick_c2c_openid() -> str | None:
@@ -172,12 +173,10 @@ async def measure(http: "httpx.AsyncClient", url: str) -> tuple[int, int] | None
 
 
 def box_for(wh: tuple[int, int] | None) -> tuple[int, int] | None:
-    """真实宽高 → 渲染框（宽固定 COVER_W，高按比例）。读不到尺寸就返回 None。"""
+    """真实宽高 → 渲染框。**直接借线上那份**，别在这儿抄第二份。"""
     if not wh or wh[0] <= 0 or wh[1] <= 0:
         return None
-    w, h = wh
-    out_h = round(COVER_W * h / w)
-    return COVER_W, max(MIN_H, min(MAX_H, out_h))
+    return multiimage.box_for(wh, COVER_W)
 
 
 def build_markdown(
