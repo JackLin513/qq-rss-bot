@@ -519,18 +519,21 @@ MARKDOWN_IMAGE_W = 320
 
 
 def render_markdown(
-    idol: str, items: list[tuple[Art, bytes, str]], year: int
+    idol: str, items: list[tuple[Art, bytes, str, str]], year: int
 ) -> str:
     """**一个偶像一条 markdown**：正文里放 N 张图，每张下面是署名。
 
-    `items` 是 `(Art, 图片字节, 标签)`。宽高必须逐张读真实值 ——
+    `items` 是 `(Art, 图片字节, 标签, 图片 URL)`。宽高必须逐张读真实值 ——
     QQ 的尺寸提示**必填**（手机端不带就整条不渲染），而且**比例错了图会被拉伸**。
     读不出尺寸的那张直接跳过（宁可不放，也不放一张被压扁的）。
+
+    ⚠️ `url` **必须是 QQ 抓得到的地址** —— 也就是自建图床那条（见 `imgsrv.py`）。
+    推特的 `pbs.twimg.com` 在大陆机房够不到，预热多久都不会显示。
 
     ⚠️ 图片 URL 原样给，**绝不加 `_cb` 之类的参数** —— 加了 QQ 的图片代理抓不到。
     """
     lines = [f"🎨 **{idol}** 誕生祭 {year}"]
-    for art, raw, label in items:
+    for art, raw, label, url in items:
         size = multiimage.image_size(raw)
         if size is None:
             _log.info("贺图：%s 的图读不出宽高，markdown 里跳过", art.id)
@@ -538,7 +541,7 @@ def render_markdown(
         w, h = size
         disp_h = max(multiimage.MIN_H,
                      min(multiimage.MAX_H, round(MARKDOWN_IMAGE_W * h / w)))
-        lines.append(f"![{label} #{MARKDOWN_IMAGE_W}px #{disp_h}px]({art.image})")
+        lines.append(f"![{label} #{MARKDOWN_IMAGE_W}px #{disp_h}px]({url})")
         lines.append(f"[♥ {_likes(art.likes)} · {label} @{art.author}]({art.url})")
     return "\n".join(lines)
 
@@ -750,12 +753,17 @@ class BirthdayArtPoller:
     """每天定时收贺图。结构和 `BirthdayPoller` 同构：slot / 窗口 / 逐群隔离。"""
 
     def __init__(self, cfg, db, sender, media_http, notifier=None, *,
-                 groups_override: tuple[str, ...] | None = None) -> None:
+                 groups_override: tuple[str, ...] | None = None,
+                 imgsrv=None) -> None:
         self.cfg = cfg
         self.db = db
         self.sender = sender
         self.http = media_http
         self.notifier = notifier
+        # 自建图床（`imgsrv.ImageServer`）。**必须有** —— markdown 的图是 QQ 的
+        # 服务器去抓的，它在大陆机房够不到 pbs.twimg.com。没有它就只能退回
+        # 发不出去的原始 URL（探针/单测里就是这么跑的）。
+        self.imgsrv = imgsrv
         # 只给探针/测试用：把「发哪些群」钉死，不去动库里的开关。
         # 生产路径永远是 None，走 `groups` 属性（每拍重查库）。
         self._groups_override = groups_override
@@ -981,14 +989,34 @@ class BirthdayArtPoller:
             return 0
 
         # 每个偶像一条 markdown。顺序跟 `idols` 走（日历里的顺序）。
+        #
+        # ⚠️ 图必须先落到**自建图床**上 —— markdown 的 `![](url)` 是 **QQ 的服务器
+        # 去抓**的，而 `pbs.twimg.com` 在大陆机房根本够不到（预热两遍 45s / 180s
+        # 群里都没有图）。落盘只做一次，所有群共用同一批 URL。
+        leaked = 0
+        if self.imgsrv is None or not self.imgsrv.enabled:
+            _log.warning(
+                "贺图：没有配图床（IMGSRV_BASE 为空）—— markdown 里会用推特原始 URL，"
+                "**QQ 抓不到，群里不会有图**")
+        else:
+            self.imgsrv.cleanup()
         messages: list[tuple[str, list[str]]] = []
         for idol in idols:
             items = picked.get(idol) or []
             if not items:
                 continue
-            md = render_markdown(
-                idol, [(a, raw, classify(a)[1]) for a, raw in items], d.year)
+            rows: list[tuple[Art, bytes, str, str]] = []
+            for a, raw in items:
+                url = self.imgsrv.publish(raw, a.id) if self.imgsrv else None
+                if url is None:
+                    url = a.image
+                    leaked += 1
+                rows.append((a, raw, classify(a)[1], url))
+            md = render_markdown(idol, rows, d.year)
             messages.append((md, [_id_of(a.url) for a, _ in items]))
+        if leaked:
+            _log.warning("贺图：%s 有 %d 张没能放进图床，退回原始 URL（多半显示不出来）",
+                         day_key, leaked)
         if not messages:
             _log.warning("贺图：%s 有候选但一条都渲染不出来，这一拍不发", day_key)
             return 0

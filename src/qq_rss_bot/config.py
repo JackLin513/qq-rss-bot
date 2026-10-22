@@ -302,6 +302,19 @@ class Config:
     # （官号 1 + 本人/声优 1 + 画师 4）。设成 True 是逃生门 = 官方号一条都不要。
     birthday_art_skip_official: bool = False
 
+    # ===== 自建图床（喂给 QQ 的 markdown，见 imgsrv.py）=====
+    #
+    # ⚠️ **不是可选项。** markdown 的图是 **QQ 的服务器去抓**，而它在大陆机房，
+    # 够不到 `pbs.twimg.com` —— 实测预热两遍（45s / 180s）群里一张图都没有。
+    # 所以图得我们自己托管一份，给 QQ 一个它抓得到的 URL。
+    #
+    # `imgsrv_base` 是**对外的**根 URL（要带端口），空 = 图床关闭（贺图会退回
+    # 原始推特 URL，也就是**发出去但没图**）。
+    imgsrv_base: str = ""
+    imgsrv_port: int = 18080          # 容器内监听端口，compose 里要发布同一个
+    imgsrv_dir: Path | None = None    # 空 = 和 bot.db 同级的 imgserve/
+    imgsrv_ttl_days: int = 7          # 贺图发完没人再看，过期自删
+
     # ===== X 搜索凭据（誕生祭 贺图用）=====
     # ⚠️ **真实凭据**：只从 `.env` / 环境变量读，**绝不打印**（日志里只出现长度）、
     # **绝不提交**（仓库是公开的）。拿账号 cookie 做自动化访问**违反 X 的条款**，
@@ -422,6 +435,12 @@ def load_config() -> Config:
     birthday_art_time = _env_str("BIRTHDAY_ART_TIME", birthday_art_module.DEFAULT_TIME)
     birthday_art_module.parse_time(birthday_art_time)
 
+    # 图床目录：同样跟着 DB_PATH 走（容器里就是 /app/data/imgserve）。
+    imgsrv_dir_raw = _env_str("IMGSRV_DIR", "")
+    imgsrv_dir = Path(imgsrv_dir_raw) if imgsrv_dir_raw else db_path.parent / "imgserve"
+    if not imgsrv_dir.is_absolute():
+        imgsrv_dir = PROJECT_ROOT / imgsrv_dir
+
     return Config(
         appid=appid,
         secret=secret,
@@ -498,6 +517,10 @@ def load_config() -> Config:
         birthday_art_exclude=_env_list("BIRTHDAY_ART_EXCLUDE"),
         birthday_art_skip_official=_env_bool("BIRTHDAY_ART_SKIP_OFFICIAL", False),
         birthday_art_warmup_group=_env_str("BIRTHDAY_ART_WARMUP_GROUP", ""),
+        imgsrv_base=_env_str("IMGSRV_BASE", "").rstrip("/"),
+        imgsrv_port=_env_int("IMGSRV_PORT", 18080),
+        imgsrv_dir=imgsrv_dir,
+        imgsrv_ttl_days=_env_int("IMGSRV_TTL_DAYS", 7),
         x_auth_token=_env_str("auth_token", ""),
         x_ct0=_env_str("ct0", ""),
         ai_api_key=_env_str("DEEPSEEK_API_KEY", ""),

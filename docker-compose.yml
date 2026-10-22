@@ -38,6 +38,12 @@ services:
     restart: unless-stopped
     depends_on:
       - rsshub
+    # 自建图床（见 src/qq_rss_bot/imgsrv.py）。markdown 的图是 **QQ 的服务器**
+    # 去抓的，而它够不到 pbs.twimg.com —— 贺图得由我们自己发一份。
+    # ⚠️ 只发布这一个端口；路由器那边 WAN:18080 → 本机:18080。
+    #    别用 80/443（电信封入站）。改这一行要 `up -d`，`restart` 不生效。
+    ports:
+      - "18080:18080"
     env_file:
       - .env
     environment:

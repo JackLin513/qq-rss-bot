@@ -57,7 +57,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import httpx  # noqa: E402
 
-from qq_rss_bot import birthday, birthday_art, features, preview, seiyuu  # noqa: E402
+from qq_rss_bot import birthday, birthday_art, features, imgsrv, preview, seiyuu  # noqa: E402
 from qq_rss_bot.config import load_config  # noqa: E402
 from qq_rss_bot.db import Database  # noqa: E402
 
@@ -164,6 +164,25 @@ class _RawSender:
             )
 
 
+def _imgsrv(cfg, *, start: bool = False):
+    """探针用的图床。**只有 `--send` 才真把端口开起来** —— 平时线上实例正占着
+    那个端口，开不起来会多一条 WARNING，没意义。
+
+    ⚠️ 地址 `IMGSRV_BASE` 指向的是**线上那台 NAS**。所以在 Mac 上跑 `--send`
+    时，图是写进本机目录的，QQ 那边**抓不到**（除非 BASE 也指回本机且公网可达）。
+    真要验「图能不能显示」，得在 NAS / 容器里跑。
+    """
+    srv = imgsrv.ImageServer(
+        cfg.imgsrv_dir or Path("data/imgserve"),
+        cfg.imgsrv_base,
+        port=cfg.imgsrv_port,
+        ttl_days=cfg.imgsrv_ttl_days,
+    )
+    if start:
+        srv.start()
+    return srv
+
+
 async def main() -> int:
     if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
         print(__doc__)
@@ -189,6 +208,8 @@ async def main() -> int:
           f"window={cfg.birthday_art_window_sec}s max={cfg.birthday_art_max} "
           f"min_likes={cfg.birthday_art_min_likes}")
     print(f"  代理 media_proxy={cfg.media_proxy or '（空 = 直连）'}")
+    print(f"  图床 imgsrv_base={cfg.imgsrv_base or '（空 = 关闭！markdown 里的图 QQ 抓不到）'}"
+          f" port={cfg.imgsrv_port} dir={cfg.imgsrv_dir}")
     have = (bool(cfg.x_auth_token), bool(cfg.x_ct0))
     print(f"  cookie：auth_token {'✅ %d 字符' % len(cfg.x_auth_token) if have[0] else '❌ 缺'} / "
           f"ct0 {'✅ %d 字符' % len(cfg.x_ct0) if have[1] else '❌ 缺'}"
@@ -256,7 +277,8 @@ async def main() -> int:
         )
     poller = birthday_art.BirthdayArtPoller(
         run_cfg, db, sender, None,
-        groups_override=(group,) if do_send else None)
+        groups_override=(group,) if do_send else None,
+        imgsrv=_imgsrv(cfg, start=do_send))
 
     if not do_search:
         print("\n（离线模式：没上过网。加 --search 才真去搜一次）")
@@ -351,7 +373,10 @@ async def main() -> int:
             for a, raw in items:
                 print(f"      {len(raw) / 1024:7.0f} KB  @{a.author}")
             md = birthday_art.render_markdown(
-                idol, [(a, raw, classify(a)[1]) for a, raw in items], d.year)
+                idol,
+                [(a, raw, classify(a)[1], poller.imgsrv.publish(raw, a.id) or a.image)
+                 for a, raw in items],
+                d.year)
             print("  ┌" + "─" * 46)
             for line in md.splitlines():
                 print(f"  │ {line}")

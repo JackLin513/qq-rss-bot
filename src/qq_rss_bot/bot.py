@@ -38,6 +38,7 @@ from . import monday as monday_module
 from . import morning as morning_module
 from .birthday import BirthdayPoller
 from .birthday_art import BirthdayArtPoller
+from . import imgsrv
 from .monday import MondayPoller
 from .morning import MorningPoller
 from .tickets import TicketPoller
@@ -129,8 +130,20 @@ class RssBot(botpy.Client):
         # 所以同样收 `media_http`（带代理的那个）。多一个 `notifier` 是因为
         # **cookie 失效的症状是「群里今天没图」**，和「今天真没人画」长得一样，
         # 只能走私聊告警。见 birthday_art.py 的模块说明。
+        #
+        # `imgsrv` 是**自建图床**：markdown 的图由 QQ 的服务器去抓，而它在大陆机房
+        # 够不到 pbs.twimg.com —— 所以图先落本地、用我们自己的公网地址给它抓。
+        # 端口开不起来不拖垮机器人（`start()` 只打 WARNING）。
+        self.imgsrv = imgsrv.ImageServer(
+            cfg.imgsrv_dir or (cfg.db_path.parent / "imgserve"),
+            cfg.imgsrv_base,
+            port=cfg.imgsrv_port,
+            ttl_days=cfg.imgsrv_ttl_days,
+        )
+        self.imgsrv.start()
         self.birthday_art = BirthdayArtPoller(
-            cfg, self.db, self.sender, self.media_http, notifier=self.notifier
+            cfg, self.db, self.sender, self.media_http, notifier=self.notifier,
+            imgsrv=self.imgsrv,
         )
         self._birthday_art_task: Any = None
         # 群复读机：连着两个人发同样的话，跟着复读一句。**没有 task** ——
@@ -297,6 +310,7 @@ class RssBot(botpy.Client):
         self.birthday_art.stop()
         if self._birthday_art_task is not None:
             self._birthday_art_task.cancel()
+        self.imgsrv.stop()
         await self.rss_http.aclose()
         await self.media_http.aclose()
         self.db.close()
