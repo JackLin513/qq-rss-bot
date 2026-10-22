@@ -91,21 +91,28 @@ async def _check_push_routing() -> None:
     import dataclasses  # noqa: PLC0415 —— 这个文件按节就近 import
 
     from qq_rss_bot.rss import Entry as E
-    from qq_rss_bot.scheduler import FeedPoller
+    from qq_rss_bot.scheduler import FeedPoller, send_entry_images
 
     class Fake:
         def __init__(self, explode: bool = False) -> None:
             self.text: list[str] = []
             self.rich: list[tuple[str, str]] = []
+            self.md: list[str] = []
             self.explode = explode
 
         async def send_text(self, group_openid: str, content: str) -> None:
             self.text.append(content)
 
+        async def send_markdown(self, group_openid: str, content: str) -> None:
+            self.md.append(content)
+
         async def send_rich(self, group_openid: str, content: str, url: str) -> None:
             if self.explode:
                 raise RuntimeError("图片上传失败")
             self.rich.append((content, url))
+
+        async def upload_image(self, group_openid: str, url: str) -> bool:
+            return True
 
     with tempfile.TemporaryDirectory() as td:
         db = Database(Path(td) / "t.db")
@@ -132,21 +139,74 @@ async def _check_push_routing() -> None:
         await FeedPoller(cfg_stub(), db, None, boom)._push_entries(sub, "源名", [with_img])
         check("配图失败退回纯文字", len(boom.text) == 1 and not boom.rich)
 
-        # --- ★ 多图：一条资讯 3 张图 → 连发 3 条 ---
+        # --- ★ 多图：一条资讯 3 张图 → 仍然只发**一条** ---
         multi = E("k3", "标题3", "https://a.com/3", None, "",
                   ("https://a.com/3a.jpg", "https://a.com/3b.jpg", "https://a.com/3c.jpg"))
         many = Fake()
         await FeedPoller(cfg_stub(), db, None, many)._push_entries(sub, "源名", [multi])
-        check("★ RSS 多图连发 3 条", len(many.rich) == 3, str(many.rich))
-        check("第一条带正文", "标题3" in many.rich[0][0], str(many.rich[0]))
-        check("★ 后续条是占位文案", many.rich[1][0] == "（图 2/3）", str(many.rich[1]))
-        check("★ 图片顺序不乱",
-              [r[1] for r in many.rich] == ["https://a.com/3a.jpg",
-                                            "https://a.com/3b.jpg",
-                                            "https://a.com/3c.jpg"], str(many.rich))
+        check("★★ 没有 http 时多图也只发**一条**（不连发）",
+              len(many.rich) == 1 and not many.text, str(many.rich))
+        check("★ 发的是第一张", many.rich and many.rich[0][1].endswith("3a.jpg"),
+              str(many.rich))
+        check("第一条带正文", "标题3" in many.rich[0][0], str(many.rich))
         check("★ 多图成功时一条纯文字都不发", many.text == [], str(many.text))
 
-        # 开关关掉 → 回到只发第一张
+        # --- ★ 有 http 时：一条 markdown 带全部图 ---
+        import struct as _st  # noqa: PLC0415
+        import zlib as _zl  # noqa: PLC0415
+
+        def _png(w: int = 320, h: int = 480) -> bytes:
+            raw = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+
+            def chunk(t, d):
+                return (_st.pack(">I", len(d)) + t + d
+                        + _st.pack(">I", _zl.crc32(t + d) & 0xFFFFFFFF))
+
+            return (b"\x89PNG\r\n\x1a\n"
+                    + chunk(b"IHDR", _st.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                    + chunk(b"IDAT", _zl.compress(raw, 1)) + chunk(b"IEND", b""))
+
+        class _MiniResp:
+            status_code = 200
+
+            def __init__(self, blob: bytes) -> None:
+                self.content = blob
+
+        class _MiniHttp:
+            async def get(self, url, **kw):
+                return _MiniResp(_png())
+
+        # 直接测 `send_entry_images`（走 `_push_entries` 会先跑 AI 摘要/标签，
+        # 还要一个能响应的 http，和这条断言无关）。
+        fd = Fake()
+        failed = await send_entry_images(
+            fd, "G", "正文", multi.images, http=_MiniHttp(),
+            link="https://a.com/3", markdown=True)
+        check("★★ 多图合成**一条** markdown", len(fd.md) == 1 and not fd.rich,
+              f"md={len(fd.md)} rich={len(fd.rich)}")
+        check("★ markdown 里三张图都在",
+              all(f"3{c}.jpg" in fd.md[0] for c in "abc"), fd.md[0][:200])
+        check("★ 链接排在图片后面",
+              fd.md[0].rindex("3c.jpg") < fd.md[0].rindex("https://a.com/3"),
+              fd.md[0][:200])
+        check("全部发出去时没有失败的图", failed == [], str(failed))
+
+        # --- ★ markdown 整条挂掉 → 只发第一张，剩余算失败（不连发）---
+        class _BoomMd(Fake):
+            async def send_markdown(self, group_openid: str, content: str) -> None:
+                raise RuntimeError("markdown boom")
+
+        bm = _BoomMd()
+        failed = await send_entry_images(
+            bm, "G", "正文", multi.images, http=_MiniHttp(),
+            link="https://a.com/3", markdown=True)
+        check("★★ markdown 挂了也只发**一条**（不退回连发）",
+              len(bm.rich) == 1 and len(bm.md) == 0, f"rich={len(bm.rich)}")
+        check("★ 发的是第一张", bm.rich[0][1].endswith("3a.jpg"), str(bm.rich))
+        check("★ 其余两张报成失败（调用方会私聊告警）",
+              failed == ["https://a.com/3b.jpg", "https://a.com/3c.jpg"], str(failed))
+
+        # 开关关掉 → 同样只发第一张（不再退回连发）
         single = Fake()
         await FeedPoller(dataclasses.replace(cfg_stub(), rss_multi_image=False),
                          db, None, single)._push_entries(sub, "源名", [multi])
@@ -157,12 +217,11 @@ async def _check_push_routing() -> None:
 
 
 async def _check_send_entry_images() -> None:
-    """`send_entry_images` 的失败语义 —— 中间某张挂了不能拖垮整条。
+    """`send_entry_images` 的失败语义 —— **一个条目只发一条消息**。
 
-    这条最容易被写反：把**后续**那张的异常也抛出去，调用方就会以为整条没发成，
-    退回纯文字再发一遍 —— 正文已经发过了，用户看到的是**重复刷屏**。
-
-    失败注入按 **URL** 而不是「第几次」：后者会被重试绕过，测不出真实语义。
+    2026-10-22 起不再连发：多图走一条 markdown（见 `[4.62]`），markdown 没走通
+    就**只发第一张**、其余报失败。这里钉的是没有 markdown 的那条路：
+    首图失败要抛（调用方退回纯文字），其余图不尝试、只记账。
     """
     import qq_rss_bot.scheduler as sched
     from qq_rss_bot.scheduler import send_entry_images
@@ -182,11 +241,17 @@ async def _check_send_entry_images() -> None:
 
         p = P()
         r = await send_entry_images(p, "G", "正文", ("u1", "u2", "u3"))
-        check("★ 3 张图发 3 条", len(p.rich) == 3, str(p.rich))
-        check("★ 全成功时返回空列表（调用方据此不告警）", r == [], repr(r))
+        check("★★ 没有 markdown 时 3 张图也只发**一条**（2026-10-22 起不连发）",
+              len(p.rich) == 1, str(p.rich))
         check("第一条带正文", p.rich[0][0] == "正文", str(p.rich[0]))
-        check("★ 后续条是占位文案", p.rich[1][0] == "（图 2/3）", str(p.rich[1]))
-        check("★ 顺序与传入一致", [r[1] for r in p.rich] == ["u1", "u2", "u3"], str(p.rich))
+        check("★ 发的是第一张", p.rich[0][1] == "u1", str(p.rich))
+        check("★ 其余两张报成失败（调用方据此私聊告警）",
+              r == ["u2", "u3"], repr(r))
+
+        p = P()
+        r = await send_entry_images(p, "G", "正文", ("u1",))
+        check("单张图 → 一条富媒体、无失败", len(p.rich) == 1 and r == [],
+              f"{p.rich} / {r}")
 
         # 第一条一直挂 → 重试一次后**必须抛出去**，调用方才能退回纯文字
         p = P(bad={"u1"})
@@ -197,14 +262,8 @@ async def _check_send_entry_images() -> None:
             raised = True
         check("★ 第一条重试后仍失败要抛出去（调用方据此退回纯文字）", raised, str(p.rich))
         check("★ 第一条确实重试了（共 2 次调用）", len(p.rich) == 2, str(p.rich))
-
-        # 中间那张一直挂 → 重试一次后吞掉，后面的照发
-        p = P(bad={"u2"})
-        r = await send_entry_images(p, "G", "正文", ("u1", "u2", "u3"))
-        check("★ 中间某张失败不中断，后面的照发",
-              bool(p.rich) and p.rich[-1][1] == "u3", str(p.rich))
-        check("★ 返回的是**没发出去**的那张，不是全部", r == ["u2"], repr(r))
-        check("★ 中间那张重试了一次（1 + 2 + 1 = 4 次调用）", len(p.rich) == 4, str(p.rich))
+        check("★ 第一条挂了**不尝试**后面的图（不连发）",
+              all(url == "u1" for _c, url in p.rich), str(p.rich))
 
         # 偶发失败（QQ 那种「请稍后重试」）→ 重试就成，不算丢图
         class Flaky:
@@ -215,13 +274,15 @@ async def _check_send_entry_images() -> None:
             async def send_rich(self, group_openid: str, content: str, url: str) -> None:
                 self.n += 1
                 self.rich.append((content, url))
-                if self.n == 2:
+                if self.n == 1:
                     raise RuntimeError("偶发 500")
 
         f = Flaky()
-        await send_entry_images(f, "G", "正文", ("u1", "u2"))
-        check("★ 偶发失败重试后成功（函数正常返回，不抛）", len(f.rich) == 3, str(f.rich))
-        check("★ 重试发的是同一张图", f.rich[-1][1] == "u2", str(f.rich))
+        r = await send_entry_images(f, "G", "正文", ("u1", "u2"))
+        check("★ 偶发失败重试后成功（函数正常返回，不抛）", len(f.rich) == 2, str(f.rich))
+        check("★ 重试发的是同一张图", f.rich[-1][1] == "u1", str(f.rich))
+        check("★ 首图重试成功后，其余图仍按失败报",
+              r == ["u2"], repr(r))
     finally:
         sched.IMAGE_RETRY_GAP = saved_gap
 
@@ -435,7 +496,7 @@ asyncio.run(_check_push_routing())
 print("[4.56] 推送失败必须可重试（不丢消息）")
 asyncio.run(_check_retry_on_push_failure())
 
-print("[4.57] 多图连发的失败语义")
+print("[4.57] 配图失败的语义（一个条目只发一条）")
 asyncio.run(_check_send_entry_images())
 
 print("[4.6] botpy 新协议适配器注册")
@@ -3074,12 +3135,20 @@ async def _check_image_failure_notify() -> None:
                     raise RuntimeError("这张图坏了")
                 self.rich.append((content, url))
 
+            async def upload_image(self, group_openid: str, url: str) -> bool:
+                return True
+
+            async def send_markdown(self, group_openid: str, content: str) -> None:
+                raise RuntimeError("markdown 用不了")
+
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "t.db")
             sid, _ = db.add_subscription("G", "https://a.com/f", "源名", 60)
             db.mark_polled(sid, title="源名", mark_initialized=True)
             sub = db.list_subscriptions("G")[0]
 
+            one = E("k0", "标题0", "https://a.com/0", None, "",
+                    ("https://a.com/0a.jpg",))
             multi = E("k1", "标题1", "https://a.com/1", None, "",
                       ("https://a.com/1a.jpg", "https://a.com/1b.jpg",
                        "https://a.com/1c.jpg"))
@@ -3087,26 +3156,26 @@ async def _check_image_failure_notify() -> None:
             # --- 全成功：一条私聊都不该有 ---
             spy = _SpyNotifier()
             await FeedPoller(cfg_stub(), db, None, Fake(), notifier=spy)._push_entries(
-                sub, "源名", [multi]
+                sub, "源名", [one]
             )
             check("★ 配图全成功时不私聊", spy.calls == [], repr(spy.calls))
 
-            # --- 中间那张挂：正文和另两张照发，但要报 ---
+            # --- 多图但 markdown 走不通：只发第一张，其余两张报失败 ---
             spy = _SpyNotifier()
-            await FeedPoller(
-                cfg_stub(), db, None, Fake(bad={"https://a.com/1b.jpg"}), notifier=spy
-            )._push_entries(sub, "源名", [multi])
+            await FeedPoller(cfg_stub(), db, None, Fake(), notifier=spy)._push_entries(
+                sub, "源名", [multi]
+            )
             check("★ 有图没发出去时私聊一次", len(spy.calls) == 1, repr(spy.calls))
             if spy.calls:
                 group, text, key = spy.calls[0]
                 check("发给的是出问题的那个群", group == "G", group)
                 check("★ 冷却键按群走，不带条目（防 DM 风暴）",
                       key == f"{IMAGE_FAILURE_KEY_PREFIX}G", key)
-                check("文案说了几张没出去", "1/3" in text, text)
-                check("文案带上了失败的图片 URL", "1b.jpg" in text, text)
+                check("文案说了几张没出去", "2/3" in text, text)
+                check("文案带上了失败的图片 URL", "1b.jpg" in text and "1c.jpg" in text, text)
                 check("文案带上了源和条目", "源名" in text and "标题1" in text, text)
                 check("★ 部分失败时说的是「几张」不是「整条」",
-                      "1/3 张没发出去" in text, text)
+                      "2/3 张没发出去" in text, text)
 
             # --- 第一条挂：整条退回纯文字，图**一张都没发出去** ---
             spy = _SpyNotifier()
@@ -3116,15 +3185,15 @@ async def _check_image_failure_notify() -> None:
             )
             check("第一条挂 → 退回纯文字", len(fake.text) == 1 and not fake.rich,
                   f"{fake.text} / {fake.rich}")
-            check("★ 第一条挂时一条都不发（退回纯文字，不重复刷屏）",
+            check("★ 第一条挂时一张图都不发（退回纯文字，不重复刷屏）",
                   fake.rich == [], repr(fake.rich))
             check("★ 退回纯文字时也要报（首图就挂 = 这类图一张都发不出去）",
                   len(spy.calls) == 1, repr(spy.calls))
             if spy.calls:
                 _g, _t, _k = spy.calls[0]
                 check("★ 退回纯文字时的冷却键和部分失败共用", _k == f"{IMAGE_FAILURE_KEY_PREFIX}G", _k)
-                check("★ 说清楚是「整条退回纯文字」而不是「少了一张」",
-                      "退回纯文字" in _t and "1/3" not in _t, _t)
+                check("★ 说清楚是「整条退回纯文字」而不是「少了几张」",
+                      "退回纯文字" in _t and "2/3" not in _t, _t)
                 check("★ 只报首图（后面几张根本没试过，算进去就是编数字）",
                       _t.count("·") == 1, _t)
             db.close()
@@ -3953,14 +4022,18 @@ async def _check_mi_send() -> None:
           not p.markdowns and len(p.rich) == 1, f"{p.markdowns} | {p.rich}")
 
     p = _MiPusher()
-    await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=False)
-    check("★ 开关关掉时退回原来的连发",
-          not p.markdowns and len(p.rich) == 2 and not p.uploads)
+    failed = await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=False)
+    check("★★ 开关关掉时也只发第一张（不连发）",
+          not p.markdowns and len(p.rich) == 1 and not p.uploads,
+          f"{p.markdowns} | {p.rich}")
+    check("★ 关掉时其余图报失败", failed == ["https://a/2.jpg"], str(failed))
 
     p = _MiPusher(uploads=[False, False])
-    await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
-    check("★ QQ 一张都抓不到时退回连发，一条都不少",
-          not p.markdowns and len(p.rich) == 2, f"{p.markdowns} | {p.rich}")
+    failed = await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
+    check("★★ QQ 一张都抓不到 → 落回只发第一张（**不连发**）",
+          not p.markdowns and len(p.rich) == 1, f"{p.markdowns} | {p.rich}")
+    check("★ 落回时其余图报失败",
+          failed == ["https://a/2.jpg"], str(failed))
 
     p = _MiPusher(uploads=[True, False])
     failed = await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
@@ -3971,15 +4044,18 @@ async def _check_mi_send() -> None:
           failed == ["https://a/2.jpg"], str(failed))
 
     p = _MiPusher(md_fails=True)
-    await send_entry_images(p, "G", "正文", two, http=http, link="l", markdown=True)
-    check("★ markdown 发不出去（比如没有模板权限）时退回连发",
-          len(p.rich) == 2, str(p.rich))
+    failed = await send_entry_images(
+        p, "G", "正文", two, http=http, link="l", markdown=True)
+    check("★★ markdown 发不出去（比如没有模板权限）→ 只发第一张（不连发）",
+          len(p.rich) == 1 and not p.markdowns, f"{p.markdowns} | {p.rich}")
+    check("★ 落回时其余图报失败", failed == ["https://a/2.jpg"], str(failed))
 
     p = _MiPusher()
-    await send_entry_images(p, "G", "正文", ["bad1", "bad2"],
-                            http=http, link="l", markdown=True)
-    check("★ 尺寸一张都读不到时退回连发（不硬猜比例）",
-          not p.markdowns and len(p.rich) == 2, f"{p.markdowns} | {p.rich}")
+    failed = await send_entry_images(p, "G", "正文", ["bad1", "bad2"],
+                                     http=http, link="l", markdown=True)
+    check("★★ 尺寸一张都读不到 → 只发第一张（不硬猜比例）",
+          not p.markdowns and len(p.rich) == 1, f"{p.markdowns} | {p.rich}")
+    check("★ 落回时其余图报失败", failed == ["bad2"], str(failed))
 
     p = _MiPusher()
     await send_entry_images(
@@ -3991,9 +4067,8 @@ async def _check_mi_send() -> None:
 
 asyncio.run(_check_mi_send())
 
-# markdown 发送撞 `50035006` 必须重试一次。**不重试的代价是 1 条变 6 条**
-# （退回连发），2026-10-18 一天撞了 4 次。预热那条更亏：连发走
-# `post_group_file`，那条路预热不了渲染缓存，退回去等于预热白做。
+# markdown 发送撞 `50035006` 必须重试一次。**不重试的代价是一条资讯退回
+# 「只发第一张」**（其余图算失败、要私聊告警），2026-10-18 一天撞了 4 次。
 
 
 class _FlakyMarkdownPusher:
@@ -4030,7 +4105,7 @@ check("★ markdown 撞 50035006 → 隔 1 秒重试一次，第二条就成功�
       f"calls={_p1.calls} sent={len(_p1.markdowns)}")
 
 _p2, _d2 = asyncio.run(_md_retry(fail_times=2))
-check("★ 重试一次仍然失败 → 才退回连发（返回 None）",
+check("★ 重试一次仍然失败 → 返回 None（调用方只发第一张）",
       _p2.calls == 2 and _d2 is None and len(_p2.markdowns) == 0,
       f"calls={_p2.calls} ret={_d2}")
 

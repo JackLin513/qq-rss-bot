@@ -283,7 +283,8 @@ sudo /usr/local/bin/docker-compose up -d --force-recreate bot
   只留给「不推送、只标记」的场景（首抓 baseline、`/check`）。
 - **`asyncio.gather(..., return_exceptions=True)` 的返回值必须检查** ——
   不检查的话异常被静默吞掉，推送失败连一行日志都没有。
-- **推送是逐条发的，不是合并摘要**（一条图文只能带一张图，合并就带不了图）。
+- **推送是逐条发的，不是合并摘要**（一条资讯 = 一条 markdown，带全部配图；
+  markdown 走不通就**只发第一张**，永远不连发）。
   文案在 `scheduler.format_entry`，`_MAX_CONTENT = 1500`；间隔 `_PUSH_GAP_SEC`。
 - `FeedPoller` 的推送出口是 `Pusher` 协议（`send_text` / `send_rich`），
   `RssBot` 自己实现它。测试里换成假实现就不碰 QQ。

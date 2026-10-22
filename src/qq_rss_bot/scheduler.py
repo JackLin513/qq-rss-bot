@@ -205,13 +205,14 @@ async def send_entry_images(
 ) -> list[str]:
     """把一条资讯连同它的**全部配图**发出去。
 
-    **两种形态，`markdown=True` 且不止一张图时走第一种**：
+    **一个条目只发一条消息，永远不连发。**
 
-    * **一条 markdown 带全部图**（`msg_type=2`）—— 1 条消息，省配额、不刷屏。
+    * 不止一张图、且允许 markdown → **一条 markdown 带全部图**（`msg_type=2`）。
       图由 QQ 的服务器去下载，语法和坑见 `multiimage.py` 的模块说明。
-      这条路**整条不通就落回连发**。
-    * **连发富媒体**（`msg_type=7`）—— 第一条带正文和首图，其余每条一张图、
-      正文用 `（图 2/4）` 占位。`MediaInfo` 只有单个 `file_info`，一条只能一张。
+    * markdown 没走通 / 被开关关掉 → **只发第一张**（`msg_type=7` 富媒体），
+      其余算没发出去，由调用方私聊告警。
+      2026-10-22 之前这里是「退回连发 N 条」—— 那正好在 markdown 出问题的时候
+      刷屏，是最不该做的选择。
 
     **失败语义是分开的，这点很重要**：
 
@@ -230,21 +231,14 @@ async def send_entry_images(
         )
         if sent is not None:
             return sent
-        _log.info("多图 markdown 这条路没走通，退回连发 %d 张", len(images))
+        _log.warning(
+            "多图 markdown 没走通 → 只发第一张（**不连发**），其余 %d 张算失败",
+            len(images) - 1,
+        )
 
-    failed: list[str] = []
-    total = len(images)
-    send = partial(pusher.send_rich, group_openid)
-    await send_with_retry(send, text, images[0])
-    for index, url in enumerate(images[1:], start=2):
-        try:
-            await send_with_retry(send, f"（图 {index}/{total}）", url)
-        except QuotaExceeded:
-            raise
-        except Exception as exc:  # noqa: BLE001 —— 单张图掉了不该拖垮整条
-            _log.warning("第 %d/%d 张配图失败，跳过 (%s): %s", index, total, url, exc)
-            failed.append(url)
-    return failed
+    # 单张：富媒体（`msg_type=7`）。第一条失败照旧抛出去，调用方退回纯文字。
+    await send_with_retry(partial(pusher.send_rich, group_openid), text, images[0])
+    return list(images[1:])
 
 
 async def _send_entry_markdown(
@@ -255,7 +249,7 @@ async def _send_entry_markdown(
     http: httpx.AsyncClient,
     link: str,
 ) -> "list[str] | None":
-    """一条 markdown 带全部图。整条路不通返回 `None`，调用方落回连发。
+    """一条 markdown 带全部图。整条路不通返回 `None`，调用方**只发第一张**。
 
     返回 `[]` 表示**发成功了**，中间可能剔掉了几张 QQ 抓不到的图 —— 那些 URL
     一起返回，交给调用方走告警。
@@ -292,15 +286,12 @@ async def _send_entry_markdown(
             raise
         except Exception as exc:  # noqa: BLE001
             if attempt == 2:
-                # 重试过还是不行 —— 落回连发，那条路更稳（但有代价，见下）
-                _log.warning("多图 markdown 发送失败，退回连发: %s", exc)
+                # 重试过还是不行 —— 交给调用方**只发第一张**。
+                _log.warning("多图 markdown 发送失败，落回只发第一张: %s", exc)
                 return None
             # QQ 会拿 `50035006 消息发送异常，请稍后重试` 把**整条**拒掉，它自己
-            # 说可重试，那就重试一次。**不重试的代价是 1 条变 6 条**（退回连发），
-            # 2026-10-18 一天撞了 4 次。
-            #
-            # 预热那条尤其不能退回连发：连发走的是 `post_group_file`，**那条路
-            # 预热不了渲染缓存**（实测），退回去等于这条预热白做了。
+            # 说可重试，那就重试一次。**不重试的代价是其余几张全丢**（落回只发
+            # 第一张），2026-10-18 一天撞了 4 次。
             _log.info(
                 "多图 markdown 发送失败，%.1f 秒后重试一次: %s", IMAGE_RETRY_GAP, exc
             )
