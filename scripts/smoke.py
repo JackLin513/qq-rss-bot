@@ -8113,6 +8113,78 @@ asyncio.run(_mirror())
 
 
 # ---------------------------------------------------------------------------
+# 图库保留期（ticket #14 / ADR 0003）
+# ---------------------------------------------------------------------------
+
+print("[4.97.3] 图库保留期：贺图永久，预览/订阅 90 天")
+
+
+def _retention() -> None:
+    """清理的判定单位是**引用**，不是文件。
+
+    最关键的一条：同一份内容既当过预览、又当过贺图时，**贺图那条引用让它活下来**
+    —— 这正是内容寻址的红利（引用按 sha 挂，不是按 URL）。写反了就是把贺图删了，
+    而且事后没法恢复。
+    """
+    import tempfile as _tf  # noqa: PLC0415
+
+    from qq_rss_bot import imagelib as _il  # noqa: PLC0415
+    from qq_rss_bot.db import Database as _DB  # noqa: PLC0415
+
+    jpeg = _BaHttp._FAKE_JPEG
+    # 每个用例用不同字节，sha 才不同（同字节会被去重成一份内容）。
+    a, b, c = jpeg, jpeg + b"A", jpeg + b"BB"
+    today, old = "2026-10-22", "2026-07-01"  # old 早于 90 天前（2026-07-24）
+
+    with _tf.TemporaryDirectory() as td:
+        db = _DB(Path(td) / "bot.db")
+        lib = _il.Library(db, Path(td) / "library", "http://img.test")
+
+        # 1) 90 天前的预览 → 引用和文件都清掉
+        pv = lib.store(a, kind=_il.KIND_PREVIEW, event_date=old, source_id="v1")
+        # 2) 90 天前的贺图 → 永久保留
+        art = lib.store(b, kind=_il.KIND_ART, event_date=old, role="杜野凛世")
+        # 3) 同一份内容：过期的预览 + 新鲜的贺图 → 文件留下
+        both = lib.store(c, kind=_il.KIND_PREVIEW, event_date=old, source_id="v3")
+        lib.store(c, kind=_il.KIND_ART, event_date="2026-10-01", role="杜野凛世")
+        # 4) 盘上的孤儿文件（索引里没有）
+        orphan_dir = lib.root / "ff"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        orphan = orphan_dir / ("f" * 64 + ".jpg")
+        orphan.write_bytes(jpeg)
+
+        check("清之前：四条引用都在", len(db.image_refs(kind=_il.KIND_PREVIEW)) == 2)
+        r = lib.cleanup(keep_days=90, today=today)
+
+        check("★ 90 天前的预览：索引里没了",
+              db.image_refs(kind=_il.KIND_PREVIEW, date=old) == [])
+        check("★ 90 天前的预览：文件也删了",
+              not lib.path_of(pv.sha256, ".jpg").exists() and not db.image_has(pv.sha256))
+        check("★ 90 天前的贺图：文件仍在（永久保留）",
+              lib.path_of(art.sha256, ".jpg").is_file() and db.image_has(art.sha256))
+        check("★ 过期预览 + 新鲜贺图：文件仍在",
+              lib.path_of(both.sha256, ".jpg").is_file(), str(both))
+        check("★ 但那条过期的预览引用被清掉了",
+              db.image_refs(kind=_il.KIND_PREVIEW, date=old) == [])
+        check("★ 新鲜贺图的引用还在",
+              len(db.image_refs(kind=_il.KIND_ART, date="2026-10")) == 1)
+        check("★★ 孤儿文件被清掉", not orphan.exists(), str(orphan))
+        check("清理结果数得出来",
+              (r.refs_removed, r.blobs_removed) == (2, 2),
+              f"refs={r.refs_removed} blobs={r.blobs_removed} bytes={r.bytes_freed}")
+        check("  bytes_freed 是真实释放的体积", r.bytes_freed > 0, str(r.bytes_freed))
+
+        # 再跑一次：什么都不会被删（幂等）
+        again = lib.cleanup(keep_days=90, today=today)
+        check("★ 再跑一次是空操作（幂等）",
+              (again.refs_removed, again.blobs_removed) == (0, 0), str(again))
+        db.close()
+
+
+_retention()
+
+
+# ---------------------------------------------------------------------------
 # 群复读机
 # ---------------------------------------------------------------------------
 

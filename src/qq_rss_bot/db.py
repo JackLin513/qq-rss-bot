@@ -769,6 +769,55 @@ class Database:
             "SELECT 1 FROM images WHERE sha256 = ?", (sha256,)
         ).fetchone() is not None
 
+    # ---------- 清理（保留期见 imagelib.cleanup / ADR 0003）----------
+
+    def image_refs_prune(self, *, kinds: tuple[str, ...], before: str
+                         ) -> tuple[int, list[str]]:
+        """删掉这些类别里 `event_date < before` 的引用。
+
+        返回 `(删掉的行数, 受影响的 sha（去重）)`。
+
+        **只删引用，不碰 `images` 表、不碰文件** —— 一份内容可能同时是 90 天前的
+        预览和一张永久的贺图，那条贺图引用必须留着（ADR 0003）。
+        """
+        if not kinds:
+            return 0, []
+        marks = ",".join("?" * len(kinds))
+        shas = [
+            r["sha256"] for r in self._conn.execute(
+                f"SELECT DISTINCT sha256 FROM image_refs "
+                f"WHERE kind IN ({marks}) AND event_date < ?",
+                (*kinds, before),
+            )
+        ]
+        if not shas:
+            return 0, []
+        cur = self._conn.execute(
+            f"DELETE FROM image_refs WHERE kind IN ({marks}) AND event_date < ?",
+            (*kinds, before),
+        )
+        self._conn.commit()
+        return cur.rowcount, shas
+
+    def image_ref_orphans(self) -> list[dict]:
+        """`images` 里没有任何引用的内容（引用被清完之后剩下的壳）。"""
+        rows = self._conn.execute(
+            "SELECT i.* FROM images i "
+            "WHERE NOT EXISTS (SELECT 1 FROM image_refs r WHERE r.sha256 = i.sha256)"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def image_all(self) -> dict[str, str]:
+        """`{sha256: ext}` —— 清理时扫盘用，判断磁盘上的文件还该不该留。"""
+        return {
+            r["sha256"]: r["ext"]
+            for r in self._conn.execute("SELECT sha256, ext FROM images")
+        }
+
+    def image_delete(self, sha256: str) -> None:
+        self._conn.execute("DELETE FROM images WHERE sha256 = ?", (sha256,))
+        self._conn.commit()
+
     def image_refs(self, *, role: str | None = None, kind: str | None = None,
                    date: str | None = None, limit: int = 200) -> list[dict]:
         """按角色 / 类别 / 日期查引用。**分类是查询，不是目录**（ADR 0002）。

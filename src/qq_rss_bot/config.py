@@ -142,6 +142,8 @@ class Config:
     # 代价：每条推送多下载、多存几 MB。**单张失败只降级那一张**（退回原 URL），
     # 消息照发。发现带宽或磁盘吃不消就关掉这个开关（不用回滚代码）。
     mirror_images: bool = True
+    # 图库保留期（天）。**贺图永久保留**，这个数只管预览 / 订阅的图（ADR 0003）。
+    imagelib_keep_days: int = 90
     # ---- markdown 多图预热：正式群推送前的两道预热 + 一道人工预览 ----
     #
     # ⚠️ **预热机制已于 2026-10-22 删除。** 当年「冷链接第一次渲染必炸」
@@ -465,6 +467,7 @@ def load_config() -> Config:
         rss_multi_image=_env_bool("RSS_MULTI_IMAGE", True),
         multi_image_markdown=_env_bool("MULTI_IMAGE_MARKDOWN", True),
         mirror_images=_env_bool("MIRROR_IMAGES", True),
+        imagelib_keep_days=_env_int("IMAGELIB_KEEP_DAYS", 90),
         preview_group=_env_str("PREVIEW_GROUP", ""),
         preview_veto_sec=_env_int("PREVIEW_VETO_SEC", 30),
         push_summary=_env_bool("PUSH_SUMMARY", True),

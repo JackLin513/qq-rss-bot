@@ -155,6 +155,9 @@ class RssBot(botpy.Client):
             library=self.library,
         )
         self._birthday_art_task: Any = None
+        # 图库保留期清理（ADR 0003）。贺图永久，预览 / 订阅 90 天。
+        # 每天一次就够，而且**启动时先跑一次** —— 停机几天攒下的过期引用不用等。
+        self._cleanup_task: Any = None
         # 群复读机：连着两个人发同样的话，跟着复读一句。**没有 task** ——
         # 它挂在 `on_group_message_create` 那条路上，每条非 @ 群消息都会喂进来
         # 一次（`consider` 有副作用，不能只在「看起来像复读」时才调）。
@@ -214,6 +217,10 @@ class RssBot(botpy.Client):
             self._birthday_art_task = self.loop.create_task(
                 self.birthday_art.run(), name="qq_rss_bot.birthday_art"
             )
+        if self._cleanup_task is None:
+            self._cleanup_task = self.loop.create_task(
+                self._library_cleanup_loop(), name="qq_rss_bot.imagelib_clean"
+            )
         if self.autosub.enabled:
             # **先挂 poller 再补订阅**：补订阅万一抛异常，不能连累轮询器起不来。
             # on_ready 在断线重连时会再跑一次，所以 backfill 必须幂等 ——
@@ -237,6 +244,19 @@ class RssBot(botpy.Client):
                         "（库里还没有任何已知的群，所以没得补。"
                         "在群里 @ 一次机器人让平台把群号报过来，之后重启就会自动订上。）"
                     )
+
+    async def _library_cleanup_loop(self) -> None:
+        """每天清一次图库：贺图永久保留，预览 / 订阅的图过期就清（ADR 0003）。
+
+        **同一份内容只删一次** —— 它可能既当过 90 天前的预览、又是一张贺图，
+        那条贺图引用会让文件活下来（引用按 sha 挂，见 `imagelib.cleanup`）。
+        """
+        while True:
+            try:
+                self.library.cleanup(keep_days=self.cfg.imagelib_keep_days)
+            except Exception:  # noqa: BLE001 —— 清理失败不能连累别的功能
+                _log.exception("图库清理失败")
+            await asyncio.sleep(24 * 3600)
 
     async def _announce_previews(self) -> None:
         """启动时把「分享预览到底能不能用」写进日志。
@@ -319,6 +339,8 @@ class RssBot(botpy.Client):
         self.birthday_art.stop()
         if self._birthday_art_task is not None:
             self._birthday_art_task.cancel()
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
         self.imgsrv.stop()
         await self.rss_http.aclose()
         await self.media_http.aclose()

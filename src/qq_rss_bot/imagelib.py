@@ -30,7 +30,8 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date as Date
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import imgsrv, multiimage
@@ -45,6 +46,11 @@ KIND_FEED = "feed"        # 订阅推送里的配图（没有角色）
 
 KINDS = (KIND_ART, KIND_PREVIEW, KIND_FEED)
 
+# 保留期（ADR 0003）：**贺图永久**，预览和订阅 90 天。
+# 保留期挂在**引用**上，不是文件上 —— 同一份内容可能一边过期、一边是贺图。
+DEFAULT_KEEP_DAYS = 90
+
+
 
 @dataclass(frozen=True)
 class ImageRef:
@@ -56,6 +62,16 @@ class ImageRef:
     width: int
     height: int
     fresh: bool  # 这次是不是第一次见到这份内容（诊断用）
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """一次清理的结果。`touched` 是被碰到引用、但文件还活着的 sha 数。"""
+
+    refs_removed: int = 0
+    blobs_removed: int = 0
+    bytes_freed: int = 0
+    touched: int = 0
 
 
 class Library:
@@ -139,6 +155,70 @@ class Library:
         )
         return ImageRef(sha256=sha, ext=ext, url=self.url_of(sha, ext),
                         width=width, height=height, fresh=fresh or not had)
+
+    # ---------- 清理（ADR 0003）----------
+
+    def cleanup(
+        self,
+        *,
+        keep_days: int = DEFAULT_KEEP_DAYS,
+        today: str | None = None,
+    ) -> CleanupResult:
+        """按类别清过期引用，**只删所有引用都没了的内容和文件**。
+
+        * 贺图（`art`）**永久保留**，一条引用都不删；
+        * 预览 / 订阅（`preview` / `feed`）保留 `keep_days` 天；
+        * 同一份内容既当过预览又当过贺图时，**贺图那条引用让它活下来**
+          （引用按内容 sha 挂，不是按 URL —— 这也是内容寻址的红利）；
+        * 顺带清掉「索引里已经没有」的孤儿文件（上次写到一半崩了会留下）。
+
+        不抛异常会更好，但调用方（bot 的每日任务）自己包了 `try`。
+        """
+        cutoff = _cutoff(today, keep_days)
+        removed_refs, touched = self.db.image_refs_prune(
+            kinds=(KIND_PREVIEW, KIND_FEED), before=cutoff)
+
+        removed_blobs = 0
+        freed = 0
+        for row in self.db.image_ref_orphans():
+            path = self.path_of(row["sha256"], row["ext"])
+            try:
+                if path.exists():
+                    freed += path.stat().st_size
+                    path.unlink()
+                    removed_blobs += 1
+            except OSError as exc:
+                _log.warning("图库清理：删不掉 %s：%s", path, exc)
+                continue
+            self.db.image_delete(row["sha256"])
+
+        # 孤儿文件：盘上有、索引里没有（`touched` 之外也可能是旧的半截写入）。
+        known = self.db.image_all()
+        for path in self.root.rglob("*"):
+            if not path.is_file():
+                continue
+            sha = path.name.split(".", 1)[0]
+            if sha in known:
+                continue
+            try:
+                freed += path.stat().st_size
+                path.unlink()
+                removed_blobs += 1
+            except OSError as exc:
+                _log.warning("图库清理：删不掉孤儿文件 %s：%s", path, exc)
+
+        if removed_refs or removed_blobs:
+            _log.info(
+                "图库清理：删了 %d 条 %d 天前的引用、%d 个文件（%d 字节）；"
+                "贺图永久保留", removed_refs, keep_days, removed_blobs, freed)
+        return CleanupResult(refs_removed=removed_refs, blobs_removed=removed_blobs,
+                             bytes_freed=freed, touched=len(touched))
+
+
+def _cutoff(today: str | None, keep_days: int) -> str:
+    """保留期 → 早于它的 `event_date` 都算过期。"""
+    base = Date.fromisoformat(today) if today else Date.today()
+    return (base - timedelta(days=keep_days)).isoformat()
 
 
 def _iso(value: datetime | str | None) -> str:
