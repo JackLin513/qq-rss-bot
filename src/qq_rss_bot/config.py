@@ -148,6 +148,11 @@ class Config:
     mirror_images: bool = True
     # 图库保留期（天）。**贺图永久保留**，这个数只管预览 / 订阅的图（ADR 0003）。
     imagelib_keep_days: int = 90
+    # 预览卡片被 QQ 内容审核拒绝时，**自动撤回触发它的那条原分享消息**
+    # （2026-10-23 加）。防止群里留下一条没有上下文的裸链接。
+    # ⚠️ 撤回是**不可逆**的，且需要机器人在群里是管理员、消息在 2 分钟内；
+    # 失败只记日志 + 私聊，不影响主流程。关掉就什么都不撤。
+    recall_blocked_share: bool = True
     # ---- markdown 多图预热：正式群推送前的两道预热 + 一道人工预览 ----
     #
     # ⚠️ **预热机制已于 2026-10-22 删除。** 当年「冷链接第一次渲染必炸」
@@ -473,6 +478,7 @@ def load_config() -> Config:
         multi_image_markdown=_env_bool("MULTI_IMAGE_MARKDOWN", True),
         mirror_images=_env_bool("MIRROR_IMAGES", True),
         imagelib_keep_days=_env_int("IMAGELIB_KEEP_DAYS", 90),
+        recall_blocked_share=_env_bool("RECALL_BLOCKED_SHARE", True),
         preview_group=_env_str("PREVIEW_GROUP", ""),
         preview_veto_sec=_env_int("PREVIEW_VETO_SEC", 30),
         push_summary=_env_bool("PUSH_SUMMARY", True),

@@ -28,9 +28,15 @@ botpy 的 ``post_group_file`` / ``post_c2c_file`` 只收 ``url``，由 **QQ 的�
 补上它之后，YouTube / X 的封面走「我们自己下载 → base64 上传」，
 不再依赖 QQ 够不够得到那个域名。
 
-三个补丁都利用同一个机制：``ConnectionState.__init__`` 用
+**补丁四：撤回群消息（``delete_group_message``）。**
+botpy 1.2.1 完全没封装群消息撤回（``recall_message`` 是频道的 REST，
+路径是 ``/channels/{channel_id}/...``）。群消息要的是
+``DELETE /v2/groups/{group_openid}/messages/{message_id}``。
+内容审核拒绝时撤回原分享消息要用它，见 `bot._preview_media`。
+
+前三个补丁利用同一个机制：``ConnectionState.__init__`` 用
 ``inspect.getmembers`` 收集所有 ``parse_*`` 方法建解析表，
-所以在 Client 建立连接之前替换类方法就会被自动注册。
+所以在 Client 建立连接之前替换类方法就会被自动注册；第四个是普通方法补丁。
 """
 
 from __future__ import annotations
@@ -194,6 +200,26 @@ async def _post_c2c_file(
     )
 
 
+async def _delete_group_message(self, group_openid: str, message_id: str) -> None:
+    """撤回群消息。
+
+    botpy 1.2.1 **没有封装**这个接口（`recall_message` 是频道的，不适用群）。
+    官方接口：`DELETE /v2/groups/{group_openid}/messages/{message_id}`，限频 10 QPS。
+
+    权限（2026-10-23 查官方文档）：
+    * 机器人是**群管理员** → 可撤回自己的消息 + **普通群成员**的消息；
+    * 只是普通成员 → 只能撤回自己的；
+    * 消息发出超过 **2 分钟**不可撤回（`40064004`），无权限 `40062003`。
+    """
+    route = Route(
+        "DELETE",
+        "/v2/groups/{group_openid}/messages/{message_id}",
+        group_openid=group_openid,
+        message_id=message_id,
+    )
+    return await self._http.request(route)
+
+
 def _install_file_upload() -> list[str]:
     """补丁三：把两个上传方法的签名换成支持 ``file_data`` 的版本。"""
     changed: list[str] = []
@@ -210,13 +236,23 @@ def _install_file_upload() -> list[str]:
     return changed
 
 
+def _install_group_recall() -> list[str]:
+    """补丁四：给 BotAPI 补上撤回群消息的方法（botpy 原本没有）。"""
+    current = getattr(BotAPI, "delete_group_message", None)
+    if current is not None and getattr(current, _PATCH_FLAG, False):
+        return []
+    setattr(_delete_group_message, _PATCH_FLAG, True)
+    setattr(BotAPI, "delete_group_message", _delete_group_message)
+    return ["delete_group_message"]
+
+
 def install_botpy_patches() -> list[str]:
     """安装全部 botpy 补丁，返回本次实际改动的项（幂等，重复调用返回空列表）。
 
     必须在 ``RssBot(...)`` 构造**之前**调用：解析表是 ``ConnectionState``
     实例化时一次性建好的，事后再换就来不及了。
     """
-    changed = _install_parsers() + _install_file_upload()
+    changed = _install_parsers() + _install_file_upload() + _install_group_recall()
     if changed:
         _log.info("已替换 botpy 实现：%s", "、".join(changed))
     else:

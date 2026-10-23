@@ -2928,10 +2928,12 @@ class _MediaApi:
 
     `code` 非 0 模拟**业务错误码**（比如 304036 没有 markdown 模板权限）——
     这个平台「HTTP 200 但用户看不见」就从这儿来，所以必须能测。
+    `deletes` 记撤回调用（群 openid, message id）—— 内容审核那条路的钉子。
     """
 
     def __init__(self, code: int = 0, raises: bool = False) -> None:
         self.sent: list[dict] = []
+        self.deletes: list[tuple[str, str]] = []
         self._code, self._raises = code, raises
 
     async def post_group_message(self, **kw):
@@ -2939,6 +2941,9 @@ class _MediaApi:
         if self._raises:
             raise RuntimeError("send boom")
         return {"code": self._code}
+
+    async def delete_group_message(self, group_openid: str, message_id: str) -> None:
+        self.deletes.append((group_openid, message_id))
 
 
 class _SpyNotifier:
@@ -2960,6 +2965,7 @@ class _MediaBotStub:
     """只借 RssBot 的预览出口，不真造 botpy Client（那要事件循环和网络）。"""
 
     _preview_media = _RssBot._preview_media
+    _recall_share = _RssBot._recall_share
     _make_repliers = _RssBot._make_repliers
 
     def __init__(self, cfg, media_http, api, notifier=None, library=None):
@@ -3212,6 +3218,54 @@ async def _check_media_preview_inner() -> None:
     check("★★ 私聊告警说清楚整条没发（不是「N 张没发出去」）",
           bool(spy.calls) and "整条没有发出" in spy.calls[0][1]
           and "消息内容违规" in spy.calls[0][1], str(spy.calls))
+    check("★★ 自动撤回了触发预览的那条原消息",
+          api.deletes == [("G", "M1")], str(api.deletes))
+    check("★ 告警里写明了撤回结果",
+          bool(spy.calls) and "原消息已自动撤回" in spy.calls[0][1], str(spy.calls))
+
+    # --- ★ 开关关掉：不撤回，但整条不发的行为不变 ---
+    grab.lines.clear()
+    blog.addHandler(grab)
+    blog.setLevel(logging.INFO)
+    spy = _SpyNotifier()
+    try:
+        api = _ModerationApi()
+        bot = _MediaBotStub(
+            dataclasses.replace(cfg, recall_blocked_share=False),
+            _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw"), api, notifier=spy)
+        await bot._preview_media(_FakeMsg(_X_TEXT))
+    finally:
+        blog.removeHandler(grab)
+        blog.setLevel(old_level)
+    check("★ RECALL_BLOCKED_SHARE=false → 一次都不撤回", api.deletes == [], str(api.deletes))
+    check("  告警里说明撤回是关着的",
+          bool(spy.calls) and "自动撤回已关闭" in spy.calls[0][1], str(spy.calls))
+
+    # --- ★ 撤回失败（机器人不是管理员）：不能抛、不能影响主流程 ---
+    class _RecallDeniedApi(_ModerationApi):
+        async def delete_group_message(self, group_openid, message_id):
+            self.deletes.append((group_openid, message_id))
+            raise ServerError("无操作权限")
+
+    grab.lines.clear()
+    blog.addHandler(grab)
+    blog.setLevel(logging.INFO)
+    spy = _SpyNotifier()
+    try:
+        api = _RecallDeniedApi()
+        bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw"),
+                            api, notifier=spy)
+        replied = await bot._preview_media(_FakeMsg(_X_TEXT))
+    finally:
+        blog.removeHandler(grab)
+        blog.setLevel(old_level)
+    check("★★ 撤回无权限时预览仍然正常返回（不抛）", replied is False, str(replied))
+    check("★ 日志里写明需要群管理员权限",
+          any("无操作权限" in ln and "群管理员" in ln for ln in grab.lines),
+          repr([ln for ln in grab.lines if "撤回" in ln][:2]))
+    check("★ 告警里注明原消息没能撤回",
+          bool(spy.calls) and "未能撤回" in spy.calls[0][1]
+          and "群管理员" in spy.calls[0][1], str(spy.calls))
 
     # --- ★ 异常要被吃掉：不能冒到 botpy 的 _run_event ---
     class _BoomApi:
@@ -3506,6 +3560,25 @@ def _check_file_data_patch() -> None:
 
     check("补丁是幂等的（重复安装不改动）",
           install_new_protocol_support() == [], repr(install_new_protocol_support()))
+
+    # ---- 补丁四：撤回群消息（botpy 1.2.1 完全没有）----
+    import types
+
+    check("★ 补上了 delete_group_message（botpy 原本没有）",
+          hasattr(BotAPI, "delete_group_message"))
+
+    class _H:
+        async def request(self, route, **kw):
+            self.route = route
+            return {}
+
+    h = _H()
+    asyncio.run(BotAPI.delete_group_message(
+        types.SimpleNamespace(_http=h), "G", "M1"))
+    check("★★ 撤回走 DELETE /v2/groups/{group_openid}/messages/{message_id}",
+          h.route.method == "DELETE"
+          and h.route.url == "https://api.sgroup.qq.com/v2/groups/G/messages/M1",
+          f"{h.route.method} {h.route.url}")
 
 
 _check_file_data_patch()

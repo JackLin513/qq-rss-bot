@@ -59,6 +59,16 @@ def _content_blocked(exc: BaseException) -> bool:
     return "消息内容违规" in (str(exc) or "")
 
 
+def _recall_reason(exc: BaseException) -> str:
+    """撤回失败的人话原因。botpy 的异常同样只有 message，只能按文案映射。"""
+    text = str(exc) or type(exc).__name__
+    if "无操作权限" in text or "40062003" in text:
+        return "无操作权限（机器人需要是群管理员）"
+    if "撤回时限" in text or "40064004" in text:
+        return "超过 2 分钟撤回时限"
+    return text
+
+
 
 class RssBot(botpy.Client):
     def __init__(self, cfg: Config) -> None:
@@ -580,6 +590,32 @@ class RssBot(botpy.Client):
         )
         return True
 
+    async def _recall_share(self, message: GroupMessage) -> str:
+        """撤回触发了预览的那条原消息（内容审核拒绝时用）。
+
+        返回**一句给私聊告警用的结果**，不抛异常 —— 撤回失败不该连累告警本身。
+
+        ⚠️ 权限（官方文档，2026-10-23）：机器人是**群管理员**才能撤回普通群成员
+        的消息；只是普通成员时只能撤回自己的。消息超过 **2 分钟**不可撤回。
+        群主发的消息能否被管理员机器人撤回，**文档没有明确保证**，线上实测为准。
+        """
+        if not self.cfg.recall_blocked_share:
+            return "自动撤回已关闭"
+        try:
+            await self.api.delete_group_message(message.group_openid, message.id)
+        except Exception as exc:  # noqa: BLE001 —— 撤回失败只影响这一句话
+            reason = _recall_reason(exc)
+            _log.warning(
+                "撤回原分享消息失败（群 %s，消息 %s）：%s",
+                message.group_openid, message.id, reason,
+            )
+            return f"原消息未能撤回（{reason}）"
+        _log.info(
+            "已撤回被内容审核拦下的原分享消息（群 %s，消息 %s）",
+            message.group_openid, message.id,
+        )
+        return "原消息已自动撤回"
+
     async def _preview_media(self, message: GroupMessage) -> bool:
         """非 @ 的群消息里有 YouTube / X 链接 → 回一条带封面的卡片。
 
@@ -603,7 +639,8 @@ class RssBot(botpy.Client):
             if target.site == "twitter" and not self.cfg.twitter_preview:
                 return False
 
-            _log.info("群 %s：认出 %s 分享 %s", message.group_openid, target.site, target.vid)
+            _log.info("群 %s：认出 %s 分享 %s（消息 %s）",
+                      message.group_openid, target.site, target.vid, message.id)
             card = await preview.lookup(self.media_http, target)
             if card is None:
                 # **这条必须看得见。** 具体原因由 preview.lookup 内部按 INFO 记。
@@ -651,6 +688,7 @@ class RssBot(botpy.Client):
                 images.append((ref.url, ref.width, ref.height))
 
             blocked = False
+            recall = ""
             fallback = ""
             try:
                 await reply_card(preview.render_markdown(card, images))
@@ -675,6 +713,8 @@ class RssBot(botpy.Client):
                         message.group_openid, target.site, target.vid, fallback,
                         exc_info=True,
                     )
+                    # 群里的原分享还留着一条裸链接 —— 按配置尝试撤回。
+                    recall = await self._recall_share(message)
                 else:
                     _log.warning("markdown 卡片发不出去，退回纯文字：%s", fallback,
                                  exc_info=True)
@@ -689,7 +729,8 @@ class RssBot(botpy.Client):
             await self.notifier.notify(
                 message.group_openid,
                 f"⚠️ 分享未发送：QQ 内容审核拒绝（{fallback}）。整条没有发出。\n"
-                f"来源：{card.site} 分享\n条目：{card.title}",
+                f"来源：{card.site} 分享\n条目：{card.title}\n"
+                f"{recall}。",
                 key=f"{IMAGE_FAILURE_KEY_PREFIX}{message.group_openid}",
             )
         elif failed:

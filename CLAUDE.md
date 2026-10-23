@@ -47,6 +47,7 @@ uv run python scripts/probe_media.py           # YouTube / X 卡片
 uv run python scripts/probe_x_search.py        # X 搜索传输诊断（X 改版挂掉时先跑它）
 uv run python scripts/probe_mdfmt.py           # markdown 尺寸/语法 A/B（唯一能定图片宽度的方法）
 uv run python scripts/probe_textlen.py         # 消息长度上限实测
+uv run python scripts/probe_recall.py --group <openid> --msg-id <id>  # 撤回测试（只删测试群）
 ```
 
 ## 硬性约束
@@ -237,6 +238,11 @@ sudo /usr/local/bin/docker-compose up -d --force-recreate bot
   ⚠️ **它不会说是文字还是图违规**；同一条的纯文字兜底能发，所以多半是图。
   完整 body（含 `trace_id`）在 botpy 自己那行 `[botpy] 接口请求异常…`，
   要申诉只能拿它。别和 `40034003`（富媒体上传超时）混。
+- **撤回群消息**：`DELETE /v2/groups/{group_openid}/messages/{message_id}`
+  （botpy 没封装，`compat` 补了 `delete_group_message`）。**机器人是群管理员**
+  才能撤普通群成员的消息，普通成员只能撤自己的；**超过 2 分钟**撤不了
+  （`40064004`），无权限 `40062003`。群主发的消息能否被管理员机器人撤回，
+  文档没保证 —— 用 `scripts/probe_recall.py` 在测试群实测。
 - `keyboard` **必须包一层 `content`**（`{"keyboard": {"content": {"rows": […]}}}`），
   漏了就是「HTTP 200 但按钮没了」。
 - 主动消息频控：发送侧 60 qpm（认证）/ 30 qpm，**群维度 20 qpm**、每群每天 1000 条。
