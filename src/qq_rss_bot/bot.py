@@ -639,14 +639,21 @@ class RssBot(botpy.Client):
                 cover_bytes += len(raw)
                 images.append((ref.url, ref.width, ref.height))
 
+            fallback = ""
             try:
                 await reply_card(preview.render_markdown(card, images))
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # **只对能观测到的错误降级。** 业务错误码非 0（比如没有 markdown
                 # 模板权限 304036）会抛出来；退回纯文字 + 链接，而不是退回另一种
                 # markdown —— markdown 本身没权限时，那个兜底也是白的。
                 # 「发出去但用户看不见」观测不到，不做自动降级。
-                _log.warning("markdown 卡片发不出去，退回纯文字", exc_info=True)
+                #
+                # ⚠️ **`消息内容违规` 是 QQ 的内容审核**，不是 X 的风控，也
+                # 不是图没传上去 —— 图早就在我们图库里了。原样记进日志和私聊，
+                # 否则「配图发送失败」会被误读成网络/图床问题（2026-10-23 踩过）。
+                fallback = str(exc) or type(exc).__name__
+                _log.warning("markdown 卡片发不出去，退回纯文字：%s", fallback,
+                             exc_info=True)
                 await _reply(preview.render_text(card))
                 failed.extend([u for u in urls])
         except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
@@ -655,10 +662,11 @@ class RssBot(botpy.Client):
 
         if failed:
             # 和定时推送共用冷却键：两个入口同时出问题时报一次就够。
+            why = f"markdown 卡片被拒：{fallback}" if fallback else "上传或发送失败"
             await self.notifier.notify(
                 message.group_openid,
                 image_failure_message(
-                    f"{len(failed)} 张没发出去（上传或发送失败）",
+                    f"{len(failed)} 张没发出去（{why}）",
                     f"来源：{card.site} 分享\n条目：{card.title}",
                     failed,
                 ),
@@ -672,15 +680,17 @@ class RssBot(botpy.Client):
         # URL 也带上：档位就写在 `?name=` 里，扫一眼就能确认。
         detail = (
             f"，配图 {len(images)} 张 {cover_bytes // 1024}KB"
-            if images
-            else ""
+            if images and not fallback
+            else (f"，已下载 {len(images)} 张 {cover_bytes // 1024}KB 但未发出"
+                  if images else "")
         )
         _log.info(
             "群 %s 分享了 %s %s，已回%s%s",
             message.group_openid,
             target.site,
             target.vid,
-            "markdown 卡片" if images else "纯文字卡片",
+            f"纯文字卡片（markdown 被拒：{fallback}）" if fallback
+            else ("markdown 卡片" if images else "纯文字卡片"),
             detail,
         )
         return True

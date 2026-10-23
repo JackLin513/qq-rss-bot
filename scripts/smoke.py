@@ -3175,6 +3175,44 @@ async def _check_media_preview_inner() -> None:
     check("★ 成功日志带配图张数和字节数",
           bool(done) and "配图 1 张" in done[-1] and "KB" in done[-1], repr(done[-1:]))
 
+    # --- ★ QQ 内容审核拒绝：不是 X 风控，也不是图没下载 ---
+    # 2026-10-23 线上：推文 2113551464060903928 的 markdown 被 QQ 判「消息内容违规」，
+    # 图其实已经下载入库（1269KB）。旧日志照样写「已回markdown 卡片，配图 1 张」，
+    # 私聊也只说「上传或发送失败」—— 两个地方都会把人引向错误方向。
+    from botpy.errors import ServerError  # noqa: PLC0415
+
+    class _ModerationApi(_MediaApi):
+        async def post_group_message(self, **kw):
+            self.sent.append(kw)
+            if kw.get("markdown"):
+                raise ServerError("消息内容违规")
+            return {"code": 0}
+
+    grab.lines.clear()
+    blog.addHandler(grab)
+    blog.setLevel(logging.INFO)
+    spy = _SpyNotifier()
+    try:
+        api = _ModerationApi()
+        bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw"),
+                            api, notifier=spy)
+        await bot._preview_media(_FakeMsg(_X_TEXT))
+    finally:
+        blog.removeHandler(grab)
+        blog.setLevel(old_level)
+
+    check("★ 被内容审核拒绝时退回纯文字（不是整条不回）",
+          any(kw.get("content") and not kw.get("markdown") for kw in api.sent),
+          str(api.sent))
+    done = [ln for ln in grab.lines if "已回" in ln]
+    check("★★ 日志写明「markdown 被拒」而不是「已回markdown 卡片」",
+          bool(done) and "被拒" in done[-1] and "消息内容违规" in done[-1],
+          repr(done[-1:]))
+    check("★ 日志说明图已下载但没发出（不再误导成发成功了）",
+          bool(done) and "未发出" in done[-1], repr(done[-1:]))
+    check("★★ 私聊告警带上真实原因，不只说「上传或发送失败」",
+          bool(spy.calls) and "消息内容违规" in spy.calls[0][1], str(spy.calls))
+
     # --- ★ 异常要被吃掉：不能冒到 botpy 的 _run_event ---
     class _BoomApi:
         async def post_group_message(self, **kw):
