@@ -1343,6 +1343,23 @@ async def _check_fail_and_pause() -> None:
         check("★ 手动暂停那条仍然停着",
               subs[mid].enabled is False and subs[mid].paused_reason == "manual",
               str(subs[mid]))
+
+        # ★ 旧版本暂停的（paused_reason 为 NULL）要能认出来：升级后那三条
+        #   线上订阅不该还要人手动 /resume。
+        db._conn.execute(
+            "UPDATE subscriptions SET paused_reason = NULL, enabled = 0, "
+            "fail_count = 2 WHERE id = ?", (aid,))
+        db._conn.execute(
+            "UPDATE subscriptions SET paused_reason = NULL, enabled = 0, "
+            "fail_count = 0 WHERE id = ?", (mid,))
+        db._conn.commit()
+        n = db.adopt_legacy_pauses(2)
+        subs = {s.id: s for s in db.list_subscriptions("G")}
+        check("★★ 旧版本自动暂停的会被补成 auto（升级后不用手动恢复）",
+              n == 1 and subs[aid].paused_reason == "auto", f"n={n} {subs[aid]}")
+        check("  旧版本手动暂停的不动（fail_count 没到阈值）",
+              subs[mid].paused_reason is None or subs[mid].paused_reason == "",
+              str(subs[mid].paused_reason))
     finally:
         restore()
         td.cleanup()

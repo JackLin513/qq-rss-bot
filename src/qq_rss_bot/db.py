@@ -422,6 +422,24 @@ class Database:
         self._conn.commit()
         return cur.rowcount > 0
 
+    def adopt_legacy_pauses(self, fail_threshold: int) -> int:
+        """把**旧版本**暂停的订阅补上暂停原因。返回改了几行。
+
+        `paused_reason` 是 2026-10-23 才加的列。之前被自动暂停的订阅这一列是
+        NULL，`retry_paused` 认不出来，就永远不会自动重试 —— 正好是升级后
+        「那三条还是得手动 /resume」的坑。
+
+        判据用 `fail_count >= 阈值`：旧代码只在连挂到阈值时才自动暂停，
+        而用户 `/pause` 不会把计数推到这个数。所以这个回填是准的。
+        """
+        cur = self._conn.execute(
+            "UPDATE subscriptions SET paused_reason = 'auto' "
+            "WHERE enabled = 0 AND paused_reason IS NULL AND fail_count >= ?",
+            (fail_threshold,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def retry_paused(self, stale_sec: int, fail_count: int) -> list[Subscription]:
         """把「自动暂停满 `stale_sec` 秒」的订阅放回去重试一次。
 

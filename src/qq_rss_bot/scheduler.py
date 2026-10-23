@@ -439,8 +439,11 @@ class FeedPoller:
         # 「不发」喊停时置位。**只在预览窗口内有效**。
         self._veto = asyncio.Event()
         self._preview_open = False
-        # 被人工否掉的条目 key → 时间戳，见 `_VETO_KEEP_SEC`。
+        # 被「人工否掉」的条目 key → 时间戳，见 `_VETO_KEEP_SEC`。
         self._vetoed: dict[str, float] = {}
+        # 旧版本暂停的订阅补原因（`paused_reason` 是 2026-10-23 才加的列）。
+        # 只跑一次，见 `Database.adopt_legacy_pauses`。
+        self._adopted_legacy = False
         # 预览那轮真正发出去的 key，用来在喊停时**精确**挡住同一批，
         # 而不是把这一轮所有条目都一起毙掉。
         self._last_pushed: dict[int, list[str]] = {}
@@ -483,6 +486,11 @@ class FeedPoller:
         _log.info("轮询已停止")
 
     async def poll_once(self) -> None:
+        if not self._adopted_legacy:
+            n = self.db.adopt_legacy_pauses(self.cfg.max_fail_before_pause)
+            if n:
+                _log.info("把 %d 条旧版本自动暂停的订阅补上原因（会被自动重试）", n)
+            self._adopted_legacy = True
         # 自动暂停的订阅（连续失败被停的）到点了就放回去重试**一次**。
         # 上游整站维护时这一点很重要 —— 否则要人去群里手打 /resume。
         for sub in self.db.retry_paused(
