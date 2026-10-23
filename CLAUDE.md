@@ -241,8 +241,10 @@ sudo /usr/local/bin/docker-compose up -d --force-recreate bot
 - **撤回群消息**：`DELETE /v2/groups/{group_openid}/messages/{message_id}`
   （botpy 没封装，`compat` 补了 `delete_group_message`）。**机器人是群管理员**
   才能撤普通群成员的消息，普通成员只能撤自己的；**超过 2 分钟**撤不了
-  （`40064004`），无权限 `40062003`。群主发的消息能否被管理员机器人撤回，
-  文档没保证 —— 用 `scripts/probe_recall.py` 在测试群实测。
+  （`40064004`），无权限 `40062003`。
+  ⚠️ **2026-10-23 实测：撤自己的消息 200；撤群主 / 普通成员的消息两个群都是
+  `40062003`** —— 要么它不是管理员，要么平台根本不允许撤他人消息。功能按
+  best-effort 保留（见 `docs/preview-yt-x.md`），别再以为是代码写错了。
 - `keyboard` **必须包一层 `content`**（`{"keyboard": {"content": {"rows": […]}}}`），
   漏了就是「HTTP 200 但按钮没了」。
 - 主动消息频控：发送侧 60 qpm（认证）/ 30 qpm，**群维度 20 qpm**、每群每天 1000 条。

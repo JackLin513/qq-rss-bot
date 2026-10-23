@@ -1292,14 +1292,57 @@ async def _check_fail_and_pause() -> None:
         check("★ 暂停原因记成 auto（只有这种会被自动重试）",
               sub.paused_reason == "auto", sub.paused_reason)
         check("暂停后不再参与轮询", db.due_subscriptions("2099-01-01T00:00:00+00:00") == [])
-        check("暂停时发了私聊通知",
-              any(k == f"pause:{sid}" for _, k, _ in notifier.notes),
+        check("★★ 只在第一次失败时私聊一次（暂停不再另外报）",
+              len(notifier.notes) == 1, str([k for _, k, _ in notifier.notes]))
+        check("★ 用的是故障状态机的 key", notifier.notes[0][1] == "rss_outage",
+              notifier.notes[0][1])
+        check("★ 第一封就说明「只报这一次、恢复后再报」",
+              "只报这一次" in notifier.notes[0][2]
+              and "每小时自动重试" in notifier.notes[0][2],
+              notifier.notes[0][2])
+        check("★ 不再有旧的「已自动暂停」私聊",
+              not any(k.startswith("pause:") for _, k, _ in notifier.notes),
               str([k for _, k, _ in notifier.notes]))
-        check("通知里说明了怎么恢复",
-              any("/resume" in t for _, _, t in notifier.notes))
-        check("★ 通知里说明会自动重试（不再要求人手动处理）",
-              any("1 小时后会自动重试" in t for _, _, t in notifier.notes),
-              str([t for _, _, t in notifier.notes]))
+    finally:
+        restore()
+        td.cleanup()
+
+    # ★ 故障状态机：首次报一次 → 中间静默 → 恢复报一次
+    td, db, rec, notifier, p, restore = _poller_fixture(entries=[])
+    try:
+        import qq_rss_bot.scheduler as sch
+
+        state = {"err": "HTTP 503"}
+
+        async def flaky(http, url, timeout):
+            if state["err"]:
+                return FeedResult(url=url, error=state["err"])
+            return FeedResult(url=url, title="源", entries=[])
+
+        sch.fetch_feed = flaky
+        sid, _ = db.add_subscription("G", "https://a.com/1", "源1", 900)
+        db.mark_polled(sid, title="源1", mark_initialized=True)
+
+        async def poll() -> None:
+            db._conn.execute("UPDATE subscriptions SET last_polled_at = NULL")
+            db._conn.commit()
+            await p.poll_once()
+
+        await poll()
+        check("★ 第一次失败报一次", len(notifier.notes) == 1, str(notifier.notes))
+        await poll()
+        await poll()
+        check("★★ 后面连续失败全部静默（不再刷私聊）",
+              len(notifier.notes) == 1, str([k for _, k, _ in notifier.notes]))
+
+        state["err"] = ""
+        await poll()
+        check("★★ 恢复后报一声", len(notifier.notes) == 2
+              and notifier.notes[-1][1] == "rss_recovered", str(notifier.notes))
+        check("  恢复文案说了「已恢复」", "已恢复" in notifier.notes[-1][2],
+              notifier.notes[-1][2])
+        await poll()
+        check("  恢复之后不再重复报", len(notifier.notes) == 2, str(notifier.notes))
     finally:
         restore()
         td.cleanup()
@@ -1409,7 +1452,7 @@ async def _check_fail_and_pause() -> None:
         db._conn.commit()
         await p.poll_once()
         check("整轮全挂时发出整体故障通知",
-              any(k == "rsshub_down" for _, k, _ in notifier.notes),
+              any(k == "rss_outage" for _, k, _ in notifier.notes),
               str([k for _, k, _ in notifier.notes]))
     finally:
         restore()
@@ -1427,7 +1470,7 @@ async def _check_fail_and_pause() -> None:
         db._conn.commit()
         await p.poll_once()
         check("★ 配额用尽导致的跳过不误报整体故障",
-              not any(k == "rsshub_down" for _, k, _ in notifier.notes),
+              not any(k == "rss_outage" for _, k, _ in notifier.notes),
               str([k for _, k, _ in notifier.notes]))
     finally:
         restore()
@@ -1442,7 +1485,7 @@ async def _check_fail_and_pause() -> None:
         db._conn.commit()
         await p.poll_once()
         check("有源成功就不报整体故障",
-              not any(k == "rsshub_down" for _, k, _ in notifier.notes))
+              not any(k == "rss_outage" for _, k, _ in notifier.notes))
     finally:
         restore()
         td.cleanup()

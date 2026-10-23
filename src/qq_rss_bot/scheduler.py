@@ -447,6 +447,13 @@ class FeedPoller:
         # 预览那轮真正发出去的 key，用来在喊停时**精确**挡住同一批，
         # 而不是把这一轮所有条目都一起毙掉。
         self._last_pushed: dict[int, list[str]] = {}
+        # 抓取失败的**状态机**：失败的订阅 id、它们属于哪个群、哪个群已经报过。
+        # 只在「从正常 → 出错」和「从出错 → 正常」两个跳变时私聊，中间全部静默。
+        # 见 `_track_outage`。
+        self._failing: set[int] = set()
+        self._sub_group: dict[int, str] = {}
+        self._sub_title: dict[int, str] = {}
+        self._outage_notified: set[str] = set()
 
     def stop(self) -> None:
         self._stopped.set()
@@ -506,7 +513,7 @@ class FeedPoller:
         _log.debug("本轮待抓取 %d 个订阅", len(due))
         collected = await self._poll_staged(due)
         results = [collected.get(sub.id) for sub in due]
-        await self._check_global_outage(due, results)
+        await self._track_outage(due, results)
 
     async def _gather_poll(self, subs: list[Subscription]) -> dict[int, object]:
         """并发抓一批订阅，返回 `{订阅 id: 结果}`。
@@ -598,37 +605,60 @@ class FeedPoller:
         collected.update(await self._gather_poll(real))
         return collected
 
-    async def _check_global_outage(self, due: list[Subscription], results: list) -> None:
-        """整轮**全军覆没**时提醒一次：多半是 RSSHub 或网络挂了。
+    async def _track_outage(self, due: list[Subscription], results: list) -> None:
+        """抓取失败的**状态机**：只在「正常 → 出错」和「出错 → 正常」时私聊一次。
 
-        比单独探活更准 —— 测的就是真正依赖的东西，也不额外发请求。
-        只要有**一个**源成功就不报警，免得单个源的 404 被误报成整体故障。
+        用户要的是：**第一次失败报一次，之后全部静默**，直到某轮恢复再报一声。
+        以前每轮都走「全部失败」告警（冷却 30 分钟），自动暂停还会再报一次 ——
+        上游维护几小时就是十几条私聊，等于刷屏。
 
-        这正是「Docker 一停、所有源一起失败、群里却一声不吭」那个场景。
+        判定单位是**群**：一个群里可能有多条订阅，只要还有一条在失败就算「故障中」。
+        跳过的（配额用尽，`None`）既不算成功也不算失败，不改变状态。
         """
-        if not due:
-            return
-        # 跳过的（配额用尽）既不算成功也不算失败，必须排除掉 ——
-        # 否则配额一满就会误报「RSSHub 挂了」，把人引到完全错误的方向。
-        attempted = [r for r in results if r is not None]
-        if not attempted or any(r is True for r in attempted):
-            return
-        _log.error("本轮 %d 个订阅全部抓取失败，怀疑 RSSHub 或网络不可达", len(attempted))
-        for group_openid in {sub.group_openid for sub in due}:
-            await self.notifier.notify(
-                group_openid,
-                f"⚠️ 本轮 {len(due)} 个订阅**全部**抓取失败，"
-                f"多半是 RSSHub 或网络挂了。\n"
-                f"先检查 RSSHub 容器是否在跑；恢复后会自动继续，不用手动干预。",
-                key="rsshub_down",
-            )
+        for sub, result in zip(due, results):
+            self._sub_group[sub.id] = sub.group_openid
+            self._sub_title[sub.id] = sub.title or sub.url
+            if result is True:
+                self._failing.discard(sub.id)
+            elif result is False:
+                self._failing.add(sub.id)
+
+        for group in {sub.group_openid for sub in due}:
+            failing = [
+                sid for sid in self._failing if self._sub_group.get(sid) == group
+            ]
+            if failing and group not in self._outage_notified:
+                self._outage_notified.add(group)
+                names = "、".join(
+                    f"《{self._sub_title.get(sid, sid)}》" for sid in failing[:3]
+                )
+                more = f" 等 {len(failing)} 个订阅" if len(failing) > 3 else ""
+                _log.error(
+                    "群 %s 首次抓取失败（%d 个订阅），之后静默到恢复", group[:8], len(failing)
+                )
+                await self.notifier.notify(
+                    group,
+                    f"⚠️ RSS 抓取失败（只报这一次，恢复后再报）：\n"
+                    f"{names}{more}\n"
+                    f"多半是 RSSHub 或网络不可用；连续失败会自动暂停，"
+                    f"之后每小时自动重试。",
+                    key="rss_outage",
+                )
+            elif not failing and group in self._outage_notified:
+                self._outage_notified.discard(group)
+                _log.info("群 %s 的 RSS 抓取已恢复", group[:8])
+                await self.notifier.notify(
+                    group,
+                    "✅ RSS 抓取已恢复，之前失败的订阅重新抓取成功了。",
+                    key="rss_recovered",
+                )
 
     async def _poll_one(self, sub: Subscription) -> bool | None:
         """抓一个订阅。
 
         返回 `True` 抓取成功 / `False` 抓取失败 / **`None` 本轮跳过**（配额用尽）。
-        三态是必要的：跳过不是失败，混在一起会让 `_check_global_outage`
-        把「配额用尽」误报成「所有源都挂了」。
+        三态是必要的：跳过不是失败，混在一起会让 `_track_outage`
+        把「配额用尽」误报成「这个源挂了」。
         """
         async with self._sem:
             # 配额已用尽就别抓了：抓了也发不出去，白占 RSSHub 和带宽
@@ -646,15 +676,12 @@ class FeedPoller:
                 )
                 if fails >= self.cfg.max_fail_before_pause:
                     self.db.set_enabled(sub.group_openid, sub.id, False, reason="auto")
-                    _log.warning("订阅 #%s 连续失败 %d 次，已自动暂停", sub.id, fails)
-                    await self.notifier.notify(
-                        sub.group_openid,
-                        f"⚠️ 订阅《{sub.title or sub.url}》连续 {fails} 次抓取失败，已自动暂停。\n"
-                        f"最后一次错误：{result.error}\n"
-                        f"{_retry_hint(self.cfg.auto_resume_sec)}"
-                        f"（想立刻重试：/resume <编号>，编号见 /list）",
-                        key=f"pause:{sub.id}",
+                    _log.warning(
+                        "订阅 #%s 连续失败 %d 次，已自动暂停（%s 后自动重试）",
+                        sub.id, fails, _retry_hint(self.cfg.auto_resume_sec).rstrip("；"),
                     )
+                    # **不私聊。** 首次失败已经报过了，暂停只是内部状态；
+                    # 再报一次就是用户说的「报错五次也太烦了」。恢复时统一报一声。
                 return False
 
             keys = [e.key for e in result.entries]

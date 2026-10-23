@@ -41,6 +41,7 @@ oEmbed 兜底；**X 以 fxtwitter 为主**、官方 oEmbed 兜底（至少还有
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -468,13 +469,30 @@ async def fetch_image(
 
     `max_bytes` 默认是 base64 那条路的 3.5 MB 上限；**存进图库的调用方要传
     更大的值**（图床的上限），否则会白白丢掉本来存得下的原图。
+
+    **超时 / 连接失败会重试一次**（2026-10-23 加的）。线上实测过：同一条推文
+    第一次下载 `ConnectTimeout`，重发一次就好了 —— 只试一次的话分享卡片直接
+    退化成纯文字，看起来像「内容被拦了」，其实只是代理抖了一下。
     """
-    try:
-        resp = await http.get(url, headers={"User-Agent": BROWSER_UA}, timeout=timeout)
-        resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        _log.info("preview：封面下载失败 %s：%s: %s", url, type(exc).__name__, exc)
-        return None
+    resp = None
+    for attempt in (1, 2):
+        try:
+            resp = await http.get(url, headers={"User-Agent": BROWSER_UA},
+                                  timeout=timeout)
+            resp.raise_for_status()
+            break
+        except httpx.HTTPError as exc:
+            transient = isinstance(
+                exc, (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError))
+            if attempt == 1 and transient:
+                _log.info(
+                    "preview：封面下载超时/连接失败，重试一次 %s：%s",
+                    url, type(exc).__name__,
+                )
+                await asyncio.sleep(0.5)
+                continue
+            _log.info("preview：封面下载失败 %s：%s: %s", url, type(exc).__name__, exc)
+            return None
     raw = resp.content
     if not raw:
         return None
