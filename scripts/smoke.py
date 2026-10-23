@@ -4431,6 +4431,8 @@ def _check_tk_parse() -> None:
           r.entry_end == datetime(2026, 11, 15, 23, 59, 59, 999000, tzinfo=_TK_JST),
           repr(r.entry_end))
     check("★ 封面档次解出来了", r.cover.get("medium") == "https://cdn/x.png.800")
+    check("★ 巡演名也存了下来（物販整理券只出现在这里）",
+          r.tour_name == "巡演名", r.tour_name)
     check("★ 抽選/先着的标", r.kind_label == "抽選" and not _tk.is_imas("") and r.lottery)
 
     bad = next(x for x in recs if x.id == "rec-2")
@@ -4482,6 +4484,108 @@ def _check_tk_alerts() -> None:
     check("★ now 与 end 都换到 UTC 后比较仍然成立",
           _tk.due_alerts(_tk_rec(entry_end=_TK_END.astimezone(timezone.utc)), utc_now, set())
           == ["new", "entry2"])
+
+
+def _check_tk_labels() -> None:
+    """★ 受付怎么标 —— 2026-10-23 用户报的两条错标。
+
+    * **物販整理券被标成演出票**：物販那条受付自己叫「一般受付（抽選）」、
+      `entry_type` 也是 `lottery`，**只有 tour 名带 `【物販整理券】`**
+      （用当天真实响应确认）。不读 tour 名永远分不出来。
+    * **リセール被标成先着**：`resale_lottery` 落在 `else` 分支里，
+      而它其实是抽選。
+    """
+    merch = _tk_rec(
+        name="一般受付（抽選）", entry_type="lottery",
+        booth_name="学園アイドルマスター LIVE TOUR -標- ファイナル公演",
+        tour_name="【物販整理券】学園アイドルマスター LIVE TOUR -標- ファイナル公演",
+        entry_end=_TK_END)
+    check("★ 物販整理券认出来了（靠 tour 名）", merch.category == "merch", merch.category)
+    check("★ 标题里写「物販整理券（抽選）」，不是光秃秃的抽選",
+          merch.sale_label == "物販整理券（抽選）", merch.sale_label)
+    check("★ 受付名那行带【物販整理券】标记",
+          merch.display_name == "【物販整理券】一般受付（抽選）", merch.display_name)
+    text = _tk.render_new(merch)
+    check("★ 新受付文案里能看出是物販", "物販整理券" in text, text)
+    dtext = _tk.render_deadline(merch, "entry2", _TK_END - timedelta(hours=1))
+    check("★ 締切文案里也能看出是物販", "物販整理券" in dtext, dtext)
+
+    normal = _tk_rec(name="アソビストア一般会員先行", tour_name="巡演名", entry_end=_TK_END)
+    check("普通受付不带物販标记",
+          normal.category == "" and normal.sale_label == "抽選"
+          and normal.display_name == normal.name)
+    check("★ tour 名和场名不同时才多印一行（巡演名在这里有信息量）",
+          "巡演名" in _tk.render_new(normal))
+
+    resale = _tk_rec(entry_type="resale_lottery", name="リセール（11月7日(土)公演）",
+                     entry_end=_TK_END)
+    check("★★ リセール抽選不是先着", resale.kind_label == "リセール抽選",
+          resale.kind_label)
+    check("  リセール算 resale 类", resale.category == "resale", resale.category)
+    check("★ 先着仍然是先着", _tk_rec(entry_type="fcfs").kind_label == "先着")
+    check("认不出的 entry_type 原样显示，不瞎猜",
+          _tk_rec(entry_type="something_new").kind_label == "something_new")
+
+
+def _check_tk_grouping() -> None:
+    """★★ 防刷屏：同一件事的多条受付**合成一条消息**。
+
+    线上形态（2026-10-23 实测）：一场 live 同时挂 2 个席位 × 2 个日期 = 4 条受付，
+    日期字段完全一样，只差名字；以前每条各发一条，一轮刷 4 条 + 各配一张图。
+    """
+    base = dict(
+        booth_slug="sidem-261226", booth_name="F@NTASTIC BATTLE FES",
+        tour_name="F@NTASTIC BATTLE FES", entry_type="lottery",
+        status="within_entry_period", entry_end=_TK_END,
+        entry_start=_TK_END - timedelta(days=10),
+        result_at=_TK_END + timedelta(days=10),
+        deposit_end=_TK_END + timedelta(days=14),
+    )
+    seats = [
+        _tk_rec(id="sp", name="【SP席】一般会員先行", **base),
+        _tk_rec(id="sa", name="【S席・A席】一般会員先行", **base),
+    ]
+    now = _TK_END - timedelta(hours=1)  # 同时进 new 和 entry2 窗口
+
+    groups = _tk.alert_groups(seats, now, {})
+    by_kind = {kind: recs for kind, recs in groups}
+    check("★ 两个席位只产生「新受付」+「締切」两组，不是四条",
+          sorted(by_kind) == ["entry2", "new"] and all(len(v) == 2 for v in by_kind.values()),
+          {k: [r.id for r in v] for k, v in by_kind.items()})
+
+    text = _tk.render_alert(by_kind["new"], "new", now)
+    check("★ 一条消息里两个席位都在",
+          "【SP席】" in text and "【S席・A席】" in text, text)
+    check("★ 标了合并件数", "（2 件）" in text, text)
+    check("★ 日期只印一次（同一套日期）", text.count("受付期間：") == 1, text)
+
+    dtext = _tk.render_alert(by_kind["entry2"], "entry2", now)
+    check("★ 締切也合并成一条", "（2 件）" in dtext
+          and "【SP席】" in dtext and "【S席・A席】" in dtext, dtext)
+    check("  締切时间只印一次", dtext.count("北京时间") == 1, dtext)
+
+    # 不同日期 = 真·不同截止时间 → 绝不合并
+    other_day = _tk_rec(id="d2", name="一般受付", entry_end=_TK_END + timedelta(days=1),
+                        entry_start=base["entry_start"], result_at=base["result_at"],
+                        deposit_end=base["deposit_end"], booth_slug=base["booth_slug"],
+                        booth_name=base["booth_name"], tour_name=base["tour_name"])
+    check("★ 截止时间不同的受付不合并",
+          len([g for g in _tk.alert_groups([seats[0], other_day], now, {})
+               if g[0] == "new"]) == 2)
+
+    # 同一场同时挂演出票和物販整理券 → 两个 tour，绝不能合并
+    merch = _tk_rec(id="m", name="一般受付（抽選）", booth_slug=base["booth_slug"],
+                    booth_name=base["booth_name"], tour_name="【物販整理券】F@NTASTIC",
+                    entry_end=_TK_END, entry_start=base["entry_start"],
+                    result_at=base["result_at"], deposit_end=base["deposit_end"])
+    check("★★ 演出票和物販整理券不合并（类别不同）",
+          len([g for g in _tk.alert_groups([seats[0], merch], now, {})
+               if g[0] == "new"]) == 2,
+          [[r.id for r in v] for _k, v in _tk.alert_groups([seats[0], merch], now, {})])
+
+    # 已经发过的 kind 不再出现
+    seen = {"sp": {"new", "entry2"}, "sa": {"new", "entry2"}}
+    check("已经发过的提醒不会再进分组", _tk.alert_groups(seats, now, seen) == [])
 
 
 def _check_tk_render() -> None:
@@ -4783,6 +4887,26 @@ def _check_tk_render() -> None:
               "这场两个来源都没封面" in joined, joined[:200])
 
     asyncio.run(run())
+
+    # ★ 列表里也要分得清「物販整理券」和演出票 —— 两者场名相同、受付名都是
+    #   「一般受付（抽選）」，只有 tour 名不同（2026-10-23 线上误标）。
+    async def _merch_digest() -> str:
+        class _NoHttp:
+            async def get(self, url, **kw):  # pragma: no cover - images=False
+                raise RuntimeError("这条用例一次网都不该上")
+
+        recs = [_tk_rec(
+            id="mg", booth_slug="gkmas-261107",
+            booth_name="学園アイドルマスター LIVE TOUR -標- ファイナル公演",
+            name="一般受付（抽選）",
+            tour_name="【物販整理券】学園アイドルマスター LIVE TOUR -標- ファイナル公演",
+            entry_end=_TK_END, result_at=_TK_END + timedelta(days=13))]
+        return await _tk.render_digest(
+            _NoHttp(), recs, _TK_END - timedelta(days=1), wanted=("open",), images=False)
+
+    mtext = asyncio.run(_merch_digest())
+    check("★ 列表里物販整理券带【物販整理券】标记，不会被当成演出票",
+          "【物販整理券】一般受付（抽選）" in mtext, mtext)
 
     # ★ 时区：显示用北京时间，但**判定必须还是日本时间**。
     #   这条钉住「别把 now() 一起改成 CST」—— 那会让所有判定整体平移一小时。
@@ -5302,11 +5426,118 @@ def _check_tk_poller() -> None:
     asyncio.run(run())
 
 
+def _check_tk_aggregate_poll() -> None:
+    """★★ 端到端防刷屏：4 条受付（2 席位 × 2 日期）一轮只发 **2 条**消息。
+
+    以前是 4 条「新受付」+ 4 条「締切」= 8 条，每条还各配一张封面；
+    加上预览窗口每条等 30 秒，一轮能折腾好几分钟。
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from qq_rss_bot.db import Database as _DB
+
+    def payload(now: datetime) -> dict:
+        end = now + timedelta(hours=5)        # 落在 24h 窗口
+        start = now - timedelta(days=10)
+        result = now + timedelta(days=20)
+        dep = now + timedelta(days=25)
+        data = []
+        for i, name in enumerate(("【SP席】一般会員先行", "【S席・A席】一般会員先行",
+                                  "【SP席】プレミアム先行", "【S席・A席】プレミアム先行")):
+            data.append({
+                "id": f"r{i}", "type": "reception",
+                "attributes": {
+                    "name": name, "entry_type": "lottery",
+                    "entry_period_status": "within_entry_period",
+                    "entry_period_starts_at": start.isoformat(),
+                    "entry_period_ends_at": end.isoformat(),
+                    "result_announcement_scheduled_at": result.isoformat(),
+                    "deposit_period_ends_at": dep.isoformat(),
+                },
+                "relationships": {
+                    "tour": {"data": {"id": "t1", "type": "tour"}},
+                    "cover_image": {"data": None},
+                },
+            })
+        return {
+            "data": data,
+            "included": [
+                {"id": "t1", "type": "tour", "attributes": {"name": "BATTLE FES"},
+                 "relationships": {"booth": {"data": {"id": "b1", "type": "booth"}}}},
+                {"id": "b1", "type": "booth",
+                 "attributes": {"name": "BATTLE FES", "slug": "sidem-261226"}},
+            ],
+        }
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+            self.headers = {}
+            self.content = b""
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self):
+            pass
+
+    class _Http:
+        async def get(self, url, **kw):
+            if url.endswith("/booths"):
+                return _Resp({"data": [], "included": []})
+            return _Resp(payload(_tk.now()))
+
+    class _Pusher:
+        def __init__(self):
+            self.sent: list[tuple[str, str]] = []
+
+        async def send_markdown(self, group, text):
+            self.sent.append((group, text))
+
+    async def run() -> None:
+        with tempfile.TemporaryDirectory() as d:
+            db = _enable(_DB(_P(d) / "t.db"), "tickets", "G")
+            try:
+                # 建过 baseline 的群：否则首轮会把 new 全吞掉
+                db.mark_ticket_alert("seed", "G", "new")
+                pusher = _Pusher()
+                poller = _tk.TicketPoller(dataclasses.replace(cfg_stub()),
+                                          db, _Http(), pusher)
+                n = await poller.poll_once()
+                texts = [t for _, t in pusher.sent]
+                check("★★ 4 条受付一轮只发 2 条消息（新受付 + 締切），不是 8 条",
+                      n == 2 and len(texts) == 2, f"n={n} {[t[:16] for t in texts]}")
+                new_text = next((t for t in texts if "新受付" in t), "")
+                dl_text = next((t for t in texts if "申込締切" in t), "")
+                check("★ 合并后的新受付带「4 件」和四个席位",
+                      "（4 件）" in new_text
+                      and all(n in new_text for n in
+                              ("【SP席】一般会員先行", "【S席・A席】一般会員先行",
+                               "【SP席】プレミアム先行", "【S席・A席】プレミアム先行")),
+                      new_text)
+                check("★ 合并后的締切也只有一条", "（4 件）" in dl_text, dl_text)
+                got = db.ticket_alert_kinds("G")
+                check("★★ 合并消息里的**每一条受付**都记了账（不然下一轮重发）",
+                      all(got.get(f"r{i}") == {"new", "entry24"} for i in range(4)),
+                      str(got))
+                check("第二轮不再重复", await poller.poll_once() == 0)
+            finally:
+                db.close()
+
+    asyncio.run(run())
+
+
 _check_tk_brand()
 _check_tk_poller()
+_check_tk_aggregate_poll()
 _check_tk_stage()
 _check_tk_parse()
 _check_tk_alerts()
+_check_tk_labels()
+_check_tk_grouping()
 _check_tk_render()
 _check_tk_cover()
 _check_tk_feed()

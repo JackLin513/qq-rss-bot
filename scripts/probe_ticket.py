@@ -61,7 +61,7 @@ def _print_rec(
     booths: dict[str, dict[str, str]] | None = None,
 ) -> None:
     booth_cover = (booths or {}).get(rec.booth_slug) or {}
-    print(f"  [{rec.kind_label}] {rec.booth_name}")
+    print(f"  [{rec.sale_label}] {rec.booth_name}")
     print(f"        {rec.name}   状态={rec.status}")
     print(
         f"        申込 {tickets._at(rec.entry_start)} ～ {tickets._at(rec.entry_end)}"
@@ -174,13 +174,13 @@ async def main() -> int:
             print(f"\n共 {len(fired)} 条。首次运行时 kind='new' 的会被 baseline 吃掉，不会推。")
         else:
             print(f"此刻会推的提醒（seen 为空，即全新状态）：")
+            # **和线上一样走 `alert_groups`**：多席位 / 多日期会合并成一条。
+            # 这里如果逐条渲染，看到的条数会比群里实际收到的多得多。
             any_fired = False
-            for rec in imas:
-                kinds = tickets.due_alerts(rec, now, set())
-                for kind in kinds:
-                    any_fired = True
-                    print(f"\n--- {kind} ---")
-                    print(tickets.render_alert(rec, kind, now))
+            for kind, group in tickets.alert_groups(imas, now, {}):
+                any_fired = True
+                print(f"\n--- {kind} ---")
+                print(tickets.render_alert(group, kind, now))
             if not any_fired:
                 print("  （没有）")
 

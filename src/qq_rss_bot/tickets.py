@@ -33,6 +33,13 @@
 **首轮只建 baseline、一条都不推。** 存量有 31 条受付（14 条 IM@S），直接跑会
 当场倒灌十几条 —— 和 `rss.py` 里 `sub.initialized` 是同一个坑。
 但**締切提醒不 baseline**：那本来就是按时间窗口算的，该响就响。
+
+**两条 2026-10-23 定下来的规矩：**
+
+* **分类**：物販整理券只能从 **tour 名**认 —— 它的受付名和 `entry_type`
+  跟演出票一模一样（见 `Reception.category`）。
+* **防刷屏**：同一场、同一类别的多个席位 / 日期**合并成一条消息**
+  （`alert_groups`）。以前每条受付各发一条，多席位同时抽时一轮刷 8 条。
 """
 
 from __future__ import annotations
@@ -117,6 +124,14 @@ LEADS: tuple[tuple[int, str], ...] = ((2, "2"), (24, "24"))
 # 三条提醒各自的标题前缀
 KIND_LABELS = {"entry": "申込締切", "deposit": "入金締切"}
 
+# 受付方式 → 中文标签。**`resale_lottery` 必须有自己的一档** ——
+# 它以前落进 `else` 被标成「先着」，而它其实是抽選（2026-10-23 修）。
+ENTRY_LABELS = {
+    "lottery": "抽選",
+    "fcfs": "先着",
+    "resale_lottery": "リセール抽選",
+}
+
 _FETCH_TIMEOUT = 25.0
 
 
@@ -156,6 +171,10 @@ class Reception:
     deposit_start: datetime | None = None
     deposit_end: datetime | None = None
     cover: Mapping[str, str] = field(default_factory=dict)
+    # 巡演名（`tour.attributes.name`）。**物販整理券只在这里出现** ——
+    # 実測 2026-10-23：物販那条受付自己叫「一般受付（抽選）」，和演出票一模一样，
+    # 只有 tour 名带 `【物販整理券】`。不存它就只能靠猜。
+    tour_name: str = ""
 
     @property
     def lottery(self) -> bool:
@@ -164,7 +183,35 @@ class Reception:
 
     @property
     def kind_label(self) -> str:
-        return "抽選" if self.lottery else "先着"
+        """受付方式。**`resale_lottery` 不是先着** —— 它也是抽選，只是卖的是转卖票。"""
+        return ENTRY_LABELS.get(self.entry_type, self.entry_type or "受付")
+
+    @property
+    def category(self) -> str:
+        """`merch`（物販整理券）/ `resale`（リセール）/ `""`（演出票）。
+
+        ⚠️ **物販只能从 tour 名认**：受付名「一般受付（抽選）」和演出票完全相同，
+        `entry_type` 也同样是 `lottery`（2026-10-23 用真实响应确认）。
+        """
+        if self.entry_type == "resale_lottery" or "リセール" in self.name:
+            return "resale"
+        if "物販整理券" in self.tour_name or "物販整理券" in self.name:
+            return "merch"
+        return ""
+
+    @property
+    def sale_label(self) -> str:
+        """消息里那行「抽選 / 先着 / 物販整理券（抽選）」。"""
+        if self.category == "merch":
+            return f"物販整理券（{self.kind_label}）"
+        return self.kind_label
+
+    @property
+    def display_name(self) -> str:
+        """列表 / 提醒里那一行。物販要带上标记，否则和演出票分不出来。"""
+        if self.category == "merch" and "物販整理券" not in self.name:
+            return f"【物販整理券】{self.name}"
+        return self.name
 
     @property
     def url(self) -> str:
@@ -241,6 +288,7 @@ def parse(payload: Mapping) -> list[Reception]:
                 deposit_start=_dt(attrs.get("deposit_period_starts_at")),
                 deposit_end=_dt(attrs.get("deposit_period_ends_at")),
                 cover={k: str(v) for k, v in urls.items() if isinstance(v, str)},
+                tour_name=str((tour.get("attributes") or {}).get("name") or ""),
             )
         )
     return out
@@ -423,6 +471,47 @@ def due_alerts(
     return out
 
 
+def _alert_key(rec: Reception, kind: str) -> tuple:
+    """同一批提醒的合并键。
+
+    **多种席位 / 多个日期同时抽时，它们只差一个名字** —— 受付名里的
+    `【SP席】`、`リセール（11月7日…）` 就是全部区别，日期字段一模一样。
+    所以键里放「场 + 类别 + 这套日期」，不同场、不同类别、不同轮次绝不合并。
+
+    ⚠️ **要带类别（`merch` / `resale` / 演出票）而不是 tour 名**：同一场 live
+    会同时挂「演出票」和「物販整理券」两个 tour（2026-10-23 实测
+    `gkmas-261107`），合进一条就分不清了；而按类别分既能分开它们，
+    又能把「每个日期单独一个 tour」那种排法照样合并。
+    """
+    if kind == "new":
+        return ("new", rec.booth_slug, rec.category, rec.entry_start,
+                rec.entry_end, rec.result_at, rec.deposit_start, rec.deposit_end)
+    prefix = kind.rstrip("0123456789")
+    end = rec.entry_end if prefix == "entry" else rec.deposit_end
+    return (kind, rec.booth_slug, rec.category, end)
+
+
+def alert_groups(
+    recs: Sequence[Reception], now: datetime, seen: Mapping[str, set[str]]
+) -> list[tuple[str, list[Reception]]]:
+    """把这一轮该发的提醒**按「同一件事」合并**，返回 `[(kind, [受付…])]`。
+
+    **这是防刷屏的唯一入口。** 一场 live 常见 2–6 条受付（SP 席 / S・A 席、
+    11/7 / 11/8 两场），以前每条各发一条消息，一轮能刷 6 条；合并之后是 1 条，
+    列几行席位 / 日期。日期不同的（真·不同截止时间）不会被合并。
+    """
+    out: list[tuple[str, list[Reception]]] = []
+    index: dict[tuple, int] = {}
+    for rec in recs:
+        for kind in due_alerts(rec, now, seen.get(rec.id, set())):
+            key = _alert_key(rec, kind)
+            if key not in index:
+                index[key] = len(out)
+                out.append((kind, []))
+            out[index[key]][1].append(rec)
+    return out
+
+
 # ---------- 渲染 ----------
 #
 # 排版照着群友那个工具的观感来（2026-10-18 用户给的样例）：
@@ -572,42 +661,89 @@ def _remain(end: datetime | None, now: datetime) -> str:
 # ---------- 单条提醒（推送用）----------
 
 
-def render_new(rec: Reception) -> str:
-    """新受付。带全部日期，一条看完。"""
-    lines = [f"🎫 **新受付 · {rec.kind_label}**", f"**{_md(rec.booth_name)}**", rec.name, ""]
-    if rec.entry_start or rec.entry_end:
-        lines.append(f"受付期間：{_span(rec.entry_start, rec.entry_end)}")
-    if rec.result_at:
-        lines.append(f"当落发表：{_at(rec.result_at, weekday=False)}")
-    if rec.deposit_start or rec.deposit_end:
-        lines.append(f"入金期間：{_span(rec.deposit_start, rec.deposit_end)}")
-    lines.append(f"[在 ASOBI TICKET 打开]({rec.url})")
+def _tour_lines(recs: Sequence[Reception]) -> list[str]:
+    """巡演名那行 —— **只在和场名不一样时才加**。
+
+    物販整理券就是靠这一行才看得出来：场名是 live 本名，巡演名是
+    `【物販整理券】…`，不显示的话和演出票一模一样。
+    """
+    first = recs[0]
+    if first.tour_name and first.tour_name != first.booth_name:
+        return [_md(first.tour_name)]
+    return []
+
+
+def _name_lines(recs: Sequence[Reception]) -> list[str]:
+    """受付名那几行。多条时逐行列出，**一条消息看完所有席位 / 日期**。
+
+    标题和巡演名那行已经标了「物販整理券」，这里就不再重复加前缀。
+    """
+    if len(recs) == 1:
+        return [recs[0].name]
+    return [f"・{rec.name}" for rec in recs]
+
+
+def _count_suffix(recs: Sequence[Reception]) -> str:
+    return f"（{len(recs)} 件）" if len(recs) > 1 else ""
+
+
+def render_new(recs: "Reception | Sequence[Reception]") -> str:
+    """新受付。**同一件事的多条受付合并成一条消息**（见 `alert_groups`）。"""
+    recs = [recs] if isinstance(recs, Reception) else list(recs)
+    first = recs[0]
+    lines = [
+        f"🎫 **新受付 · {first.sale_label}**{_count_suffix(recs)}",
+        f"**{_md(first.booth_name)}**",
+        *_tour_lines(recs),
+        "",
+        *_name_lines(recs),
+    ]
+    if first.entry_start or first.entry_end:
+        lines.append(f"受付期間：{_span(first.entry_start, first.entry_end)}")
+    if first.result_at:
+        lines.append(f"当落发表：{_at(first.result_at, weekday=False)}")
+    if first.deposit_start or first.deposit_end:
+        lines.append(f"入金期間：{_span(first.deposit_start, first.deposit_end)}")
+    lines.append(f"[在 ASOBI TICKET 打开]({first.url})")
     return "\n".join(lines)
 
 
-def render_deadline(rec: Reception, kind: str, now: datetime) -> str:
+def render_deadline(
+    recs: "Reception | Sequence[Reception]", kind: str, now: datetime
+) -> str:
     """締切提醒。`kind` 形如 `entry24` / `entry2` / `deposit24` / `deposit2`。
 
     **尾数是 24 或 2，位数不一样** —— 所以只能把尾部的数字整体剥掉，
     不能写 `kind[:-2]`（那样 `entry2` 会解析成前缀 `entr`，静默退到入金日期，
     推出去的是一条日期错误的締切）。smoke 里有一条专门钉这个。
+
+    同一截止时刻的多条受付合并成一条（`alert_groups` 的键含截止时间）。
     """
+    recs = [recs] if isinstance(recs, Reception) else list(recs)
+    first = recs[0]
     prefix = kind.rstrip("0123456789")
-    end = rec.entry_end if prefix == "entry" else rec.deposit_end
+    end = first.entry_end if prefix == "entry" else first.deposit_end
     label = KIND_LABELS.get(prefix, "締切")
-    return "\n".join(
-        [
-            f"⏰ **{label}まで あと {_remain(end, now)}**",
-            f"**{_md(rec.booth_name)}**",
-            f"{rec.name}（{rec.kind_label}）",
-            f"{_at(end, weekday=False)}（北京时间）",
-            f"[在 ASOBI TICKET 打开]({rec.url})",
-        ]
-    )
+    lines = [
+        f"⏰ **{label}まで あと {_remain(end, now)}**{_count_suffix(recs)}",
+        f"**{_md(first.booth_name)}**",
+        *_tour_lines(recs),
+    ]
+    if len(recs) == 1:
+        lines.append(f"{first.name}（{first.sale_label}）")
+    else:
+        lines += _name_lines(recs)
+    lines += [
+        f"{_at(end, weekday=False)}（北京时间）",
+        f"[在 ASOBI TICKET 打开]({first.url})",
+    ]
+    return "\n".join(lines)
 
 
-def render_alert(rec: Reception, kind: str, now: datetime) -> str:
-    return render_new(rec) if kind == "new" else render_deadline(rec, kind, now)
+def render_alert(
+    recs: "Reception | Sequence[Reception]", kind: str, now: datetime
+) -> str:
+    return render_new(recs) if kind == "new" else render_deadline(recs, kind, now)
 
 
 # ---------- 列表（/抽选、/当落）----------
@@ -640,7 +776,7 @@ def _section_key(rec: Reception, which: str) -> datetime:
 
 def _receipt_lines(rec: Reception, which: str) -> list[str]:
     """一条受付下面那几行。"""
-    out = [rec.name]
+    out = [rec.display_name]
     if which == "open":
         if rec.entry_start or rec.entry_end:
             out.append(f"受付期間：{_span(rec.entry_start, rec.entry_end)}")
@@ -1039,24 +1175,34 @@ class TicketPoller:
                 len(seeded_groups),
                 seeded,
             )
-        pending: list[tuple[Reception, str, list[str]]] = []
-        for rec in recs:
-            groups_for: dict[str, list[str]] = {}
-            for group in self.groups:
-                for kind in due_alerts(rec, now, seen[group].get(rec.id, set())):
-                    groups_for.setdefault(kind, []).append(group)
-            for kind, groups in groups_for.items():
-                pending.append((rec, kind, groups))
+        # **先按「同一件事」合并，再发。** 一场 live 常有 2–6 条受付
+        # （SP 席 / S・A 席，或 11/7 + 11/8 两场），以前每条各发一条消息，
+        # 多席位 + 多日期同时抽时一轮刷 6 条。合并后是一条消息列几行。
+        #
+        # 合并键含「场 + 巡演 + 这套日期」—— 不同场、不同巡演（演出票 vs
+        # 物販整理券）、不同截止时刻都**不会**被合到一起。
+        pending: list[tuple[str, list[Reception], list[str]]] = []
+        merged: dict[tuple, int] = {}
+        for group in self.groups:
+            for kind, group_recs in alert_groups(recs, now, seen[group]):
+                key = (kind, tuple(r.id for r in group_recs))
+                at = merged.get(key)
+                if at is None:
+                    merged[key] = len(pending)
+                    pending.append((kind, group_recs, [group]))
+                else:
+                    pending[at][2].append(group)
 
         sent = 0
-        for rec, kind, groups in pending:
+        for kind, group_recs, groups in pending:
             if self._stopped.is_set():
                 break
-            text = render_alert(rec, kind, now)
+            first = group_recs[0]
+            text = render_alert(group_recs, kind, now)
             if self.cfg.ticket_images:
                 text = await with_cover(
                     self.http,
-                    rec,
+                    first,
                     text,
                     self.cfg.ticket_image_size,
                     self._size_cache,
@@ -1064,20 +1210,32 @@ class TicketPoller:
                     booths,
                     library=self.library if self.cfg.mirror_images else None,
                 )
-            label = f"{kind}/{rec.title[:40]}"
-            delivered = await self._deliver(text, groups, label)
+            what = f"{kind}/{first.title[:40]}"
+            if len(group_recs) > 1:
+                what += f"（合并 {len(group_recs)} 条受付）"
+            delivered = await self._deliver(text, groups, what)
 
             if delivered is None:
                 # 被「不发」挡下：**照着已推处理**。不记的话下一轮又捞出来，
                 # 你得每轮否一次。和 RSS 那边同一条规矩。
+                # **合并消息里的每一条受付都要记** —— 只记第一条的话，
+                # 下一轮剩下的会再发一遍（这正是以前刷屏的形态）。
                 for group in groups:
-                    self.db.mark_ticket_alert(rec.id, group, kind)
+                    for rec in group_recs:
+                        self.db.mark_ticket_alert(rec.id, group, kind)
                 continue
 
             # 发失败就**不记账**，下一轮会重试 —— 和 RSS「先发再标记已见」一致。
             for group in delivered:
-                self.db.mark_ticket_alert(rec.id, group, kind)
-                _log.info("抽票：已推送 %s → %s（%s）", kind, group[:8], rec.title[:50])
+                for rec in group_recs:
+                    self.db.mark_ticket_alert(rec.id, group, kind)
+                _log.info(
+                    "抽票：已推送 %s → %s（%s%s）",
+                    kind,
+                    group[:8],
+                    first.title[:50],
+                    f" 等 {len(group_recs)} 条受付" if len(group_recs) > 1 else "",
+                )
             sent += len(delivered)
 
         if sent:
