@@ -1289,12 +1289,81 @@ async def _check_fail_and_pause() -> None:
             check(f"第 {i} 次失败后 fail_count={i}", sub.fail_count == i, str(sub.fail_count))
         sub = db.list_subscriptions("G")[0]
         check("到阈值后自动暂停", sub.enabled is False)
+        check("★ 暂停原因记成 auto（只有这种会被自动重试）",
+              sub.paused_reason == "auto", sub.paused_reason)
         check("暂停后不再参与轮询", db.due_subscriptions("2099-01-01T00:00:00+00:00") == [])
         check("暂停时发了私聊通知",
               any(k == f"pause:{sid}" for _, k, _ in notifier.notes),
               str([k for _, k, _ in notifier.notes]))
         check("通知里说明了怎么恢复",
               any("/resume" in t for _, _, t in notifier.notes))
+        check("★ 通知里说明会自动重试（不再要求人手动处理）",
+              any("1 小时后会自动重试" in t for _, _, t in notifier.notes),
+              str([t for _, _, t in notifier.notes]))
+    finally:
+        restore()
+        td.cleanup()
+
+    # ★ 自动暂停满一小时 → 放回去重试一次；用户手动暂停的不动
+    td, db, rec, notifier, p, restore = _poller_fixture(error="HTTP 503")
+    try:
+        aid, _ = db.add_subscription("G", "https://a.com/a", "自动", 900)
+        mid, _ = db.add_subscription("G", "https://a.com/m", "手动", 900)
+        db.mark_polled(aid, title="自动")
+        db.mark_polled(mid, title="手动")
+        db.set_enabled("G", aid, False, reason="auto")
+        db.set_enabled("G", mid, False, reason="manual")
+        db._conn.execute(
+            "UPDATE subscriptions SET fail_count = 2, last_polled_at = ? "
+            "WHERE id IN (?, ?)", (utcnow(), aid, mid))
+        db._conn.commit()
+
+        # 还没满一小时 → 不重试
+        got = db.retry_paused(3600, 1)
+        check("★ 自动暂停未满一小时不重试", got == [], str(got))
+        check("  手动暂停的永远不重试",
+              db.list_subscriptions("G")[1].enabled is False)
+
+        # 把「最后一次失败」挪到两小时前 → 自动那条被放回去
+        from datetime import datetime, timedelta, timezone as _tz  # noqa: PLC0415
+
+        two_hours_ago = (datetime.now(_tz.utc) - timedelta(hours=2)).isoformat(
+            timespec="seconds")
+        db._conn.execute(
+            "UPDATE subscriptions SET last_polled_at = ? WHERE id = ?",
+            (two_hours_ago, aid))
+        db._conn.commit()
+        got = db.retry_paused(3600, 1)
+        check("★ 自动暂停满一小时 → 放回去重试", [s.id for s in got] == [aid], str(got))
+        subs = {s.id: s for s in db.list_subscriptions("G")}
+        check("  放回去时 enabled=1、原因清空",
+              subs[aid].enabled is True and subs[aid].paused_reason == "", str(subs[aid]))
+        check("★ fail_count 设成阈值-1：再失败一次就重新暂停，不会又连挂 5 次",
+              subs[aid].fail_count == 1, str(subs[aid].fail_count))
+        check("★ 手动暂停那条仍然停着",
+              subs[mid].enabled is False and subs[mid].paused_reason == "manual",
+              str(subs[mid]))
+    finally:
+        restore()
+        td.cleanup()
+
+    # ★ 端到端：poll_once 自己会把到点的自动暂停订阅放回去，抓成功就彻底恢复
+    td, db, rec, notifier, p, restore = _poller_fixture(entries=[])
+    try:
+        sid, _ = db.add_subscription("G", "https://a.com/1", "源1", 900)
+        db.mark_polled(sid, title="源1", mark_initialized=True)
+        db.set_enabled("G", sid, False, reason="auto")
+        from datetime import datetime, timedelta, timezone as _tz  # noqa: PLC0415
+
+        old = (datetime.now(_tz.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+        db._conn.execute(
+            "UPDATE subscriptions SET fail_count = 2, last_polled_at = ? WHERE id = ?",
+            (old, sid))
+        db._conn.commit()
+        await p.poll_once()
+        sub = db.list_subscriptions("G")[0]
+        check("★★ poll_once 把到点的自动暂停订阅放回去并抓取",
+              sub.enabled is True and sub.fail_count == 0, str(sub))
     finally:
         restore()
         td.cleanup()

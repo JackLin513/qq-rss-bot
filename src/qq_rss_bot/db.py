@@ -197,6 +197,9 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("subscriptions", "fail_count", "INTEGER NOT NULL DEFAULT 0"),
     # AI 摘要按源开关。**默认 0** —— 这个功能会花钱，必须是显式打开的。
     ("subscriptions", "ai_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    # 暂停原因：`auto`（连续失败被暂停，**会被自动重试**）/ `manual`（用户 /pause，
+    # 不自动恢复）。NULL = 没暂停。见 `retry_paused`。
+    ("subscriptions", "paused_reason", "TEXT"),
 ]
 
 
@@ -223,6 +226,9 @@ class Subscription:
     # 这个源要不要走「抓正文 + AI 翻译/摘要」。**默认关**：会花钱，
     # 而且对 36氪快讯这种「162 字就是全文」的源纯属浪费。
     ai_enabled: bool = False
+    # 暂停原因：`auto` / `manual` / 空（没暂停）。**只有 `auto` 会被自动重试**，
+    # 用户手动 `/pause` 的不动。见 `Database.retry_paused`。
+    paused_reason: str = ""
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> "Subscription":
@@ -239,6 +245,10 @@ class Subscription:
             enabled=bool(row["enabled"]),
             ai_enabled=(
                 bool(row["ai_enabled"]) if "ai_enabled" in row.keys() else False
+            ),
+            paused_reason=(
+                str(row["paused_reason"] or "")
+                if "paused_reason" in row.keys() else ""
             ),
         )
 
@@ -390,11 +400,18 @@ class Database:
         ).fetchone()
         return int(row["fail_count"]) if row else 0
 
-    def set_enabled(self, group_openid: str, sub_id: int, enabled: bool) -> bool:
-        """暂停 / 恢复一个订阅。表里本来就有 enabled 列，只是从前没有任何代码能改它。"""
+    def set_enabled(self, group_openid: str, sub_id: int, enabled: bool,
+                    *, reason: str = "manual") -> bool:
+        """暂停 / 恢复一个订阅。表里本来就有 enabled 列，只是从前没有任何代码能改它。
+
+        `reason="auto"` 表示「连续失败被暂停」—— 这种订阅 `retry_paused()` 会
+        在过了一段时间后自动放开重试一次；`manual`（`/pause`）的不动。
+        """
         cur = self._conn.execute(
-            "UPDATE subscriptions SET enabled = ? WHERE id = ? AND group_openid = ?",
-            (1 if enabled else 0, sub_id, group_openid),
+            "UPDATE subscriptions SET enabled = ?, paused_reason = ? "
+            "WHERE id = ? AND group_openid = ?",
+            (1 if enabled else 0, None if enabled else (reason or "manual"),
+             sub_id, group_openid),
         )
         if enabled:
             # 恢复时把失败计数清零，否则一恢复就立刻又被自动暂停
@@ -404,6 +421,38 @@ class Database:
             )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def retry_paused(self, stale_sec: int, fail_count: int) -> list[Subscription]:
+        """把「自动暂停满 `stale_sec` 秒」的订阅放回去重试一次。
+
+        **只碰 `paused_reason='auto'`** —— 用户 `/pause` 的绝不能被它偷偷恢复。
+        放回去时把 `fail_count` 设成 `fail_count` 参数（调用方传阈值 -1）：
+        再失败一次就重新暂停，不会又连着失败 5 次才停。成功了 `mark_polled`
+        自然清零。
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM subscriptions WHERE enabled = 0 AND paused_reason = 'auto'"
+        ).fetchall()
+        now = datetime.now(timezone.utc)
+        out: list[Subscription] = []
+        for row in rows:
+            last = row["last_polled_at"]
+            if last:
+                try:
+                    age = (now - datetime.fromisoformat(last)).total_seconds()
+                except ValueError:
+                    age = stale_sec  # 时间戳坏了就当已经够久
+                if age < stale_sec:
+                    continue
+            self._conn.execute(
+                "UPDATE subscriptions SET enabled = 1, paused_reason = NULL, "
+                "fail_count = ? WHERE id = ?",
+                (fail_count, row["id"]),
+            )
+            out.append(Subscription._from_row(row))
+        if out:
+            self._conn.commit()
+        return out
 
     def set_interval(self, group_openid: str, sub_id: int, interval_sec: int) -> bool:
         """改间隔，并把 last_polled_at 清空让新间隔**立刻生效**。

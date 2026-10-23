@@ -92,6 +92,10 @@ class Config:
     max_subs_per_group: int = 10
     # 连续失败多少次自动暂停该订阅
     max_fail_before_pause: int = 5
+    # 自动暂停的订阅隔多久**自动重试一次**（秒，默认 1 小时）。
+    # 上游整站维护时不用人再去群里手打 /resume；再失败会重新暂停、再等这么久。
+    # ⚠️ 只管「连续失败自动暂停」的；用户自己 `/pause` 的不会被自动恢复。
+    auto_resume_sec: int = 3600
     # 出错私聊的收件人白名单。**留空 = 自动登记群主和管理员**（默认行为）；
     # 一旦填了就只发给名单上的人，数据库里登记的谁都不看 —— 收件人写死在
     # .env 里，换群主、加管理员、撤管理员都不影响。
@@ -457,6 +461,7 @@ def load_config() -> Config:
         daily_send_limit=_env_int("DAILY_SEND_LIMIT", 900),
         max_subs_per_group=_env_int("MAX_SUBS_PER_GROUP", 10),
         max_fail_before_pause=_env_int("MAX_FAIL_BEFORE_PAUSE", 5),
+        auto_resume_sec=_env_int("AUTO_RESUME_SEC", 3600),
         notify_openids=_env_list("NOTIFY_OPENIDS"),
         auto_subscribe_feed=(os.environ.get("AUTO_SUBSCRIBE_FEED") or "").strip(),
         log_file=(os.environ.get("LOG_FILE") or "").strip(),

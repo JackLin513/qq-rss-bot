@@ -41,6 +41,15 @@ _MAX_CONTENT = 1500
 # 二是让客户端收到的顺序稳定（并发发出时到达顺序不保证）
 _PUSH_GAP_SEC = 0.4
 
+
+def _retry_hint(sec: int) -> str:
+    """「N 小时后会自动重试；」—— 给私聊告警用，别在文案里写死 3600。"""
+    if sec >= 3600 and sec % 3600 == 0:
+        return f"{sec // 3600} 小时后会自动重试；"
+    if sec >= 60 and sec % 60 == 0:
+        return f"{sec // 60} 分钟后会自动重试；"
+    return f"{sec} 秒后会自动重试；"
+
 # 被「不发」否掉的条目 key 保留多久。**不能只留一轮** —— 正式群有好几个，
 # 它们的轮询是并发的，只要有一个这一轮抓取失败、下一轮才发，就已经过了本轮。
 # 6 小时足够覆盖任何退避重试，又不会让集合无限长。
@@ -474,6 +483,15 @@ class FeedPoller:
         _log.info("轮询已停止")
 
     async def poll_once(self) -> None:
+        # 自动暂停的订阅（连续失败被停的）到点了就放回去重试**一次**。
+        # 上游整站维护时这一点很重要 —— 否则要人去群里手打 /resume。
+        for sub in self.db.retry_paused(
+            self.cfg.auto_resume_sec, self.cfg.max_fail_before_pause - 1
+        ):
+            _log.info(
+                "订阅 #%s《%s》暂停已满 %d 秒，放回去重试一次",
+                sub.id, sub.title or sub.url, self.cfg.auto_resume_sec,
+            )
         due = self.db.due_subscriptions(utcnow())
         if not due:
             return
@@ -619,13 +637,14 @@ class FeedPoller:
                     "抓取失败 #%s %s: %s（连续 %d 次）", sub.id, sub.url, result.error, fails
                 )
                 if fails >= self.cfg.max_fail_before_pause:
-                    self.db.set_enabled(sub.group_openid, sub.id, False)
+                    self.db.set_enabled(sub.group_openid, sub.id, False, reason="auto")
                     _log.warning("订阅 #%s 连续失败 %d 次，已自动暂停", sub.id, fails)
                     await self.notifier.notify(
                         sub.group_openid,
                         f"⚠️ 订阅《{sub.title or sub.url}》连续 {fails} 次抓取失败，已自动暂停。\n"
                         f"最后一次错误：{result.error}\n"
-                        f"修好后用 /resume <编号> 恢复（编号见 /list）。",
+                        f"{_retry_hint(self.cfg.auto_resume_sec)}"
+                        f"（想立刻重试：/resume <编号>，编号见 /list）",
                         key=f"pause:{sub.id}",
                     )
                 return False
