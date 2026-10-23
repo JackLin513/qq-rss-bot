@@ -3177,8 +3177,8 @@ async def _check_media_preview_inner() -> None:
 
     # --- ★ QQ 内容审核拒绝：不是 X 风控，也不是图没下载 ---
     # 2026-10-23 线上：推文 2113551464060903928 的 markdown 被 QQ 判「消息内容违规」，
-    # 图其实已经下载入库（1269KB）。旧日志照样写「已回markdown 卡片，配图 1 张」，
-    # 私聊也只说「上传或发送失败」—— 两个地方都会把人引向错误方向。
+    # 图其实已经下载入库（1269KB）。**用户明确要求：这种情况整条不发**，
+    # 不要退回纯文字 —— 一半文字一半缺图的残条比不发更麻烦。
     from botpy.errors import ServerError  # noqa: PLC0415
 
     class _ModerationApi(_MediaApi):
@@ -3196,22 +3196,22 @@ async def _check_media_preview_inner() -> None:
         api = _ModerationApi()
         bot = _MediaBotStub(cfg, _FakeMediaHttp(fx=_FX_OK, image=b"\xff\xd8tw"),
                             api, notifier=spy)
-        await bot._preview_media(_FakeMsg(_X_TEXT))
+        replied = await bot._preview_media(_FakeMsg(_X_TEXT))
     finally:
         blog.removeHandler(grab)
         blog.setLevel(old_level)
 
-    check("★ 被内容审核拒绝时退回纯文字（不是整条不回）",
-          any(kw.get("content") and not kw.get("markdown") for kw in api.sent),
-          str(api.sent))
-    done = [ln for ln in grab.lines if "已回" in ln]
-    check("★★ 日志写明「markdown 被拒」而不是「已回markdown 卡片」",
-          bool(done) and "被拒" in done[-1] and "消息内容违规" in done[-1],
-          repr(done[-1:]))
-    check("★ 日志说明图已下载但没发出（不再误导成发成功了）",
-          bool(done) and "未发出" in done[-1], repr(done[-1:]))
-    check("★★ 私聊告警带上真实原因，不只说「上传或发送失败」",
-          bool(spy.calls) and "消息内容违规" in spy.calls[0][1], str(spy.calls))
+    check("★★ 内容审核拒绝时**整条不发**（不退回纯文字）",
+          replied is False
+          and not any(kw.get("content") and not kw.get("markdown")
+                      for kw in api.sent),
+          f"replied={replied} sent={api.sent}")
+    check("★★ 日志写明「被 QQ 内容审核拒绝，整条不发」",
+          any("内容审核拒绝" in ln and "消息内容违规" in ln for ln in grab.lines),
+          repr([ln for ln in grab.lines if "审核" in ln][:2]))
+    check("★★ 私聊告警说清楚整条没发（不是「N 张没发出去」）",
+          bool(spy.calls) and "整条没有发出" in spy.calls[0][1]
+          and "消息内容违规" in spy.calls[0][1], str(spy.calls))
 
     # --- ★ 异常要被吃掉：不能冒到 botpy 的 _run_event ---
     class _BoomApi:

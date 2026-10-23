@@ -49,6 +49,17 @@ _log = logging.getLogger("qq_rss_bot.bot")
 _USER_AGENT = "qq-rss-bot/0.1 (+https://github.com/DIYgod/RSSHub)"
 
 
+def _content_blocked(exc: BaseException) -> bool:
+    """这条异常是不是 **QQ 内容审核** 拒绝的（`40034006 消息内容违规`）。
+
+    ⚠️ botpy 的 `ServerError` **只带 message，不带 code**，所以只能按文案判。
+    完整 body（含 `code` / `trace_id`）在 botpy 自己那行 `[botpy] 接口请求异常…`
+    日志里。文案改了的话这里会漏判 —— 漏判的后果是退回纯文字，不是崩溃。
+    """
+    return "消息内容违规" in (str(exc) or "")
+
+
+
 class RssBot(botpy.Client):
     def __init__(self, cfg: Config) -> None:
         super().__init__(
@@ -639,6 +650,7 @@ class RssBot(botpy.Client):
                 cover_bytes += len(raw)
                 images.append((ref.url, ref.width, ref.height))
 
+            blocked = False
             fallback = ""
             try:
                 await reply_card(preview.render_markdown(card, images))
@@ -649,18 +661,38 @@ class RssBot(botpy.Client):
                 # 「发出去但用户看不见」观测不到，不做自动降级。
                 #
                 # ⚠️ **`消息内容违规` 是 QQ 的内容审核**，不是 X 的风控，也
-                # 不是图没传上去 —— 图早就在我们图库里了。原样记进日志和私聊，
-                # 否则「配图发送失败」会被误读成网络/图床问题（2026-10-23 踩过）。
+                # 不是图没传上去 —— 图早就在我们图库里了。
+                #
+                # ⚠️ **这种情况整条不发，也不退回纯文字。** 用户明确要求：
+                # 一半文字一半缺图的残条比不发更麻烦，还得人工去群里解释。
+                # 纯文字能过审是因为审核对象是图，但发出去只会制造困惑。
                 fallback = str(exc) or type(exc).__name__
-                _log.warning("markdown 卡片发不出去，退回纯文字：%s", fallback,
-                             exc_info=True)
-                await _reply(preview.render_text(card))
                 failed.extend([u for u in urls])
+                if _content_blocked(exc):
+                    blocked = True
+                    _log.warning(
+                        "群 %s 分享了 %s %s，被 QQ 内容审核拒绝，整条不发：%s",
+                        message.group_openid, target.site, target.vid, fallback,
+                        exc_info=True,
+                    )
+                else:
+                    _log.warning("markdown 卡片发不出去，退回纯文字：%s", fallback,
+                                 exc_info=True)
+                    await _reply(preview.render_text(card))
         except Exception:  # noqa: BLE001 —— 解析和发消息什么都可能抛
             _log.warning("YouTube/X 预览失败", exc_info=True)
             return False
 
-        if failed:
+        if blocked:
+            # 整条没发，所以不用 `image_failure_message` 那套「N 张没发出去」——
+            # 用户要的是「这条被审核拦了」，不是「图没上传成功」。
+            await self.notifier.notify(
+                message.group_openid,
+                f"⚠️ 分享未发送：QQ 内容审核拒绝（{fallback}）。整条没有发出。\n"
+                f"来源：{card.site} 分享\n条目：{card.title}",
+                key=f"{IMAGE_FAILURE_KEY_PREFIX}{message.group_openid}",
+            )
+        elif failed:
             # 和定时推送共用冷却键：两个入口同时出问题时报一次就够。
             why = f"markdown 卡片被拒：{fallback}" if fallback else "上传或发送失败"
             await self.notifier.notify(
@@ -672,6 +704,15 @@ class RssBot(botpy.Client):
                 ),
                 key=f"{IMAGE_FAILURE_KEY_PREFIX}{message.group_openid}",
             )
+
+        # **封面字节数必须记。** 推文的图分 orig / large / medium / small 四档，
+        # 943KB 和 70KB 差 13 倍，而「已回图文卡片」四种情况长得一模一样 ——
+        # 只报结果不报尺寸的话，「发出去的到底是不是原图」这个问题在日志里
+        # **无法回答**（这个已经发生过一次，只能靠重发来补证据）。
+        # URL 也带上：档位就写在 `?name=` 里，扫一眼就能确认。
+        if blocked:
+            # 上面那条 WARNING 已经带群号 / 推文 id / 原因，这里不再重复一行。
+            return False
 
         # **封面字节数必须记。** 推文的图分 orig / large / medium / small 四档，
         # 943KB 和 70KB 差 13 倍，而「已回图文卡片」四种情况长得一模一样 ——
