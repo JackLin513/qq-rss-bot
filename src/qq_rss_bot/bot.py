@@ -729,7 +729,7 @@ class RssBot(botpy.Client):
             await self.notifier.notify(
                 message.group_openid,
                 f"⚠️ 分享未发送：QQ 内容审核拒绝（{fallback}）。整条没有发出。\n"
-                f"来源：{card.site} 分享\n条目：{card.title}\n"
+                f"来源：{card.site} 分享\n条目：{card.title}\n链接：{card.url}\n"
                 f"{recall}。",
                 key=f"{IMAGE_FAILURE_KEY_PREFIX}{message.group_openid}",
             )

@@ -3265,6 +3265,10 @@ async def _check_media_preview_inner() -> None:
           api.deletes == [("G", "M1")], str(api.deletes))
     check("★ 告警里写明了撤回结果",
           bool(spy.calls) and "原消息已自动撤回" in spy.calls[0][1], str(spy.calls))
+    check("★★ 告警里带上原推链接（方便直接点开核对）",
+          bool(spy.calls) and "链接：" in spy.calls[0][1]
+          and "x.com/BarackObama/status/896523232098078720" in spy.calls[0][1],
+          str(spy.calls))
 
     # --- ★ 开关关掉：不撤回，但整条不发的行为不变 ---
     grab.lines.clear()
